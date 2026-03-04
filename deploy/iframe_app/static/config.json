@@ -1,0 +1,5 @@
+{
+  "trajectory_url": "./trajectory.json",
+  "api_recompute_url": "./api/recompute",
+  "widget": "ball3d"
+}

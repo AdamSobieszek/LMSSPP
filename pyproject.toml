@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lmsspp"
+version = "0.1.0"
+description = "LMS Kuramoto widgets and iframe deployment package"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+authors = [{name = "LMSSPP Team"}]
+dependencies = [
+  "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+backend = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.30",
+]
+widgets = [
+  "ipywidgets>=8.0",
+  "plotly>=5.0",
+]
+torch = [
+  "torch>=2.2",
+]
+live = [
+  "jupyterlab>=4.0",
+  "voila>=0.5",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

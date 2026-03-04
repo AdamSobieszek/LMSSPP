@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>LMS Iframe Widget</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    :root {
+      --bg: #f6f7fb;
+      --card: #ffffff;
+      --ink: #1e2a44;
+      --muted: #5e6a85;
+      --line: #d5dced;
+      --accent: #1f5dd2;
+    }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Roboto, Arial, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    .page {
+      padding: 12px;
+    }
+    .title {
+      margin: 0 0 8px 0;
+      font-size: 20px;
+      font-weight: 600;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+    }
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(180px, 1fr));
+      gap: 8px 10px;
+      margin-bottom: 10px;
+    }
+    .ctrl {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 4px;
+    }
+    .ctrl label {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .ctrl input,
+    .ctrl select {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 7px 8px;
+      font-size: 13px;
+      color: var(--ink);
+      background: #fff;
+    }
+    .checkbox {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+    }
+    .btns {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    button {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fff;
+      color: var(--ink);
+      font-size: 13px;
+      padding: 7px 10px;
+      cursor: pointer;
+    }
+    button.primary {
+      border-color: var(--accent);
+      color: #fff;
+      background: var(--accent);
+    }
+    button:disabled {
+      opacity: 0.55;
+      cursor: default;
+    }
+    .status {
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 8px;
+      min-height: 18px;
+    }
+    #plot {
+      width: 100%;
+      height: 720px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    #metrics {
+      width: 100%;
+      height: 260px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-top: 10px;
+      background: #fff;
+    }
+    .scrub {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .scrub input[type="range"] {
+      flex: 1;
+    }
+    .mono {
+      font-family: Menlo, Consolas, Monaco, monospace;
+      min-width: 90px;
+      text-align: right;
+    }
+    @media (max-width: 1120px) {
+      .controls {
+        grid-template-columns: repeat(2, minmax(180px, 1fr));
+      }
+      #plot {
+        height: 560px;
+      }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+  <h1 class="title">LMS Widget Export Player</h1>
+  <div class="card">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="widget">Widget type</label>
+        <select id="widget">
+          <option value="ball3d">ball3d</option>
+          <option value="ball3d_backward_two_sheet">ball3d_backward_two_sheet</option>
+          <option value="circle">circle</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <label for="N">Oscillators N</label>
+        <input id="N" type="number" value="150" min="4" step="1" />
+      </div>
+      <div class="ctrl">
+        <label for="K">Coupling K</label>
+        <input id="K" type="number" value="1.0" step="0.05" />
+      </div>
+      <div class="ctrl">
+        <label for="omega">Rotation rate omega</label>
+        <input id="omega" type="number" value="3.0" step="0.05" />
+      </div>
+      <div class="ctrl">
+        <label for="r0">Requested initial radius r0</label>
+        <input id="r0" type="number" value="0.03" min="0" max="0.99" step="0.01" />
+      </div>
+      <div class="ctrl">
+        <label for="dt">dt</label>
+        <input id="dt" type="number" value="0.05" step="0.005" />
+      </div>
+      <div class="ctrl">
+        <label for="steps">steps</label>
+        <input id="steps" type="number" value="400" min="10" step="10" />
+      </div>
+      <div class="ctrl">
+        <label for="seed">random seed</label>
+        <input id="seed" type="number" value="0" min="0" step="1" />
+      </div>
+      <div class="ctrl">
+        <label for="wAz">w direction azimuth</label>
+        <input id="wAz" type="number" value="0.2" step="0.05" />
+      </div>
+      <div class="ctrl">
+        <label for="wEl">w direction elevation</label>
+        <input id="wEl" type="number" value="0.25" step="0.05" />
+      </div>
+      <div class="ctrl">
+        <label for="axAz">axis azimuth</label>
+        <input id="axAz" type="number" value="0.0" step="0.05" />
+      </div>
+      <div class="ctrl">
+        <label for="axEl">axis elevation</label>
+        <input id="axEl" type="number" value="1.5707963268" step="0.05" />
+      </div>
+      <div class="ctrl">
+        <label for="theta">circle theta</label>
+        <input id="theta" type="number" value="0.45" step="0.05" />
+      </div>
+      <div class="ctrl">
+        <label for="wMode">Computational backend</label>
+        <select id="wMode">
+          <option value="autograd">autograd</option>
+          <option value="explicit">explicit</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <label for="pointDecimation">Point decimation</label>
+        <input id="pointDecimation" type="number" value="1" min="1" step="1" />
+      </div>
+      <div class="ctrl">
+        <label for="speed">Playback speed multiplier</label>
+        <input id="speed" type="number" value="1.0" min="0.1" step="0.1" />
+      </div>
+      <div class="checkbox">
+        <input id="includePoints" type="checkbox" checked />
+        <label for="includePoints">Include boundary points in payload</label>
+      </div>
+    </div>
+    <div class="btns">
+      <button id="recompute" class="primary">Recompute</button>
+      <button id="playForward">Play forward</button>
+      <button id="playBackward">Play backward</button>
+      <button id="pause">Pause</button>
+      <button id="stepBack">Step -</button>
+      <button id="stepForward">Step +</button>
+      <button id="resetFrame">Reset frame</button>
+    </div>
+    <div id="status" class="status"></div>
+    <div id="plot"></div>
+    <div class="scrub">
+      <label for="frame">Frame</label>
+      <input id="frame" type="range" min="0" max="0" value="0" />
+      <span id="frameLabel" class="mono">0 / 0</span>
+    </div>
+    <div id="metrics"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const DEFAULT_CONFIG = {
+    trajectory_url: "./trajectory.json",
+    api_recompute_url: "./api/recompute",
+    widget: "ball3d"
+  };
+
+  const state = {
+    payload: null,
+    frame: 0,
+    timer: null,
+    direction: 1,
+    speed: 1.0,
+    plotIdx: {},
+    metricIdx: {}
+  };
+
+  const config = { ...DEFAULT_CONFIG };
+
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    widget: $("widget"),
+    N: $("N"),
+    K: $("K"),
+    omega: $("omega"),
+    r0: $("r0"),
+    dt: $("dt"),
+    steps: $("steps"),
+    seed: $("seed"),
+    wAz: $("wAz"),
+    wEl: $("wEl"),
+    axAz: $("axAz"),
+    axEl: $("axEl"),
+    theta: $("theta"),
+    wMode: $("wMode"),
+    includePoints: $("includePoints"),
+    pointDecimation: $("pointDecimation"),
+    speed: $("speed"),
+    recompute: $("recompute"),
+    playForward: $("playForward"),
+    playBackward: $("playBackward"),
+    pause: $("pause"),
+    stepBack: $("stepBack"),
+    stepForward: $("stepForward"),
+    resetFrame: $("resetFrame"),
+    frame: $("frame"),
+    frameLabel: $("frameLabel"),
+    status: $("status"),
+    plot: $("plot"),
+    metrics: $("metrics")
+  };
+
+  function parseQuery() {
+    const out = {};
+    const q = new URLSearchParams(window.location.search);
+    for (const [k, v] of q.entries()) out[k] = v;
+    return out;
+  }
+
+  function status(msg, isError = false) {
+    el.status.textContent = msg || "";
+    el.status.style.color = isError ? "#b00020" : "#5e6a85";
+  }
+
+  function clampFrame(idx) {
+    if (!state.payload) return 0;
+    const last = state.payload.time.length - 1;
+    if (idx < 0) return last;
+    if (idx > last) return 0;
+    return idx;
+  }
+
+  function vec3(v) {
+    if (!Array.isArray(v)) return [0, 0, 0];
+    if (v.length >= 3) return [Number(v[0]), Number(v[1]), Number(v[2])];
+    return [Number(v[0] || 0), Number(v[1] || 0), 0];
+  }
+
+  function coordsFromVecs(vectors) {
+    const x = [];
+    const y = [];
+    const z = [];
+    for (const v of vectors) {
+      const q = vec3(v);
+      x.push(q[0]);
+      y.push(q[1]);
+      z.push(q[2]);
+    }
+    return { x, y, z };
+  }
+
+  function sphereWire(radius = 1.0, nLat = 5, nLon = 8) {
+    const traces = [];
+    for (let i = 1; i <= nLat; i++) {
+      const phi = -0.5 * Math.PI + (i * Math.PI) / (nLat + 1);
+      const x = [];
+      const y = [];
+      const z = [];
+      for (let k = 0; k <= 72; k++) {
+        const t = (2 * Math.PI * k) / 72;
+        x.push(radius * Math.cos(phi) * Math.cos(t));
+        y.push(radius * Math.cos(phi) * Math.sin(t));
+        z.push(radius * Math.sin(phi));
+      }
+      traces.push({
+        type: "scatter3d",
+        mode: "lines",
+        hoverinfo: "skip",
+        showlegend: false,
+        line: { color: "rgba(120,120,120,0.25)", width: 1 },
+        ...{ x, y, z }
+      });
+    }
+    for (let j = 0; j < nLon; j++) {
+      const lam = (2 * Math.PI * j) / nLon;
+      const x = [];
+      const y = [];
+      const z = [];
+      for (let k = 0; k <= 72; k++) {
+        const t = -0.5 * Math.PI + (Math.PI * k) / 72;
+        x.push(radius * Math.cos(t) * Math.cos(lam));
+        y.push(radius * Math.cos(t) * Math.sin(lam));
+        z.push(radius * Math.sin(t));
+      }
+      traces.push({
+        type: "scatter3d",
+        mode: "lines",
+        hoverinfo: "skip",
+        showlegend: false,
+        line: { color: "rgba(120,120,120,0.25)", width: 1 },
+        ...{ x, y, z }
+      });
+    }
+    return traces;
+  }
+
+  function controlParams() {
+    return {
+      N: Number(el.N.value),
+      K: Number(el.K.value),
+      omega: Number(el.omega.value),
+      r0: Number(el.r0.value),
+      dt: Number(el.dt.value),
+      steps: Number(el.steps.value),
+      w_az: Number(el.wAz.value),
+      w_el: Number(el.wEl.value),
+      ax_az: Number(el.axAz.value),
+      ax_el: Number(el.axEl.value),
+      theta: Number(el.theta.value)
+    };
+  }
+
+  function payloadMaxRadius(payload) {
+    const base = payload.widget_type === "circle" ? 1.15 : 1.15;
+    if (!payload.series.bar_sheet) return base;
+    const norms = payload.metrics.bar_w_norm || [];
+    let max = 1.15;
+    for (const n of norms) max = Math.max(max, Number(n) + 0.5);
+    return Math.min(12.0, max);
+  }
+
+  async function drawPayload(payload) {
+    state.payload = payload;
+    state.frame = 0;
+
+    const idx = {};
+    const traces = [];
+    const T = payload.time.length;
+    const pointsSeries = payload.series.points || null;
+    const wSeries = payload.series.w || [];
+    const zSeries = payload.series.z || [];
+    const zKSeries = payload.series.Z_over_K || [];
+    const barSeries = payload.series.bar_sheet || null;
+
+    const wire = sphereWire(1.0, 5, 8);
+    for (const w of wire) traces.push(w);
+
+    if (pointsSeries && pointsSeries.length) {
+      const c = coordsFromVecs(pointsSeries[0]);
+      idx.points = traces.length;
+      traces.push({
+        type: "scatter3d",
+        mode: "markers",
+        name: "x_i(t)",
+        marker: { size: 3, color: "royalblue", opacity: 0.9 },
+        ...c
+      });
+    }
+
+    function addPath(name, series, color, width, dash) {
+      const c = coordsFromVecs(series);
+      idx[name + "_path"] = traces.length;
+      traces.push({
+        type: "scatter3d",
+        mode: "lines",
+        name,
+        line: { color, width, dash: dash || "solid" },
+        ...c
+      });
+    }
+    function addMarker(name, vec, color, symbol, size) {
+      const c = vec3(vec);
+      idx[name + "_marker"] = traces.length;
+      traces.push({
+        type: "scatter3d",
+        mode: "markers",
+        name,
+        marker: { size, color, symbol },
+        x: [c[0]],
+        y: [c[1]],
+        z: [c[2]]
+      });
+    }
+
+    addPath("|w| path", wSeries, "#111111", 4);
+    addPath("|z| path", zSeries, "#0d47a1", 3);
+    addPath("|Z|/K path", zKSeries, "#c62828", 3);
+
+    addMarker("w(t)", wSeries[0], "#000000", "x", 7);
+    addMarker("z(t)", zSeries[0], "#0d47a1", "circle-open", 7);
+    addMarker("Z/K(t)", zKSeries[0], "#c62828", "diamond", 6);
+
+    if (barSeries) {
+      addPath("|w_bar| path", barSeries.w || [], "#6a1b9a", 2, "dash");
+      addPath("|z_bar| path", barSeries.z || [], "#00897b", 2, "dash");
+      addPath("|Z_bar|/K path", barSeries.Z_over_K || [], "#ef6c00", 2, "dash");
+
+      addMarker("w_bar(t)", (barSeries.w || [])[0], "#6a1b9a", "x", 6);
+      addMarker("z_bar(t)", (barSeries.z || [])[0], "#00897b", "circle-open", 6);
+      addMarker("Z_bar/K(t)", (barSeries.Z_over_K || [])[0], "#ef6c00", "diamond", 6);
+    }
+
+    state.plotIdx = idx;
+    const lim = payloadMaxRadius(payload);
+    const layout = {
+      title: {
+        text: `LMS ${payload.widget_type} trajectory`,
+        x: 0.01,
+        xanchor: "left"
+      },
+      margin: { l: 8, r: 8, t: 45, b: 8 },
+      legend: { orientation: "h", y: 1.03, x: 0.0 },
+      scene: {
+        aspectmode: "cube",
+        xaxis: { range: [-lim, lim], title: "x" },
+        yaxis: { range: [-lim, lim], title: "y" },
+        zaxis: { range: [-lim, lim], title: "z" }
+      }
+    };
+    await Plotly.newPlot(el.plot, traces, layout, { responsive: true, displaylogo: false });
+
+    el.frame.max = String(Math.max(0, T - 1));
+    el.frame.value = "0";
+    await drawMetrics(payload);
+    await updateFrame(0);
+  }
+
+  async function drawMetrics(payload) {
+    const t = payload.time || [];
+    const w = payload.metrics.w_norm || [];
+    const z = payload.metrics.Z_norm_over_K || [];
+    const traces = [
+      { x: t, y: z, type: "scatter", mode: "lines", name: "|Z|/K", line: { color: "#c62828", width: 2 } },
+      { x: t, y: w, type: "scatter", mode: "lines", name: "|w|", line: { color: "#111111", width: 2 } }
+    ];
+    const idx = {
+      zCur: traces.length,
+      wCur: traces.length + 1
+    };
+    traces.push({
+      x: [t[0] || 0], y: [z[0] || 0], type: "scatter", mode: "markers",
+      name: "current |Z|/K", marker: { size: 8, color: "#c62828" }, showlegend: false
+    });
+    traces.push({
+      x: [t[0] || 0], y: [w[0] || 0], type: "scatter", mode: "markers",
+      name: "current |w|", marker: { size: 8, color: "#111111" }, showlegend: false
+    });
+
+    await Plotly.newPlot(el.metrics, traces, {
+      margin: { l: 50, r: 20, t: 30, b: 50 },
+      title: { text: "Magnitudes", x: 0.5 },
+      xaxis: { title: "time" },
+      yaxis: { title: "value" },
+      legend: { orientation: "h", y: 1.25, x: 0 }
+    }, { responsive: true, displaylogo: false });
+    state.metricIdx = idx;
+  }
+
+  async function updateFrame(frameIndex) {
+    if (!state.payload) return;
+    const p = state.payload;
+    const i = clampFrame(frameIndex);
+    state.frame = i;
+    el.frame.value = String(i);
+    const last = p.time.length - 1;
+    el.frameLabel.textContent = `${i} / ${last}`;
+
+    const idx = state.plotIdx;
+    function setMarker(key, series) {
+      if (idx[key] === undefined || !series || !series[i]) return Promise.resolve();
+      const q = vec3(series[i]);
+      return Plotly.restyle(el.plot, { x: [[q[0]]], y: [[q[1]]], z: [[q[2]]] }, [idx[key]]);
+    }
+
+    const tasks = [];
+    if (idx.points !== undefined && p.series.points && p.series.points[i]) {
+      const c = coordsFromVecs(p.series.points[i]);
+      tasks.push(Plotly.restyle(el.plot, { x: [c.x], y: [c.y], z: [c.z] }, [idx.points]));
+    }
+    tasks.push(setMarker("w(t)_marker", p.series.w));
+    tasks.push(setMarker("z(t)_marker", p.series.z));
+    tasks.push(setMarker("Z/K(t)_marker", p.series.Z_over_K));
+
+    if (p.series.bar_sheet) {
+      tasks.push(setMarker("w_bar(t)_marker", p.series.bar_sheet.w));
+      tasks.push(setMarker("z_bar(t)_marker", p.series.bar_sheet.z));
+      tasks.push(setMarker("Z_bar/K(t)_marker", p.series.bar_sheet.Z_over_K));
+    }
+
+    if (state.metricIdx.zCur !== undefined) {
+      const tx = p.time[i] || i;
+      const zw = (p.metrics.Z_norm_over_K || [])[i] || 0;
+      const ww = (p.metrics.w_norm || [])[i] || 0;
+      tasks.push(Plotly.restyle(el.metrics, { x: [[tx]], y: [[zw]] }, [state.metricIdx.zCur]));
+      tasks.push(Plotly.restyle(el.metrics, { x: [[tx]], y: [[ww]] }, [state.metricIdx.wCur]));
+    }
+    await Promise.all(tasks);
+
+    const wN = (p.metrics.w_norm || [])[i];
+    const zN = (p.metrics.z_norm || [])[i];
+    const ZN = (p.metrics.Z_norm_over_K || [])[i];
+    status(`frame=${i}  |w|=${Number(wN || 0).toFixed(5)}  |z|=${Number(zN || 0).toFixed(5)}  |Z|/K=${Number(ZN || 0).toFixed(5)}`);
+  }
+
+  function stopPlayback() {
+    if (state.timer) {
+      clearInterval(state.timer);
+      state.timer = null;
+    }
+  }
+
+  function startPlayback(direction) {
+    if (!state.payload) return;
+    stopPlayback();
+    state.direction = direction;
+    state.speed = Math.max(0.1, Number(el.speed.value) || 1.0);
+    const baseMs = 33.0;
+    const intervalMs = Math.max(8, Math.round(baseMs / state.speed));
+    state.timer = setInterval(() => {
+      const next = state.frame + state.direction;
+      updateFrame(next).catch((err) => {
+        stopPlayback();
+        status(`Playback error: ${String(err)}`, true);
+      });
+    }, intervalMs);
+  }
+
+  async function recompute() {
+    const apiUrl = config.api_recompute_url || "";
+    if (!apiUrl) {
+      status("No API recompute endpoint configured.", true);
+      return;
+    }
+    const body = {
+      widget: el.widget.value,
+      params: controlParams(),
+      include_points: !!el.includePoints.checked,
+      point_decimation: Math.max(1, Number(el.pointDecimation.value) || 1),
+      seed: Number(el.seed.value) || 0,
+      w_mode: el.wMode.value
+    };
+    el.recompute.disabled = true;
+    status("Recomputing payload...");
+    try {
+      const resp = await fetch(apiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      const payload = await resp.json();
+      await drawPayload(payload);
+      status("Recompute completed.");
+    } catch (err) {
+      status(`Recompute failed: ${String(err)}`, true);
+    } finally {
+      el.recompute.disabled = false;
+    }
+  }
+
+  async function loadJson(url) {
+    const resp = await fetch(url, { cache: "no-cache" });
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+    return resp.json();
+  }
+
+  async function loadConfigAndPayload() {
+    const query = parseQuery();
+    try {
+      const cfg = await loadJson("./config.json");
+      Object.assign(config, cfg || {});
+    } catch (_) {
+      // Keep defaults.
+    }
+
+    if (query.api) config.api_recompute_url = query.api;
+    if (query.trajectory) config.trajectory_url = query.trajectory;
+    if (query.widget) config.widget = query.widget;
+
+    if (config.widget) el.widget.value = String(config.widget);
+    if (query.speed) el.speed.value = String(query.speed);
+
+    if (config.trajectory_url) {
+      try {
+        status(`Loading trajectory from ${config.trajectory_url} ...`);
+        const payload = await loadJson(config.trajectory_url);
+        await drawPayload(payload);
+        status("Trajectory loaded.");
+        return;
+      } catch (_) {
+        // Fallback to API recompute.
+      }
+    }
+    await recompute();
+  }
+
+  function wireEvents() {
+    el.recompute.addEventListener("click", () => {
+      stopPlayback();
+      recompute();
+    });
+    el.playForward.addEventListener("click", () => startPlayback(+1));
+    el.playBackward.addEventListener("click", () => startPlayback(-1));
+    el.pause.addEventListener("click", () => stopPlayback());
+    el.stepBack.addEventListener("click", () => {
+      stopPlayback();
+      updateFrame(state.frame - 1);
+    });
+    el.stepForward.addEventListener("click", () => {
+      stopPlayback();
+      updateFrame(state.frame + 1);
+    });
+    el.resetFrame.addEventListener("click", () => {
+      stopPlayback();
+      updateFrame(0);
+    });
+    el.frame.addEventListener("input", () => {
+      stopPlayback();
+      updateFrame(Number(el.frame.value));
+    });
+    el.speed.addEventListener("change", () => {
+      if (state.timer) {
+        startPlayback(state.direction);
+      }
+    });
+  }
+
+  wireEvents();
+  loadConfigAndPayload().catch((err) => status(`Initialization failed: ${String(err)}`, true));
+})();
+</script>
+</body>
+</html>

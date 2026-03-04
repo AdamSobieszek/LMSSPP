@@ -1,0 +1,81 @@
+{
+  "slots": {
+    "0": {
+      "enabled": true,
+      "widget": "ball3d",
+      "kwargs": {
+        "rng_seed": 0
+      }
+    },
+    "1": {
+      "enabled": true,
+      "widget": "circle",
+      "kwargs": {
+        "rng_seed": 1
+      }
+    },
+    "2": {
+      "enabled": true,
+      "widget": "ball3d_backward_two_sheet",
+      "kwargs": {
+        "rng_seed": 2
+      }
+    },
+    "3": {
+      "enabled": true,
+      "widget": "ball3d_hydrodynamic_ensemble",
+      "kwargs": {
+        "rng_seed": 3
+      }
+    },
+    "4": {
+      "enabled": true,
+      "widget": "ball3d",
+      "kwargs": {
+        "rng_seed": 4
+      }
+    },
+    "5": {
+      "enabled": true,
+      "widget": "ball3d",
+      "kwargs": {
+        "rng_seed": 5
+      }
+    },
+    "6": {
+      "enabled": true,
+      "widget": "ball3d",
+      "kwargs": {
+        "rng_seed": 6
+      }
+    },
+    "7": {
+      "enabled": true,
+      "widget": "ball3d",
+      "kwargs": {
+        "rng_seed": 7
+      }
+    },
+    "8": {
+      "enabled": true,
+      "widget": "ball3d",
+      "kwargs": {
+        "rng_seed": 8
+      }
+    },
+    "9": {
+      "enabled": true,
+      "widget": "ball3d",
+      "kwargs": {
+        "rng_seed": 9
+      }
+    },
+    "10": {
+      "enabled": true,
+      "widget": "ball3d",
+      "kwargs": {
+        "rng_seed": 10
+      }
+    }
+  }
+}

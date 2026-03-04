@@ -1,0 +1,2 @@
+"""Integration widgets and adapters."""
+
