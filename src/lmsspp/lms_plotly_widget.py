@@ -1,4 +1,4 @@
- """Plotly + ipywidgets LMS widget for circle/simplified disk dynamics.
+"""Plotly + ipywidgets LMS widget for circle/simplified disk dynamics.
 
 This is a Plotly-first interactive widget inspired by widgets_legacy/LMS.html.
 It keeps distinct reduced variables (w, z, Z) and exposes an extensible
