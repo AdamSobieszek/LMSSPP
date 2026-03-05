@@ -410,6 +410,7 @@ def integrate_lms_reduced_euler(
     store_points: Literal["none", "body", "lab", "both"] = "none",
     store_dtype: torch.dtype = torch.float32,
     preallocate: bool = True,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> LMSReducedTrajectory:
     """Integrate reduced LMS dynamics in ambient dimension d."""
     if base_points.dim() != 2:
@@ -452,6 +453,8 @@ def integrate_lms_reduced_euler(
         )
 
         for t in range(t_count):
+            if cancel_check is not None and bool(cancel_check()):
+                raise InterruptedError("Reduced LMS integration cancelled.")
             wdot, zetadot, x_body, x_lab, Z, Z_body, z = lms_reduced_rhs(
                 w,
                 zeta,
@@ -492,6 +495,8 @@ def integrate_lms_reduced_euler(
         x_lab_hist_l = [] if store_lab else None
 
         for _ in range(t_count):
+            if cancel_check is not None and bool(cancel_check()):
+                raise InterruptedError("Reduced LMS integration cancelled.")
             wdot, zetadot, x_body, x_lab, Z, Z_body, z = lms_reduced_rhs(
                 w,
                 zeta,

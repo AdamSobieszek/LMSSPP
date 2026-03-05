@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import threading
 import time
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
 import torch
@@ -95,6 +96,10 @@ OptimizedInitMode = Literal[
 ]
 ActiveInitMode = Literal["entropy_high", "entropy_low", "var_perp_high", "var_perp_low", "poisson"]
 InitMetricMode = Literal["entropy", "perp_variance"]
+
+
+class _HydroRecomputeCancelled(Exception):
+    """Internal cooperative-cancellation signal for hydro recompute jobs."""
 
 
 def _sphere_wireframe_traces(n_lat: int = 9, n_lon: int = 18) -> list[go.Scatter3d]:
@@ -1020,14 +1025,15 @@ class LMSBall3DWidget:
         self.play.interval = interval
         self._sync_speed_button_labels()
 
-    def _time_direction_sign(self) -> float:
-        return -1.0 if bool(self.toggle_time_direction.value) else 1.0
+    def _time_direction_sign(self, *, time_backward: bool | None = None) -> float:
+        backward = bool(self.toggle_time_direction.value) if time_backward is None else bool(time_backward)
+        return -1.0 if backward else 1.0
 
-    def _effective_dt(self, params: dict[str, float | int]) -> float:
+    def _effective_dt(self, params: dict[str, float | int], *, time_backward: bool | None = None) -> float:
         dt_mag = abs(float(params["dt"]))
         if dt_mag < 1e-12:
             dt_mag = 1e-12
-        return self._time_direction_sign() * dt_mag
+        return self._time_direction_sign(time_backward=time_backward) * dt_mag
 
     def _overlay_stride(self) -> int:
         if not self.play.playing:
@@ -1176,7 +1182,8 @@ class LMSBall3DWidget:
         inv_ctx: tuple[np.ndarray, float] | None,
     ) -> np.ndarray:
         if inv_ctx is None:
-            return np.asarray(x, dtype=np.float64)
+            # Fast path: inversion disabled, keep original dtype/array and avoid copies.
+            return x
         x0, cap = inv_ctx
         return self._literal_inversion_rows(
             x,
@@ -2079,11 +2086,13 @@ class LMSBall3DWidget:
 
         frame_target = 0 if reset_frame else max(0, min(prev_frame, self._steps))
         self._updating = True
-        self.frame_slider.max = self._steps
-        self.play.max = self._steps
-        self.frame_slider.value = frame_target
-        self.play.value = frame_target
-        self._updating = False
+        try:
+            self.frame_slider.max = self._steps
+            self.play.max = self._steps
+            self.frame_slider.value = frame_target
+            self.play.value = frame_target
+        finally:
+            self._updating = False
 
         self._render_frame(int(self.frame_slider.value))
 
@@ -2990,6 +2999,11 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         self._ensemble_runtime: dict[str, float] = {}
         self._display_indices: np.ndarray | None = None
         self._metric_trace_index: dict[str, dict[str, int]] = {}
+        self._async_lock = threading.Lock()
+        self._async_pending_job: dict[str, Any] | None = None
+        self._async_worker: threading.Thread | None = None
+        self._async_seq = 0
+        self._async_cancel_before = 0
         super().__init__(
             controls=controls,
             trajectory_mode="memory",
@@ -3190,6 +3204,110 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         super()._bind_events()
         self.ensemble_dropdown.observe(self._on_ensemble_display_change, names="value")
 
+    def _schedule_on_main_thread(self, fn: Callable[[], None]) -> None:
+        try:
+            from IPython import get_ipython  # type: ignore
+
+            ip = get_ipython()
+            kernel = getattr(ip, "kernel", None)
+            io_loop = getattr(kernel, "io_loop", None)
+            if io_loop is not None:
+                io_loop.add_callback(fn)
+                return
+        except Exception:
+            pass
+        fn()
+
+    def _capture_async_recompute_job(self, *, reset_frame: bool) -> dict[str, Any]:
+        params = dict(self._params())
+        target_mode = self._coerce_mode_to_active_family(
+            str(getattr(self.ensemble_dropdown, "value", self._display_mode))
+        )
+        return {
+            "params": params,
+            "prev_frame": int(self.frame_slider.value),
+            "reset_frame": bool(reset_frame),
+            "target_mode": target_mode,
+            "entropy_increase": bool(self.toggle_entropy.value),
+            "time_backward": bool(self.toggle_time_direction.value),
+            "w_mode": str(self.mode_dropdown.value),
+        }
+
+    def _is_async_cancelled(self, seq: int) -> bool:
+        with self._async_lock:
+            return int(seq) <= int(self._async_cancel_before)
+
+    def _queue_async_recompute(self, *, reset_frame: bool) -> None:
+        job = self._capture_async_recompute_job(reset_frame=reset_frame)
+        with self._async_lock:
+            self._async_seq += 1
+            seq = int(self._async_seq)
+            job["seq"] = seq
+            self._async_pending_job = job
+            # Any older running/pending job is now stale.
+            self._async_cancel_before = seq - 1
+            worker_alive = self._async_worker is not None and self._async_worker.is_alive()
+            if worker_alive:
+                return
+            self._async_worker = threading.Thread(
+                target=self._async_recompute_worker_loop,
+                name="hydro-recompute-worker",
+                daemon=True,
+            )
+            self._async_worker.start()
+
+    def _async_recompute_worker_loop(self) -> None:
+        while True:
+            with self._async_lock:
+                job = self._async_pending_job
+                self._async_pending_job = None
+            if job is None:
+                return
+            seq = int(job["seq"])
+            try:
+                result = self._compute_hydro_job_result(job=job, seq=seq)
+            except _HydroRecomputeCancelled:
+                continue
+            except Exception as exc:
+                def _report_error(err_text: str = str(exc)) -> None:
+                    self.stats_html.value = (
+                        "<b>Hydrodynamic Ensemble Stats</b>"
+                        "<div style='margin-top:6px;color:#b00020;font-family:monospace'>"
+                        f"recompute error: {err_text}</div>"
+                    )
+
+                self._schedule_on_main_thread(_report_error)
+                continue
+            if self._is_async_cancelled(seq):
+                continue
+
+            def _apply(seq_local: int = seq, job_local: dict[str, Any] = job, result_local: dict[str, Any] = result) -> None:
+                if self._is_async_cancelled(seq_local):
+                    return
+                self._apply_hydro_job_result(job=job_local, result=result_local, seq=seq_local)
+
+            self._schedule_on_main_thread(_apply)
+
+    def _on_control_change(self, _change: dict[str, Any]) -> None:
+        if self._updating:
+            return
+        self._queue_async_recompute(reset_frame=False)
+
+    def _on_time_direction_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self._sync_time_direction_button_label()
+        self._queue_async_recompute(reset_frame=False)
+
+    def _on_entropy_direction_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self._sync_entropy_button_label()
+        self._queue_async_recompute(reset_frame=False)
+
+    def _on_recompute_clicked(self, _btn: widgets.Button) -> None:
+        self._queue_async_recompute(reset_frame=False)
+
     def _sync_init_state_button_label(self) -> None:
         if self._display_mode == self._ensemble_modes[1]:
             self.toggle_init_state.description = f"Displayed: {self._init_mode_label(self._display_mode)}"
@@ -3245,18 +3363,28 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
             init_state=init_state,
         )
 
-    def _simulate_mode(self, mode: ActiveInitMode, params: dict[str, float | int]):
+    def _simulate_mode(
+        self,
+        mode: ActiveInitMode,
+        params: dict[str, float | int],
+        *,
+        entropy_increase: bool | None = None,
+        time_backward: bool | None = None,
+        w_mode: str | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ):
         d = 3
         n = int(params["N"])
         K = float(params["K"])
-        conformal_sign = -1.0 if bool(self.toggle_entropy.value) else 1.0
+        entropy_flag = bool(self.toggle_entropy.value) if entropy_increase is None else bool(entropy_increase)
+        conformal_sign = -1.0 if entropy_flag else 1.0
         omega = float(params["omega"])
         r0 = float(params["r0"])
         w_az = float(params["w_az"])
         w_el = float(params["w_el"])
         ax_az = float(params["ax_az"])
         ax_el = float(params["ax_el"])
-        dt = self._effective_dt(params)
+        dt = self._effective_dt(params, time_backward=time_backward)
         steps = int(params["steps"])
 
         weights = torch.ones(n, dtype=torch.float64) / float(n)
@@ -3304,11 +3432,12 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
             coupling=conformal_sign * K,
             dt=dt,
             steps=steps,
-            w_mode=str(self.mode_dropdown.value),
+            w_mode=str(self.mode_dropdown.value) if w_mode is None else str(w_mode),
             project_rotation=True,
             store_points="none",
             store_dtype=torch.float32,
             preallocate=True,
+            cancel_check=cancel_check,
         )
 
     @staticmethod
@@ -3339,6 +3468,8 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         params: dict[str, float | int],
         frame_name: Literal["lab", "body"],
         sample_idx: np.ndarray | None,
+        time_backward: bool | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, np.ndarray]:
         z_series = traj_cache["z_body"] if frame_name == "body" else traj_cache["z_lab"]
         Z_series = traj_cache["Z_body"] if frame_name == "body" else traj_cache["Z_lab"]
@@ -3362,6 +3493,8 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         axis_final_u = axis_final / max(axis_final_n, 1e-12)
 
         for t in range(t_count):
+            if cancel_check is not None and bool(cancel_check()):
+                raise _HydroRecomputeCancelled("Hydro metrics computation cancelled.")
             pts = self._reconstruct_points_from_cache(
                 traj_cache=traj_cache,
                 base_points=base_points,
@@ -3405,7 +3538,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                     sample_size=min(int(pts.shape[0]), 420),
                 )
 
-        dt_eff = self._effective_dt(params)
+        dt_eff = self._effective_dt(params, time_backward=time_backward)
         if abs(dt_eff) < 1e-12:
             dt_eff = 1.0
         entropy_rate = np.gradient(entropy, dt_eff)
@@ -3418,6 +3551,135 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
             "var_perp": var_perp,
             "var_aligned": var_aligned,
         }
+
+    def _compute_hydro_job_result(self, *, job: dict[str, Any], seq: int) -> dict[str, Any]:
+        params = dict(job["params"])
+        entropy_increase = bool(job["entropy_increase"])
+        time_backward = bool(job["time_backward"])
+        w_mode = str(job["w_mode"])
+        steps = int(params["steps"])
+
+        ensemble_state: dict[str, dict[str, Any]] = {}
+        ensemble_metrics: dict[str, dict[str, dict[str, np.ndarray]]] = {}
+        ensemble_runtime: dict[str, float] = {}
+
+        def _cancel_check() -> bool:
+            return self._is_async_cancelled(seq)
+
+        for mode in self._ensemble_modes:
+            if _cancel_check():
+                raise _HydroRecomputeCancelled("Hydro recompute cancelled before simulation.")
+            t0 = time.perf_counter()
+            traj = self._simulate_mode(
+                mode,
+                params,
+                entropy_increase=entropy_increase,
+                time_backward=time_backward,
+                w_mode=w_mode,
+                cancel_check=_cancel_check,
+            )
+            elapsed = float(time.perf_counter() - t0)
+            ensemble_runtime[mode] = elapsed
+            if _cancel_check():
+                raise _HydroRecomputeCancelled("Hydro recompute cancelled after simulation.")
+
+            base_points_np = np.ascontiguousarray(
+                np.asarray(traj.base_points.detach().cpu().numpy(), dtype=np.float32)
+            )
+            traj_cache = {
+                "w": np.ascontiguousarray(np.asarray(traj.w.detach().cpu().numpy(), dtype=np.float32)),
+                "zeta": np.ascontiguousarray(np.asarray(traj.zeta.detach().cpu().numpy(), dtype=np.float32)),
+                "z_lab": np.ascontiguousarray(np.asarray(traj.z.detach().cpu().numpy(), dtype=np.float32)),
+                "z_body": np.ascontiguousarray(np.asarray((-traj.w).detach().cpu().numpy(), dtype=np.float32)),
+                "Z_lab": np.ascontiguousarray(np.asarray(traj.Z.detach().cpu().numpy(), dtype=np.float32)),
+                "Z_body": np.ascontiguousarray(np.asarray(traj.Z_body.detach().cpu().numpy(), dtype=np.float32)),
+            }
+
+            n_points = int(base_points_np.shape[0])
+            if n_points <= self.display_points_cap:
+                display_idx = np.arange(n_points, dtype=np.int32)
+            else:
+                stride = max(1, int(math.ceil(n_points / float(self.display_points_cap))))
+                display_idx = np.arange(0, n_points, stride, dtype=np.int32)[: self.display_points_cap]
+
+            metric_cap = min(n_points, max(2400, self.display_points_cap * 2))
+            metric_idx: np.ndarray | None
+            if n_points <= metric_cap:
+                metric_idx = None
+            else:
+                stride_m = max(1, int(math.ceil(n_points / float(metric_cap))))
+                metric_idx = np.arange(0, n_points, stride_m, dtype=np.int32)[:metric_cap]
+
+            metrics_lab = self._compute_mode_metrics(
+                traj_cache=traj_cache,
+                base_points=base_points_np,
+                params=params,
+                frame_name="lab",
+                sample_idx=metric_idx,
+                time_backward=time_backward,
+                cancel_check=_cancel_check,
+            )
+            metrics_body = self._compute_mode_metrics(
+                traj_cache=traj_cache,
+                base_points=base_points_np,
+                params=params,
+                frame_name="body",
+                sample_idx=metric_idx,
+                time_backward=time_backward,
+                cancel_check=_cancel_check,
+            )
+
+            ensemble_state[mode] = {
+                "traj": traj_cache,
+                "base_points": base_points_np,
+                "display_idx": display_idx,
+            }
+            ensemble_metrics[mode] = {"lab": metrics_lab, "body": metrics_body}
+            del traj
+
+        return {
+            "params": params,
+            "steps": steps,
+            "ensemble_state": ensemble_state,
+            "ensemble_metrics": ensemble_metrics,
+            "ensemble_runtime": ensemble_runtime,
+        }
+
+    def _apply_hydro_job_result(self, *, job: dict[str, Any], result: dict[str, Any], seq: int) -> None:
+        if self._is_async_cancelled(seq):
+            return
+        params = dict(result["params"])
+        self._params_cache = dict(params)
+        self._ensemble_state = result["ensemble_state"]
+        self._ensemble_metrics = result["ensemble_metrics"]
+        self._ensemble_runtime = result["ensemble_runtime"]
+        self._steps = int(result["steps"])
+
+        prev_frame = int(job["prev_frame"])
+        reset_frame = bool(job["reset_frame"])
+        target_mode = self._coerce_mode_to_active_family(str(job["target_mode"]))
+
+        self._last_overlay_frame = -10**9
+        self._last_path_frame = -10**9
+
+        frame_target = 0 if reset_frame else max(0, min(prev_frame, self._steps))
+        self._updating = True
+        try:
+            self.frame_slider.max = self._steps
+            self.play.max = self._steps
+            self.frame_slider.value = frame_target
+            self.play.value = frame_target
+            if target_mode not in self._ensemble_state:
+                target_mode = self._ensemble_modes[0]
+                self.ensemble_dropdown.value = target_mode
+        finally:
+            self._updating = False
+
+        if target_mode not in self._ensemble_state:
+            target_mode = self._ensemble_modes[0]
+        self._select_display_mode(target_mode)
+        self._refresh_metric_series(params)
+        self._render_frame(int(self.frame_slider.value))
 
     def _select_display_mode(self, mode: str) -> None:
         mode = self._coerce_mode_to_active_family(mode)
@@ -3525,11 +3787,13 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
 
         frame_target = 0 if reset_frame else max(0, min(prev_frame, self._steps))
         self._updating = True
-        self.frame_slider.max = self._steps
-        self.play.max = self._steps
-        self.frame_slider.value = frame_target
-        self.play.value = frame_target
-        self._updating = False
+        try:
+            self.frame_slider.max = self._steps
+            self.play.max = self._steps
+            self.frame_slider.value = frame_target
+            self.play.value = frame_target
+        finally:
+            self._updating = False
 
         target_mode = self._coerce_mode_to_active_family(str(getattr(self.ensemble_dropdown, "value", self._display_mode)))
         if target_mode not in self._ensemble_state:
