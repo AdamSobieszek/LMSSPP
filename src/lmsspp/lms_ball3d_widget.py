@@ -1025,6 +1025,28 @@ class LMSBall3DWidget:
         self.play.interval = interval
         self._sync_speed_button_labels()
 
+    def _is_playing(self) -> bool:
+        """Compatibility wrapper across ipywidgets versions.
+
+        Some environments (notably Colab + older widget stacks) do not expose
+        `Play.playing`. In that case we keep a local fallback flag.
+        """
+        attr = getattr(self.play, "playing", None)
+        if attr is None:
+            return bool(getattr(self, "_play_running_fallback", False))
+        try:
+            return bool(attr)
+        except Exception:
+            return bool(getattr(self, "_play_running_fallback", False))
+
+    def _set_playing(self, value: bool) -> None:
+        self._play_running_fallback = bool(value)
+        if hasattr(self.play, "playing"):
+            try:
+                self.play.playing = bool(value)
+            except Exception:
+                pass
+
     def _time_direction_sign(self, *, time_backward: bool | None = None) -> float:
         backward = bool(self.toggle_time_direction.value) if time_backward is None else bool(time_backward)
         return -1.0 if backward else 1.0
@@ -1036,12 +1058,12 @@ class LMSBall3DWidget:
         return self._time_direction_sign(time_backward=time_backward) * dt_mag
 
     def _overlay_stride(self) -> int:
-        if not self.play.playing:
+        if not self._is_playing():
             return 1
         return max(1, min(16, int(round(self._playback_speed))))
 
     def _path_stride(self) -> int:
-        if not self.play.playing:
+        if not self._is_playing():
             return 1
         return max(1, min(12, int(round(self._playback_speed * 0.8))))
 
@@ -2146,7 +2168,7 @@ class LMSBall3DWidget:
                 self.sphere_fig.data[idx + 3].z = [float(Z_hat_disp[2])]
 
                 if show_paths and path_update:
-                    path_decim = 1 if not self.play.playing else max(1, (t + 1) // 1200)
+                    path_decim = 1 if not self._is_playing() else max(1, (t + 1) // 1200)
                     if path_decim > 1:
                         path_idx = np.arange(0, t + 1, path_decim, dtype=np.int32)
                         if path_idx[-1] != t:
@@ -2324,7 +2346,7 @@ class LMSBall3DWidget:
         # Reset transient drag-pause state and restart play deterministically.
         self._paused_for_drag = False
         self._was_playing_before_drag = False
-        self.play.playing = False
+        self._set_playing(False)
         self.play.step = direction
         cur = int(self.frame_slider.value)
         if direction < 0 and cur <= self.frame_slider.min:
@@ -2338,7 +2360,7 @@ class LMSBall3DWidget:
 
         # Guard against false camera-change pauses right after starting playback.
         self._ignore_camera_pause_until = time.monotonic() + 0.30
-        self.play.playing = True
+        self._set_playing(True)
 
     def _on_play_forward_clicked(self, _btn: widgets.Button) -> None:
         self._start_play(direction=1)
@@ -2395,14 +2417,14 @@ class LMSBall3DWidget:
 
         if now < self._ignore_camera_pause_until:
             return
-        if changed and self.play.playing and not self._paused_for_drag:
+        if changed and self._is_playing() and not self._paused_for_drag:
             self._was_playing_before_drag = True
             self._paused_for_drag = True
-            self.play.playing = False
+            self._set_playing(False)
 
     def _on_plot_edits_completed(self) -> None:
         if self._paused_for_drag and self._was_playing_before_drag:
-            self.play.playing = True
+            self._set_playing(True)
         self._paused_for_drag = False
         self._was_playing_before_drag = False
 
@@ -2452,7 +2474,7 @@ class LMSBall3DBackwardTwoSheetWidget(LMSBall3DWidget):
 
     def _path_stride(self) -> int:
         """Backward/two-sheet view needs stronger throttling for base path traces."""
-        if not self.play.playing:
+        if not self._is_playing():
             return 1
         return max(8, min(48, int(round(self._playback_speed * 6.0))))
 
@@ -3854,7 +3876,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 self.sphere_fig.data[idx + 3].z = [float(Z_hat_disp[2])]
 
                 if show_paths and path_update:
-                    path_decim = 1 if not self.play.playing else max(1, (t + 1) // 1200)
+                    path_decim = 1 if not self._is_playing() else max(1, (t + 1) // 1200)
                     if path_decim > 1:
                         path_idx = np.arange(0, t + 1, path_decim, dtype=np.int32)
                         if path_idx[-1] != t:

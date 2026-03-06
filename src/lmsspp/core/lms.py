@@ -1,6 +1,6 @@
 """LMS dynamics utilities for Kuramoto-on-sphere models.
 
-This module implements the real-valued Lohe-Matthews-Strogatz (LMS) reduction
+This module implements the real-valued Lipton-Morelo-Strogatz (LMS) reduction
 for Kuramoto dynamics on S^{d-1}, with PyTorch autograd support for
 hyperbolic-metric gradients on the Poincare ball B^d.
 
@@ -1062,6 +1062,24 @@ def make_lms_ball3d_hydrodynamic_ensemble_widget(**kwargs):
     except Exception:
         from lms_ball3d_widget import LMSBall3DHydrodynamicEnsembleWidget  # type: ignore
     return LMSBall3DHydrodynamicEnsembleWidget(**kwargs)
+
+
+def make_cucker_smale_ball3d_widget(**kwargs):
+    """Create the Cucker-Smale B^3 display widget (lazy import)."""
+    try:
+        from ..cucker_smale_ball3d_widget import CuckerSmaleBall3DWidget
+    except Exception:
+        from cucker_smale_ball3d_widget import CuckerSmaleBall3DWidget  # type: ignore
+    return CuckerSmaleBall3DWidget(**kwargs)
+
+
+def make_cucker_smale_ball3d_hydrodynamic_ensemble_widget(**kwargs):
+    """Create the Cucker-Smale hydrodynamic-ensemble widget (lazy import)."""
+    try:
+        from ..cucker_smale_ball3d_widget import CuckerSmaleBall3DHydrodynamicEnsembleWidget
+    except Exception:
+        from cucker_smale_ball3d_widget import CuckerSmaleBall3DHydrodynamicEnsembleWidget  # type: ignore
+    return CuckerSmaleBall3DHydrodynamicEnsembleWidget(**kwargs)
 
 
 def make_lms_iframe_widget(
