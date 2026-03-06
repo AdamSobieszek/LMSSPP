@@ -18,9 +18,9 @@ try:
     from .core import cucker_smale as cs_backend
     from .lms_ball3d_widget import (
         LMS3DControlSpec,
-        ActiveInitMode,
-        InitMetricMode,
-        LMSBall3DHydrodynamicEnsembleWidget,
+        EnergyStateMode,
+        EntropyCoordinateMode,
+        LMSBall3DEntropyShellEnsembleWidget,
         LMSBall3DWidget,
         _HydroRecomputeCancelled,
         _angles_to_unit,
@@ -29,9 +29,9 @@ except Exception:
     import cucker_smale as cs_backend  # type: ignore
     from lms_ball3d_widget import (  # type: ignore
         LMS3DControlSpec,
-        ActiveInitMode,
-        InitMetricMode,
-        LMSBall3DHydrodynamicEnsembleWidget,
+        EnergyStateMode,
+        EntropyCoordinateMode,
+        LMSBall3DEntropyShellEnsembleWidget,
         LMSBall3DWidget,
         _HydroRecomputeCancelled,
         _angles_to_unit,
@@ -132,10 +132,10 @@ class _CuckerSmaleWidgetMixin:
     backend: CuckerSmaleBackendContract = cs_backend  # type: ignore[assignment]
 
     def _cs_mode_scales(self, mode: str) -> tuple[float, float]:
-        mode_key = self._canonical_init_mode(mode)
-        if mode_key in {"entropy_low", "var_perp_low", "varmin_parallel_perp"}:
+        mode_key = str(self._canonical_init_mode(mode))
+        if mode_key == "min_energy":
             return 0.55, 0.55
-        if mode_key in {"entropy_high", "var_perp_high", "varmax_parallel_perp"}:
+        if mode_key == "max_energy":
             return 1.35, 1.35
         return 1.0, 1.0
 
@@ -254,7 +254,7 @@ class CuckerSmaleBall3DWidget(_CuckerSmaleWidgetMixin, LMSBall3DWidget):
 
 class CuckerSmaleBall3DHydrodynamicEnsembleWidget(
     _CuckerSmaleWidgetMixin,
-    LMSBall3DHydrodynamicEnsembleWidget,
+    LMSBall3DEntropyShellEnsembleWidget,
 ):
     """Hydrodynamic-style ensemble widget using Cucker-Smale backend trajectories."""
 
@@ -262,10 +262,12 @@ class CuckerSmaleBall3DHydrodynamicEnsembleWidget(
         self,
         *,
         controls: tuple[LMS3DControlSpec, ...] = CS_HYDRO_DEFAULT_CONTROLS,
-        init_metric_mode: InitMetricMode = "entropy",
+        entropy_coordinate_mode: EntropyCoordinateMode = "kernel",
         **kwargs: Any,
     ) -> None:
-        super().__init__(controls=controls, init_metric_mode=init_metric_mode, **kwargs)
+        if "init_metric_mode" in kwargs:
+            kwargs.pop("init_metric_mode")
+        super().__init__(controls=controls, entropy_coordinate_mode=entropy_coordinate_mode, **kwargs)
 
     def _build_controls(self) -> None:
         super()._build_controls()
@@ -277,7 +279,7 @@ class CuckerSmaleBall3DHydrodynamicEnsembleWidget(
 
     def _simulate_mode(
         self,
-        mode: ActiveInitMode,
+        mode: EnergyStateMode,
         params: dict[str, float | int],
         *,
         entropy_increase: bool | None = None,

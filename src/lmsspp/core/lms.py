@@ -1047,21 +1047,21 @@ def make_lms_ball3d_widget(**kwargs):
 
 
 def make_lms_ball3d_backward_two_sheet_widget(**kwargs):
-    """Create the backward-time LMS B^3/S^2 widget with outer-sheet traces."""
+    """Create the LMS entropy-shell two-sheet widget with outer-sheet traces."""
     try:
-        from ..lms_ball3d_widget import LMSBall3DBackwardTwoSheetWidget
+        from ..lms_ball3d_widget import LMSBall3DEntropyShellTwoSheetWidget
     except Exception:
-        from lms_ball3d_widget import LMSBall3DBackwardTwoSheetWidget  # type: ignore
-    return LMSBall3DBackwardTwoSheetWidget(**kwargs)
+        from lms_ball3d_widget import LMSBall3DEntropyShellTwoSheetWidget  # type: ignore
+    return LMSBall3DEntropyShellTwoSheetWidget(**kwargs)
 
 
 def make_lms_ball3d_hydrodynamic_ensemble_widget(**kwargs):
-    """Create the high-N hydrodynamic-approximation ensemble LMS widget."""
+    """Create the LMS entropy-shell ensemble widget."""
     try:
-        from ..lms_ball3d_widget import LMSBall3DHydrodynamicEnsembleWidget
+        from ..lms_ball3d_widget import LMSBall3DEntropyShellEnsembleWidget
     except Exception:
-        from lms_ball3d_widget import LMSBall3DHydrodynamicEnsembleWidget  # type: ignore
-    return LMSBall3DHydrodynamicEnsembleWidget(**kwargs)
+        from lms_ball3d_widget import LMSBall3DEntropyShellEnsembleWidget  # type: ignore
+    return LMSBall3DEntropyShellEnsembleWidget(**kwargs)
 
 
 def make_cucker_smale_ball3d_widget(**kwargs):

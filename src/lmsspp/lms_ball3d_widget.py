@@ -77,6 +77,32 @@ HYDRO_DEFAULT_CONTROLS = (
 )
 
 
+ENTROPY_SHELL_DEFAULT_CONTROLS = (
+    LMS3DControlSpec("N", "Oscillators N", 8, 300, 1, 150, integer=True, readout_format=".0f"),
+    LMS3DControlSpec("K", "Coupling K", 0.0, 5.0, 0.02, 1.0, readout_format=".2f"),
+    LMS3DControlSpec("omega", "Rotation rate omega", -10.0, 10.0, 0.02, 3.0, readout_format=".2f"),
+    LMS3DControlSpec("dt", "Time step dt", 1e-4, 8e-2, 1e-4, 5e-2, readout_format=".4f"),
+    LMS3DControlSpec("w_az", "dipole axis azimuth", -math.pi, math.pi, 0.02, 0.2, readout_format=".2f"),
+    LMS3DControlSpec("w_el", "dipole axis elevation", -0.5 * math.pi, 0.5 * math.pi, 0.02, 0.25, readout_format=".2f"),
+    LMS3DControlSpec("ax_az", "rotation axis azimuth", -math.pi, math.pi, 0.02, 0.0, readout_format=".2f"),
+    LMS3DControlSpec("ax_el", "rotation axis elevation", -0.5 * math.pi, 0.5 * math.pi, 0.02, 0.5 * math.pi, readout_format=".2f"),
+    LMS3DControlSpec("steps", "Integration steps", 200, 2000, 1, 400, integer=True, readout_format=".0f"),
+)
+
+
+ENTROPY_SHELL_HYDRO_DEFAULT_CONTROLS = (
+    LMS3DControlSpec("N", "Oscillators N", 100, 12000, 50, 1800, integer=True, readout_format=".0f"),
+    LMS3DControlSpec("K", "Coupling K", 0.0, 5.0, 0.02, 1.0, readout_format=".2f"),
+    LMS3DControlSpec("omega", "Rotation rate omega", -10.0, 10.0, 0.02, 3.0, readout_format=".2f"),
+    LMS3DControlSpec("dt", "Time step dt", 1e-4, 8e-2, 1e-4, 5e-2, readout_format=".4f"),
+    LMS3DControlSpec("w_az", "dipole axis azimuth", -math.pi, math.pi, 0.02, 0.2, readout_format=".2f"),
+    LMS3DControlSpec("w_el", "dipole axis elevation", -0.5 * math.pi, 0.5 * math.pi, 0.02, 0.25, readout_format=".2f"),
+    LMS3DControlSpec("ax_az", "rotation axis azimuth", -math.pi, math.pi, 0.02, 0.0, readout_format=".2f"),
+    LMS3DControlSpec("ax_el", "rotation axis elevation", -0.5 * math.pi, 0.5 * math.pi, 0.02, 0.5 * math.pi, readout_format=".2f"),
+    LMS3DControlSpec("steps", "Integration steps", 120, 1800, 1, 420, integer=True, readout_format=".0f"),
+)
+
+
 InitMode = Literal[
     "entropy_high",
     "entropy_low",
@@ -96,10 +122,106 @@ OptimizedInitMode = Literal[
 ]
 ActiveInitMode = Literal["entropy_high", "entropy_low", "var_perp_high", "var_perp_low", "poisson"]
 InitMetricMode = Literal["entropy", "perp_variance"]
+EnergyStateMode = Literal["min_energy", "poisson", "max_energy"]
+EntropyCoordinateMode = Literal["kernel", "continuum_poisson"]
+ShellConstraintMode = Literal["constant_entropy", "constant_energy"]
 
 
 class _HydroRecomputeCancelled(Exception):
     """Internal cooperative-cancellation signal for hydro recompute jobs."""
+
+
+@dataclass(frozen=True)
+class _EntropyShellTable:
+    r_grid: np.ndarray
+    kernel_entropy: np.ndarray
+    continuum_poisson_entropy: np.ndarray
+    kernel_kappa: float
+
+    def entropy_values(self, mode: EntropyCoordinateMode) -> np.ndarray:
+        if mode == "continuum_poisson":
+            return self.continuum_poisson_entropy
+        return self.kernel_entropy
+
+    def invert_entropy(self, target: float, mode: EntropyCoordinateMode) -> tuple[float, float]:
+        values = np.asarray(self.entropy_values(mode), dtype=np.float64)
+        if values.ndim != 1 or values.size == 0:
+            return 0.0, 1.0
+        target_clip = float(np.clip(target, float(values[-1]), float(values[0])))
+        vals_inc = values[::-1]
+        r_inc = np.asarray(self.r_grid[::-1], dtype=np.float64)
+        r = float(np.interp(target_clip, vals_inc, r_inc))
+        kernel_target = float(np.interp(r, self.r_grid, self.kernel_entropy))
+        return r, kernel_target
+
+
+def _monotone_decreasing(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64).copy()
+    if arr.size <= 1:
+        return arr
+    return np.minimum.accumulate(arr)
+
+
+def _poisson_density_s2(r: float, u: np.ndarray) -> np.ndarray:
+    rr = float(np.clip(r, 0.0, 0.999999))
+    uu = np.asarray(u, dtype=np.float64)
+    den = 1.0 + rr * rr - 2.0 * rr * uu
+    den = np.maximum(den, 1e-12)
+    num = (1.0 - rr * rr) ** 2
+    return num / (den * den)
+
+
+def _entropy_shell_table(
+    *,
+    kappa: float = 14.0,
+    grid_size: int = 220,
+    quadrature_n: int = 96,
+    r_max: float = 0.9995,
+) -> _EntropyShellTable:
+    nodes, weights = np.polynomial.legendre.leggauss(int(quadrature_n))
+    u = np.asarray(nodes, dtype=np.float64)
+    wu = np.asarray(weights, dtype=np.float64)
+    u_col = u[:, None]
+    u_row = u[None, :]
+    su = np.sqrt(np.maximum(0.0, 1.0 - u * u))
+    base_kernel = np.exp(float(kappa) * (u_col * u_row - 1.0)) * np.i0(
+        float(kappa) * (su[:, None] * su[None, :])
+    )
+
+    if abs(float(kappa)) < 1e-12:
+        pair_expect = 1.0
+    else:
+        pair_expect = (1.0 - math.exp(-2.0 * float(kappa))) / (2.0 * float(kappa))
+    h_uniform = max(-math.log(max(pair_expect, 1e-12)), 1e-12)
+
+    r_grid = np.linspace(0.0, float(r_max), int(grid_size), dtype=np.float64)
+    kernel_vals = np.zeros_like(r_grid)
+    cont_raw = np.zeros_like(r_grid)
+
+    for i, r in enumerate(r_grid):
+        rho = _poisson_density_s2(float(r), u)
+        inner = 0.5 * (base_kernel * rho[None, :] * wu[None, :]).sum(axis=1)
+        inner = np.maximum(inner, 1e-12)
+        kernel_raw = -0.5 * float(np.sum(wu * rho * np.log(inner)))
+        kernel_vals[i] = float(np.clip(kernel_raw / h_uniform, 0.0, 1.0))
+
+        rho_safe = np.maximum(rho, 1e-12)
+        cont_raw[i] = -0.5 * float(np.sum(wu * rho_safe * np.log(rho_safe)))
+
+    kernel_vals = _monotone_decreasing(kernel_vals)
+
+    kl = -cont_raw
+    kl_max = max(float(kl[-1]), 1e-12)
+    cont_vals = 1.0 - (kl / kl_max)
+    cont_vals = np.clip(cont_vals, 0.0, 1.0)
+    cont_vals = _monotone_decreasing(cont_vals)
+
+    return _EntropyShellTable(
+        r_grid=r_grid,
+        kernel_entropy=kernel_vals,
+        continuum_poisson_entropy=cont_vals,
+        kernel_kappa=float(kappa),
+    )
 
 
 def _sphere_wireframe_traces(n_lat: int = 9, n_lon: int = 18) -> list[go.Scatter3d]:
@@ -3026,6 +3148,9 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         self._async_worker: threading.Thread | None = None
         self._async_seq = 0
         self._async_cancel_before = 0
+        self._recompute_busy = False
+        self._recompute_busy_since = 0.0
+        self._recompute_busy_note = ""
         super().__init__(
             controls=controls,
             trajectory_mode="memory",
@@ -3226,6 +3351,51 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         super()._bind_events()
         self.ensemble_dropdown.observe(self._on_ensemble_display_change, names="value")
 
+    def _set_recompute_busy(self, busy: bool, *, note: str = "") -> None:
+        busy_flag = bool(busy)
+        self._recompute_busy = busy_flag
+        if busy_flag:
+            if self._recompute_busy_since <= 0.0:
+                self._recompute_busy_since = time.perf_counter()
+            if note:
+                self._recompute_busy_note = str(note)
+            body = self._strip_busy_banner(self.stats_html.value)
+            self.stats_html.value = self._busy_banner_html() + body
+        else:
+            self._recompute_busy_since = 0.0
+            self._recompute_busy_note = ""
+            self.stats_html.value = self._strip_busy_banner(self.stats_html.value)
+
+    def _busy_banner_html(self) -> str:
+        if not bool(getattr(self, "_recompute_busy", False)):
+            return ""
+        elapsed = max(0.0, time.perf_counter() - float(getattr(self, "_recompute_busy_since", 0.0)))
+        note = str(getattr(self, "_recompute_busy_note", "")).strip() or "Recomputing trajectories"
+        return (
+            "<style>@keyframes lmsspp-spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}</style>"
+            "<div style='display:flex;align-items:center;gap:8px;margin:4px 0 8px 0;"
+            "font-family:monospace;font-size:12px;color:#1f4e79'>"
+            "<span style='display:inline-block;width:10px;height:10px;border:2px solid #9ec1e6;"
+            "border-top-color:#1f77b4;border-radius:50%;animation:lmsspp-spin 0.9s linear infinite;'></span>"
+            f"<span>{note} ({elapsed:.1f}s)</span>"
+            "</div>"
+        )
+
+    @staticmethod
+    def _strip_busy_banner(html: str) -> str:
+        marker = "@keyframes lmsspp-spin"
+        idx = str(html).find(marker)
+        if idx < 0:
+            return str(html)
+        start = str(html).rfind("<style", 0, idx)
+        if start < 0:
+            return str(html)
+        end = str(html).find("</div>", idx)
+        if end < 0:
+            return str(html)
+        end += len("</div>")
+        return str(html)[:start] + str(html)[end:]
+
     def _schedule_on_main_thread(self, fn: Callable[[], None]) -> None:
         try:
             from IPython import get_ipython  # type: ignore
@@ -3261,6 +3431,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
 
     def _queue_async_recompute(self, *, reset_frame: bool) -> None:
         job = self._capture_async_recompute_job(reset_frame=reset_frame)
+        self._set_recompute_busy(True, note="Recomputing ensembles")
         with self._async_lock:
             self._async_seq += 1
             seq = int(self._async_seq)
@@ -3284,14 +3455,21 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 job = self._async_pending_job
                 self._async_pending_job = None
             if job is None:
+                self._schedule_on_main_thread(lambda: self._set_recompute_busy(False))
                 return
             seq = int(job["seq"])
             try:
                 result = self._compute_hydro_job_result(job=job, seq=seq)
             except _HydroRecomputeCancelled:
                 continue
+            except InterruptedError:
+                # Integrator-level cooperative cancellation for stale async jobs.
+                continue
             except Exception as exc:
+                if "cancelled" in str(exc).strip().lower():
+                    continue
                 def _report_error(err_text: str = str(exc)) -> None:
+                    self._set_recompute_busy(False)
                     self.stats_html.value = (
                         "<b>Hydrodynamic Ensemble Stats</b>"
                         "<div style='margin-top:6px;color:#b00020;font-family:monospace'>"
@@ -3307,6 +3485,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 if self._is_async_cancelled(seq_local):
                     return
                 self._apply_hydro_job_result(job=job_local, result=result_local, seq=seq_local)
+                self._set_recompute_busy(False)
 
             self._schedule_on_main_thread(_apply)
 
@@ -3958,7 +4137,8 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         rt_low = float(self._ensemble_runtime.get(mode_lo, 0.0))
         rt_poi = float(self._ensemble_runtime.get("poisson", 0.0))
         self.stats_html.value = (
-            "<b>Hydrodynamic Ensemble Stats</b>"
+            self._busy_banner_html()
+            + "<b>Hydrodynamic Ensemble Stats</b>"
             "<table style='font-family:monospace;font-size:12px;margin-top:6px'>"
             f"<tr><td style='padding-right:14px'>Displayed mode</td><td>{self._init_mode_label(self._display_mode)}</td></tr>"
             f"<tr><td style='padding-right:14px'>N total / shown</td><td>{n_total} / {n_display}</td></tr>"
@@ -3980,11 +4160,1101 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         )
 
 
+class _LMSEntropyShellMixin:
+    """Shared entropy-shell semantics for the concrete LMS widgets.
+
+    See `papers/LMS_FREE_ENERGY_INITIALIZATION_NOTE.md` for the mathematical
+    initialization problem implemented here.
+    """
+
+    _ENTROPY_TABLE_CACHE: dict[tuple[float, int, int, float], _EntropyShellTable] = {}
+    _ENERGY_MODES: tuple[EnergyStateMode, ...] = ("min_energy", "poisson", "max_energy")
+    _ENERGY_COLORS: dict[str, str] = {
+        "min_energy": "seagreen",
+        "poisson": "firebrick",
+        "max_energy": "royalblue",
+    }
+
+    def __init__(self, *, entropy_coordinate_mode: EntropyCoordinateMode = "kernel", **kwargs: Any) -> None:
+        entropy0_init = float(np.clip(float(kwargs.pop("entropy0", 0.84)), 0.0, 1.0))
+        energy0_init = float(np.clip(float(kwargs.pop("energy0", 0.35)), 0.0, 1.0))
+        constraint_init_raw = str(kwargs.pop("constraint_mode", "constant_entropy")).strip().lower()
+        constraint_init: ShellConstraintMode = "constant_energy" if constraint_init_raw in {"energy", "constant_energy"} else "constant_entropy"
+        self.entropy_coordinate_mode = self._canonical_entropy_coordinate_mode(entropy_coordinate_mode)
+        self._job_entropy_coordinate_mode: EntropyCoordinateMode | None = None
+        self._job_constraint_mode: ShellConstraintMode | None = None
+        super().__init__(**kwargs)
+        need_recompute = False
+        if hasattr(self, "shell_entropy_slider"):
+            prev = self._updating
+            self._updating = True
+            try:
+                if abs(float(self.shell_entropy_slider.value) - entropy0_init) > 1e-12:
+                    self.shell_entropy_slider.value = entropy0_init
+                    need_recompute = True
+                if abs(float(self.shell_energy_slider.value) - energy0_init) > 1e-12:
+                    self.shell_energy_slider.value = energy0_init
+                    need_recompute = True
+                desired_toggle = constraint_init == "constant_energy"
+                if bool(self.constraint_toggle.value) != desired_toggle:
+                    self.constraint_toggle.value = desired_toggle
+                    need_recompute = True
+            finally:
+                self._updating = prev
+            self._sync_constraint_button_label()
+            self._sync_shell_slider_styles()
+            self._refresh_state_selector_labels()
+            self._sync_recompute_button_label()
+            self._sync_init_state_button_label()
+        if hasattr(self, "_mode_colors"):
+            self._mode_colors = dict(self._ENERGY_COLORS)
+        if hasattr(self, "_ensemble_modes"):
+            self._ensemble_modes = self._ENERGY_MODES  # type: ignore[assignment]
+        if hasattr(self, "_display_mode") and getattr(self, "_display_mode", None) not in self._ENERGY_MODES:
+            self._display_mode = self._ENERGY_MODES[0]  # type: ignore[assignment]
+        self._sync_init_state_button_label()
+        if need_recompute:
+            self._on_control_change({"name": "value"})
+
+    @staticmethod
+    def _canonical_entropy_coordinate_mode(mode: str) -> EntropyCoordinateMode:
+        value = str(mode).strip().lower()
+        if value in {"continuum", "poisson", "continuum_poisson", "continuum-poisson"}:
+            return "continuum_poisson"
+        return "kernel"
+
+    @classmethod
+    def _entropy_shell_table(cls, *, kappa: float = 14.0) -> _EntropyShellTable:
+        key = (float(kappa), 220, 96, 0.9995)
+        table = cls._ENTROPY_TABLE_CACHE.get(key)
+        if table is None:
+            table = _entropy_shell_table(
+                kappa=float(kappa),
+                grid_size=220,
+                quadrature_n=96,
+                r_max=0.9995,
+            )
+            cls._ENTROPY_TABLE_CACHE[key] = table
+        return table
+
+    @staticmethod
+    def _active_modes_for_init_metric_mode(_mode: str) -> tuple[EnergyStateMode, ...]:
+        return _LMSEntropyShellMixin._ENERGY_MODES
+
+    def _active_mode_order(self) -> tuple[EnergyStateMode, ...]:
+        return self._ENERGY_MODES
+
+    @staticmethod
+    def _canonical_init_mode(mode: str) -> str:
+        aliases = {
+            "min_energy": "min_energy",
+            "minimum_energy": "min_energy",
+            "low_energy": "min_energy",
+            "low-energy": "min_energy",
+            "poisson": "poisson",
+            "max_energy": "max_energy",
+            "maximum_energy": "max_energy",
+            "high_energy": "max_energy",
+            "high-energy": "max_energy",
+            "entropy_low": "min_energy",
+            "entropy_high": "max_energy",
+            "low": "min_energy",
+            "high": "max_energy",
+        }
+        return aliases.get(str(mode).strip().lower(), "min_energy")
+
+    def _coerce_mode_to_active_family(self, mode: str) -> str:
+        canonical = self._canonical_init_mode(mode)
+        if canonical not in self._ENERGY_MODES:
+            return self._ENERGY_MODES[0]
+        return canonical
+
+    def _current_constraint_mode(self) -> ShellConstraintMode:
+        if self._job_constraint_mode is not None:
+            return self._job_constraint_mode
+        if hasattr(self, "constraint_toggle"):
+            return "constant_energy" if bool(self.constraint_toggle.value) else "constant_entropy"
+        return "constant_entropy"
+
+    def _init_mode_label(self, mode: str) -> str:
+        if self._current_constraint_mode() == "constant_energy":
+            labels = {
+                "min_energy": "Min Entropy",
+                "poisson": "Poisson",
+                "max_energy": "Max Entropy",
+            }
+            return labels.get(str(mode), str(mode))
+        labels = {
+            "min_energy": "Min Energy",
+            "poisson": "Poisson",
+            "max_energy": "Max Energy",
+        }
+        return labels.get(str(mode), str(mode))
+
+    def _init_mode_short_tag(self, mode: str) -> str:
+        if self._current_constraint_mode() == "constant_energy":
+            tags = {
+                "min_energy": "min-S",
+                "poisson": "poisson",
+                "max_energy": "max-S",
+            }
+            return tags.get(str(mode), str(mode))
+        tags = {
+            "min_energy": "min-E",
+            "poisson": "poisson",
+            "max_energy": "max-E",
+        }
+        return tags.get(str(mode), str(mode))
+
+    def _primary_metric_title(self) -> str:
+        return "Entropy"
+
+    def _primary_metric_series_name(self) -> str:
+        return "entropy"
+
+    def _primary_rate_series_name(self) -> str:
+        return "dS/dt"
+
+    def _sync_entropy_button_label(self) -> None:
+        if bool(self.toggle_entropy.value):
+            self.toggle_entropy.description = "Align: Increase"
+            self.toggle_entropy.button_style = "warning"
+        else:
+            self.toggle_entropy.description = "Align: Dissipate"
+            self.toggle_entropy.button_style = "success"
+
+    def _sync_constraint_button_label(self) -> None:
+        mode = self._current_constraint_mode()
+        if mode == "constant_energy":
+            self.constraint_toggle.description = "Constraint: Energy"
+            self.constraint_toggle.button_style = "warning"
+        else:
+            self.constraint_toggle.description = "Constraint: Entropy"
+            self.constraint_toggle.button_style = "info"
+
+    def _sync_recompute_button_label(self) -> None:
+        if hasattr(self, "ensemble_dropdown"):
+            if self._current_constraint_mode() == "constant_energy":
+                self.btn_recompute.description = "Recompute S states"
+            else:
+                self.btn_recompute.description = "Recompute E states"
+            return
+        self.btn_recompute.description = "Recompute state"
+
+    def _sync_shell_slider_styles(self) -> None:
+        mode = self._current_constraint_mode()
+        active_color = "#2e7d32"
+        inactive_color = "#b0b0b0"
+        if mode == "constant_entropy":
+            self.shell_entropy_slider.style.handle_color = "#2e7d32"
+            self.shell_energy_slider.style.handle_color = "#9e9e9e"
+            self._shell_entropy_row.layout.border = f"2px solid {active_color}"
+            self._shell_energy_row.layout.border = f"1px solid {inactive_color}"
+        else:
+            self.shell_entropy_slider.style.handle_color = "#9e9e9e"
+            self.shell_energy_slider.style.handle_color = "#2e7d32"
+            self._shell_entropy_row.layout.border = f"1px solid {inactive_color}"
+            self._shell_energy_row.layout.border = f"2px solid {active_color}"
+        self._shell_entropy_row.layout.padding = "2px 6px"
+        self._shell_energy_row.layout.padding = "2px 6px"
+        self._shell_entropy_row.layout.border_radius = "6px"
+        self._shell_energy_row.layout.border_radius = "6px"
+
+    def _refresh_state_selector_labels(self) -> None:
+        if hasattr(self, "ensemble_dropdown"):
+            mode_hi, mode_lo, mode_poi = self._ENERGY_MODES
+            self.ensemble_dropdown.options = [
+                (f"Display: {self._init_mode_label(mode_hi)}", mode_hi),
+                (f"Display: {self._init_mode_label(mode_lo)}", mode_lo),
+                (f"Display: {self._init_mode_label(mode_poi)}", mode_poi),
+            ]
+            self.ensemble_dropdown.description = "Displayed state"
+        if hasattr(self, "metrics_fig") and len(getattr(self.metrics_fig.layout, "annotations", ())) > 0:
+            # Keep row-1 title consistent with the active initialization family.
+            mode_hi, mode_lo, mode_poi = self._ENERGY_MODES
+            self.metrics_fig.layout.annotations[0].text = (
+                "Magnitudes: |w| and |Z|/K "
+                f"({self._init_mode_label(mode_hi).lower()}/"
+                f"{self._init_mode_label(mode_lo).lower()}/"
+                f"{self._init_mode_label(mode_poi).lower()})"
+            )
+        if hasattr(self, "_metric_trace_index") and hasattr(self, "metrics_fig"):
+            for mode in self._ENERGY_MODES:
+                mode_tag = self._init_mode_short_tag(mode)
+                idx_map = self._metric_trace_index.get(mode, {})
+                if "w_norm" in idx_map:
+                    self.metrics_fig.data[idx_map["w_norm"]].name = f"{mode_tag}: |w|"
+                if "z_norm" in idx_map:
+                    self.metrics_fig.data[idx_map["z_norm"]].name = f"{mode_tag}: |Z|/K"
+                if "entropy" in idx_map:
+                    self.metrics_fig.data[idx_map["entropy"]].name = f"{mode_tag}: {self._primary_metric_series_name()}"
+                if "entropy_rate" in idx_map:
+                    self.metrics_fig.data[idx_map["entropy_rate"]].name = f"{mode_tag}: {self._primary_rate_series_name()}"
+                if "var_total" in idx_map:
+                    self.metrics_fig.data[idx_map["var_total"]].name = f"{mode_tag}: var total"
+                if "var_perp" in idx_map:
+                    self.metrics_fig.data[idx_map["var_perp"]].name = f"{mode_tag}: var perp"
+                if "var_aligned" in idx_map:
+                    self.metrics_fig.data[idx_map["var_aligned"]].name = f"{mode_tag}: var aligned"
+
+    def _sync_init_state_button_label(self) -> None:
+        if hasattr(self, "_display_mode"):
+            mode = self._coerce_mode_to_active_family(str(getattr(self, "_display_mode", self._ENERGY_MODES[0])))
+            if hasattr(self, "_display_mode"):
+                self._display_mode = mode  # type: ignore[assignment]
+            self.toggle_init_state.description = f"Displayed: {self._init_mode_label(mode)}"
+            self.toggle_init_state.button_style = "info" if mode == "poisson" else ("success" if mode == "min_energy" else "")
+            return
+
+        mode = self._coerce_mode_to_active_family(str(getattr(self, "_init_state_mode", self._ENERGY_MODES[0])))
+        self._init_state_mode = mode  # type: ignore[assignment]
+        self.toggle_init_state.description = f"Initial State: {self._init_mode_label(mode)}"
+        self.toggle_init_state.button_style = "info" if mode == "poisson" else ("success" if mode == "min_energy" else "")
+
+    def _controls_header_html(self) -> str:
+        if hasattr(self, "_ensemble_modes"):
+            return "<b>LMS entropy-shell ensemble widget controls</b>"
+        return "<b>LMS entropy-shell two-sheet widget controls</b>"
+
+    def _build_controls(self) -> None:
+        super()._build_controls()
+        if self.controls_box.children and isinstance(self.controls_box.children[0], widgets.HTML):
+            self.controls_box.children[0].value = self._controls_header_html()
+
+        self.toggle_time_direction.value = False
+        self.toggle_time_direction.disabled = True
+        self.toggle_time_direction.layout = widgets.Layout(display="none")
+
+        self.entropy_coordinate_dropdown = widgets.Dropdown(
+            options=[
+                ("Kernel entropy", "kernel"),
+                ("Continuum Poisson entropy", "continuum_poisson"),
+            ],
+            value=self.entropy_coordinate_mode,
+            description="Entropy coordinate",
+            layout=widgets.Layout(width="300px"),
+            style={"description_width": "initial"},
+        )
+
+        self.constraint_toggle = widgets.ToggleButton(
+            value=False,
+            description="Constraint: Entropy",
+            layout=widgets.Layout(width="360px"),
+        )
+        self.shell_entropy_slider = widgets.FloatSlider(
+            value=0.84,
+            min=0.0,
+            max=1.0,
+            step=1e-3,
+            description="Entropy S0",
+            readout=True,
+            readout_format=".3f",
+            continuous_update=False,
+            layout=widgets.Layout(width="760px"),
+            style={"description_width": "120px"},
+        )
+        self.shell_energy_slider = widgets.FloatSlider(
+            value=0.35,
+            min=0.0,
+            max=1.0,
+            step=1e-3,
+            description="Energy shell q0",
+            readout=True,
+            readout_format=".3f",
+            continuous_update=False,
+            layout=widgets.Layout(width="760px"),
+            style={"description_width": "120px"},
+        )
+        self._shell_entropy_row = widgets.HBox([self.shell_entropy_slider], layout=widgets.Layout(width=self._control_width))
+        self._shell_energy_row = widgets.HBox([self.shell_energy_slider], layout=widgets.Layout(width=self._control_width))
+
+        if hasattr(self, "ensemble_dropdown"):
+            self.ensemble_dropdown.description = "Displayed state"
+
+        self.mode_dropdown.layout = widgets.Layout(width="220px")
+        self.layout_dropdown.layout = widgets.Layout(width="360px")
+        self.btn_recompute.description = (
+            "Recompute all energy states" if hasattr(self, "ensemble_dropdown") else "Recompute state"
+        )
+        self._sync_entropy_button_label()
+        self._sync_constraint_button_label()
+        self._sync_recompute_button_label()
+        self._sync_init_state_button_label()
+        self._refresh_state_selector_labels()
+        self._sync_shell_slider_styles()
+
+        button_col_layout = widgets.Layout(width="180px")
+        for btn in (
+            self.btn_play_forward,
+            self.btn_play_backward,
+            self.toggle_entropy,
+            self.constraint_toggle,
+            self.btn_recompute,
+            self.toggle_init_state,
+            self.btn_toggle_frame,
+            self.btn_speed_half,
+            self.btn_speed_double,
+        ):
+            btn.layout = button_col_layout
+        self.play.layout = button_col_layout
+
+        button_grid = widgets.HBox(
+            [
+                widgets.VBox([self.btn_play_forward, self.play]),
+                widgets.VBox([self.btn_play_backward, self.btn_recompute]),
+                widgets.VBox([self.toggle_entropy, self.constraint_toggle]),
+                widgets.VBox([self.toggle_init_state, self.btn_toggle_frame]),
+                widgets.VBox([self.btn_speed_half, self.btn_speed_double]),
+            ],
+            layout=widgets.Layout(align_items="flex-start", width=self._control_width),
+        )
+
+        params_accordion = self.controls_box.children[-1]
+        children: list[widgets.Widget] = [
+            self.controls_box.children[0],
+            button_grid,
+            self.frame_slider,
+            self._shell_entropy_row,
+            self._shell_energy_row,
+        ]
+        if hasattr(self, "ensemble_dropdown"):
+            children.append(
+                widgets.HBox([self.ensemble_dropdown], layout=widgets.Layout(width=self._control_width))
+            )
+        children.append(
+            widgets.HBox(
+                [self.mode_dropdown, self.entropy_coordinate_dropdown, self.layout_dropdown],
+                layout=widgets.Layout(width=self._control_width, justify_content="space-between"),
+            )
+        )
+        children.append(widgets.HBox([self.show_paths, self.show_vectors]))
+        children.append(params_accordion)
+        self.controls_box.children = tuple(children)
+
+    def _build_figures(self) -> None:
+        if hasattr(self, "_ensemble_modes"):
+            self._mode_colors = dict(self._ENERGY_COLORS)
+        super()._build_figures()
+        self._refresh_state_selector_labels()
+
+    def _bind_events(self) -> None:
+        super()._bind_events()
+        self.entropy_coordinate_dropdown.observe(self._on_entropy_coordinate_change, names="value")
+        self.constraint_toggle.observe(self._on_constraint_mode_change, names="value")
+        self.shell_entropy_slider.observe(self._on_shell_slider_change, names="value")
+        self.shell_energy_slider.observe(self._on_shell_slider_change, names="value")
+
+    def _on_entropy_coordinate_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self.entropy_coordinate_mode = self._canonical_entropy_coordinate_mode(str(change.get("new", "kernel")))
+        self._on_control_change(change)
+
+    def _on_constraint_mode_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self._sync_constraint_button_label()
+        self._sync_shell_slider_styles()
+        self._refresh_state_selector_labels()
+        self._sync_recompute_button_label()
+        self._sync_init_state_button_label()
+        self._on_control_change(change)
+
+    def _on_shell_slider_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self._on_control_change(change)
+
+    def _current_entropy_coordinate_mode(self) -> EntropyCoordinateMode:
+        if self._job_entropy_coordinate_mode is not None:
+            return self._job_entropy_coordinate_mode
+        if hasattr(self, "entropy_coordinate_dropdown"):
+            return self._canonical_entropy_coordinate_mode(str(self.entropy_coordinate_dropdown.value))
+        return self._canonical_entropy_coordinate_mode(str(getattr(self, "entropy_coordinate_mode", "kernel")))
+
+    def _params(self) -> dict[str, float | int]:
+        params = super()._params()
+        entropy_slider = getattr(self, "shell_entropy_slider", None)
+        energy_slider = getattr(self, "shell_energy_slider", None)
+        params["entropy0"] = float(entropy_slider.value) if entropy_slider is not None else 0.84
+        params["energy0"] = float(energy_slider.value) if energy_slider is not None else 0.35
+        return params
+
+    def _q_target_to_radius(self, *, d: int, q_target: float) -> float:
+        q = float(np.clip(q_target, 0.0, 0.999999))
+        if q <= 1e-12:
+            return 0.0
+        lo = 0.0
+        hi = 0.9995
+        q_hi = self._radius_to_q_target(d=d, r=hi)
+        if q >= q_hi:
+            return hi
+        for _ in range(64):
+            mid = 0.5 * (lo + hi)
+            if self._radius_to_q_target(d=d, r=mid) < q:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    def _entropy_target_for_params(
+        self,
+        params: dict[str, float | int],
+        *,
+        coord_mode: EntropyCoordinateMode | None = None,
+    ) -> dict[str, float | str]:
+        coord = self._current_entropy_coordinate_mode() if coord_mode is None else self._canonical_entropy_coordinate_mode(coord_mode)
+        table = self._entropy_shell_table()
+        constraint_mode = self._current_constraint_mode()
+        slider_entropy = float(np.clip(float(params.get("entropy0", 0.84)), 0.0, 1.0))
+        slider_energy = float(np.clip(float(params.get("energy0", 0.35)), 0.0, 1.0))
+
+        if constraint_mode == "constant_energy":
+            q_target = slider_energy
+            r_poisson = self._q_target_to_radius(d=3, q_target=q_target)
+            kernel_target = float(np.interp(r_poisson, table.r_grid, table.kernel_entropy))
+            entropy_effective = float(np.interp(r_poisson, table.r_grid, table.entropy_values(coord)))
+            return {
+                "coord_mode": coord,
+                "constraint_mode": constraint_mode,
+                "slider_target": slider_energy,
+                "effective_target": entropy_effective,
+                "kernel_target": kernel_target,
+                "r_poisson": r_poisson,
+                "q_target": q_target,
+            }
+
+        r_poisson, kernel_target = table.invert_entropy(slider_entropy, coord)
+        entropy_effective = float(np.interp(r_poisson, table.r_grid, table.entropy_values(coord)))
+        q_target = self._radius_to_q_target(d=3, r=float(r_poisson))
+        return {
+            "coord_mode": coord,
+            "constraint_mode": constraint_mode,
+            "slider_target": slider_entropy,
+            "effective_target": entropy_effective,
+            "kernel_target": kernel_target,
+            "r_poisson": r_poisson,
+            "q_target": q_target,
+        }
+
+    def _target_axis_from_params(self, params: dict[str, float | int]) -> torch.Tensor:
+        axis = torch.tensor(
+            _angles_to_unit(float(params["w_az"]), float(params["w_el"])),
+            dtype=torch.float64,
+        )
+        return normalize(axis.unsqueeze(0))[0]
+
+    def _spherical_entropy_proxy_normalized_torch(
+        self,
+        *,
+        points: torch.Tensor,
+        kappa: float,
+        sample_size: int,
+        sample_idx: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        n = int(points.shape[0])
+        if n <= 1:
+            return torch.zeros((), dtype=points.dtype, device=points.device)
+        if sample_idx is None:
+            idx_np = self._deterministic_subsample_indices(n, sample_size)
+            idx = torch.as_tensor(idx_np, dtype=torch.long, device=points.device)
+        else:
+            idx = sample_idx.to(device=points.device, dtype=torch.long)
+        xs = points[idx]
+        if int(xs.shape[0]) <= 1:
+            return torch.zeros((), dtype=points.dtype, device=points.device)
+        gram = torch.clamp(xs @ xs.T, -1.0, 1.0)
+        kernel = torch.exp(float(kappa) * (gram - 1.0))
+        density = kernel.mean(dim=1)
+        h_raw = -torch.log(density + 1e-12).mean()
+        rho_uniform = self._kernel_uniform_density(kappa=float(kappa), sample_count=int(xs.shape[0]))
+        h_uniform = max(-math.log(max(rho_uniform, 1e-12)), 1e-12)
+        return torch.clamp(h_raw / h_uniform, 0.0, 1.2)
+
+    @staticmethod
+    def _flip_points_to_axis(points: torch.Tensor, axis: torch.Tensor) -> torch.Tensor:
+        mean = points.mean(dim=0)
+        if float(torch.dot(mean, axis)) < 0.0:
+            return -points
+        return points
+
+    def _poisson_reference_cloud(
+        self,
+        *,
+        n: int,
+        axis: torch.Tensor,
+        r_poisson: float,
+        target_entropy: float | None = None,
+        refine_entropy: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        base_points = random_points_on_sphere(
+            n,
+            d=3,
+            generator=self._torch_gen,
+            dtype=torch.float64,
+        )
+        r_refined = float(np.clip(r_poisson, 0.0, 0.9995))
+        if refine_entropy and target_entropy is not None:
+            r_refined = self._refine_poisson_radius_for_sample(
+                base_points=base_points,
+                axis=axis,
+                r_seed=float(r_poisson),
+                target_entropy=float(target_entropy),
+            )
+        w_poisson = -axis * float(np.clip(r_refined, 0.0, 0.9995))
+        x_poisson = normalize(mobius_sphere(base_points, w_poisson))
+        return base_points, w_poisson, x_poisson
+
+    def _refine_poisson_radius_for_sample(
+        self,
+        *,
+        base_points: torch.Tensor,
+        axis: torch.Tensor,
+        r_seed: float,
+        target_entropy: float,
+    ) -> float:
+        n = int(base_points.shape[0])
+        sample_size = min(n, 720 if n >= 1200 else 480)
+        sample_idx = torch.as_tensor(
+            self._deterministic_subsample_indices(n, sample_size),
+            dtype=torch.long,
+            device=base_points.device,
+        )
+        sample_points = base_points[sample_idx]
+        kappa = float(self._entropy_shell_table().kernel_kappa)
+
+        def h_of_r(r: float) -> float:
+            w = -axis * float(np.clip(r, 0.0, 0.9995))
+            x = normalize(mobius_sphere(sample_points, w))
+            return float(
+                self._spherical_entropy_proxy_normalized_torch(
+                    points=x,
+                    kappa=kappa,
+                    sample_size=int(x.shape[0]),
+                ).detach()
+            )
+
+        lo = 0.0
+        hi = 0.9995
+        h_lo = h_of_r(lo)
+        h_hi = h_of_r(hi)
+        target = float(np.clip(target_entropy, min(h_hi, h_lo), max(h_hi, h_lo)))
+        if target >= h_lo:
+            return lo
+        if target <= h_hi:
+            return hi
+
+        mid = float(np.clip(r_seed, lo, hi))
+        for _ in range(12):
+            h_mid = h_of_r(mid)
+            if h_mid > target:
+                lo = mid
+            else:
+                hi = mid
+            mid = 0.5 * (lo + hi)
+        return mid
+
+    def _tangent_perturbation(
+        self,
+        *,
+        points: torch.Tensor,
+        sigma: float,
+    ) -> torch.Tensor:
+        noise = torch.randn(points.shape, generator=self._torch_gen, dtype=points.dtype, device=points.device)
+        tangent = noise - torch.sum(noise * points, dim=1, keepdim=True) * points
+        return normalize(points + float(sigma) * tangent)
+
+    def _energy_shell_dir_loss(self, *, mean: torch.Tensor, axis: torch.Tensor) -> torch.Tensor:
+        q = torch.linalg.norm(mean)
+        if float(q.detach()) < 0.05:
+            return torch.zeros((), dtype=mean.dtype, device=mean.device)
+        mean_u = mean / (q + 1e-12)
+        cos_dir = torch.clamp(torch.dot(mean_u, axis), -1.0, 1.0)
+        return torch.relu(torch.tensor(0.95, dtype=mean.dtype, device=mean.device) - cos_dir) ** 2
+
+    def _optimize_energy_shell_boundary_points(
+        self,
+        *,
+        x_start: torch.Tensor,
+        axis: torch.Tensor,
+        target_entropy: float,
+        minimize_energy: bool,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> torch.Tensor:
+        kappa = float(self._entropy_shell_table().kernel_kappa)
+        n = int(x_start.shape[0])
+        sample_size = min(n, 640 if n >= 1200 else 480)
+        sample_idx = torch.as_tensor(
+            self._deterministic_subsample_indices(n, sample_size),
+            dtype=torch.long,
+            device=x_start.device,
+        )
+        x_var = torch.nn.Parameter(normalize(x_start.clone()))
+        opt = torch.optim.Adam([x_var], lr=0.060 if minimize_energy else 0.070)
+        max_iters = 150 if minimize_energy else 170
+        move_cap = 0.050 if minimize_energy else 0.060
+        lambda_shell = 420.0 if minimize_energy else 460.0
+        lambda_energy = 36.0 if minimize_energy else 42.0
+        lambda_dir = 42.0 if minimize_energy else 18.0
+
+        x_prev = normalize(x_var.detach())
+        for _ in range(max_iters):
+            if cancel_check is not None and bool(cancel_check()):
+                raise _HydroRecomputeCancelled("Entropy-shell initialization cancelled.")
+            opt.zero_grad(set_to_none=True)
+            x = normalize(x_var)
+            mean = x.mean(dim=0)
+            m_sq = torch.dot(mean, mean)
+            entropy = self._spherical_entropy_proxy_normalized_torch(
+                points=x,
+                kappa=kappa,
+                sample_size=sample_size,
+                sample_idx=sample_idx,
+            )
+            shell_loss = (entropy - float(target_entropy)) ** 2
+            dir_loss = self._energy_shell_dir_loss(mean=mean, axis=axis)
+            energy_loss = -m_sq if minimize_energy else m_sq
+            loss = lambda_shell * shell_loss + lambda_energy * energy_loss + lambda_dir * dir_loss
+            loss.backward()
+            opt.step()
+
+            with torch.no_grad():
+                x_new = normalize(x_var)
+                delta = x_new - x_prev
+                delta_norm = torch.linalg.norm(delta, dim=1, keepdim=True)
+                scale = torch.clamp(move_cap / (delta_norm + 1e-12), max=1.0)
+                x_step = normalize(x_prev + delta * scale)
+                x_var.copy_(x_step)
+                x_prev = x_step.detach()
+
+        opt_refine = torch.optim.Adam([x_var], lr=0.045)
+        x_prev = normalize(x_var.detach())
+        for _ in range(52):
+            if cancel_check is not None and bool(cancel_check()):
+                raise _HydroRecomputeCancelled("Entropy-shell refinement cancelled.")
+            opt_refine.zero_grad(set_to_none=True)
+            x = normalize(x_var)
+            mean = x.mean(dim=0)
+            entropy = self._spherical_entropy_proxy_normalized_torch(
+                points=x,
+                kappa=kappa,
+                sample_size=sample_size,
+                sample_idx=sample_idx,
+            )
+            shell_loss = (entropy - float(target_entropy)) ** 2
+            dir_loss = self._energy_shell_dir_loss(mean=mean, axis=axis)
+            loss = 860.0 * shell_loss + 60.0 * dir_loss
+            loss.backward()
+            opt_refine.step()
+
+            with torch.no_grad():
+                x_new = normalize(x_var)
+                delta = x_new - x_prev
+                delta_norm = torch.linalg.norm(delta, dim=1, keepdim=True)
+                scale = torch.clamp((0.7 * move_cap) / (delta_norm + 1e-12), max=1.0)
+                x_step = normalize(x_prev + delta * scale)
+                x_var.copy_(x_step)
+                x_prev = x_step.detach()
+
+        return normalize(self._flip_points_to_axis(normalize(x_var.detach()), axis))
+
+    def _candidate_signature(
+        self,
+        *,
+        points: torch.Tensor,
+        axis: torch.Tensor,
+        target_entropy: float,
+    ) -> tuple[int, float, float]:
+        kappa = float(self._entropy_shell_table().kernel_kappa)
+        entropy = float(
+            self._spherical_entropy_proxy_normalized_torch(
+                points=points,
+                kappa=kappa,
+                sample_size=min(int(points.shape[0]), 720),
+            ).detach()
+        )
+        shell_err = abs(entropy - float(target_entropy))
+        mean = points.mean(dim=0)
+        q = float(torch.linalg.norm(mean))
+        cos_dir = 1.0
+        if q >= 0.05:
+            cos_dir = float(torch.dot(mean / max(q, 1e-12), axis))
+        feasible = shell_err <= 0.02 and (q < 0.05 or cos_dir >= 0.95)
+        return (0 if feasible else 1, q * q, shell_err)
+
+    def _make_energy_shell_boundary_points(
+        self,
+        *,
+        n: int,
+        params: dict[str, float | int],
+        mode: EnergyStateMode,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        target_info = self._entropy_target_for_params(params)
+        constraint_mode = str(target_info.get("constraint_mode", "constant_entropy"))
+        axis = self._target_axis_from_params(params)
+        _, w_poisson, x_poisson = self._poisson_reference_cloud(
+            n=n,
+            axis=axis,
+            r_poisson=float(target_info["r_poisson"]),
+            target_entropy=float(target_info["kernel_target"]),
+            refine_entropy=constraint_mode == "constant_entropy",
+        )
+        if mode == "poisson":
+            return x_poisson, w_poisson
+
+        if constraint_mode == "constant_energy":
+            init_state = "entropy_low" if mode == "min_energy" else "entropy_high"
+            x_final = self._make_entropy_initial_boundary_points(
+                n=n,
+                d=3,
+                w_az=float(params["w_az"]),
+                w_el=float(params["w_el"]),
+                target_r=float(target_info["r_poisson"]),
+                init_state=init_state,
+            )
+            w0 = self._estimate_w_from_boundary_points(
+                points=x_final,
+                weights=torch.ones(n, dtype=torch.float64) / float(n),
+                d=3,
+                fallback_dir=axis,
+            )
+            return x_final, w0
+
+        if mode == "min_energy":
+            x_final = self._optimize_energy_shell_boundary_points(
+                x_start=x_poisson,
+                axis=axis,
+                target_entropy=float(target_info["kernel_target"]),
+                minimize_energy=True,
+                cancel_check=cancel_check,
+            )
+            w0 = self._estimate_w_from_boundary_points(
+                points=x_final,
+                weights=torch.ones(n, dtype=torch.float64) / float(n),
+                d=3,
+                fallback_dir=axis,
+            )
+            return x_final, w0
+
+        best_points: torch.Tensor | None = None
+        best_key: tuple[int, float, float] | None = None
+        for sigma in (0.10, 0.18, 0.26):
+            if cancel_check is not None and bool(cancel_check()):
+                raise _HydroRecomputeCancelled("Entropy-shell maximum-energy restarts cancelled.")
+            x_start = self._tangent_perturbation(points=x_poisson, sigma=float(sigma))
+            x_candidate = self._optimize_energy_shell_boundary_points(
+                x_start=x_start,
+                axis=axis,
+                target_entropy=float(target_info["kernel_target"]),
+                minimize_energy=False,
+                cancel_check=cancel_check,
+            )
+            key = self._candidate_signature(
+                points=x_candidate,
+                axis=axis,
+                target_entropy=float(target_info["kernel_target"]),
+            )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_points = x_candidate
+        if best_points is None:
+            best_points = x_poisson
+        w0 = self._estimate_w_from_boundary_points(
+            points=best_points,
+            weights=torch.ones(n, dtype=torch.float64) / float(n),
+            d=3,
+            fallback_dir=axis,
+        )
+        return best_points, w0
+
+    def _entropy_shell_stats_rows(self, *, t: int, params: dict[str, float | int], z_norm: float, w_norm: float) -> str:
+        target = self._entropy_target_for_params(params)
+        constraint_mode = str(target.get("constraint_mode", "constant_entropy"))
+        energy_now = -0.5 * float(params["K"]) * z_norm * z_norm
+        if constraint_mode == "constant_energy":
+            target_row = f"<tr><td style='padding-right:14px'>Target energy shell |Z|/K</td><td>{float(target['q_target']):.5f}</td></tr>"
+            constraint_label = "constant energy"
+        else:
+            target_row = f"<tr><td style='padding-right:14px'>Target entropy</td><td>{float(target['effective_target']):.5f}</td></tr>"
+            constraint_label = "constant entropy"
+        return "".join(
+            [
+                f"<tr><td style='padding-right:14px'>Initialization constraint</td><td>{constraint_label}</td></tr>",
+                f"<tr><td style='padding-right:14px'>Entropy coordinate</td><td>{str(target['coord_mode'])}</td></tr>",
+                target_row,
+                f"<tr><td style='padding-right:14px'>Poisson radius</td><td>{float(target['r_poisson']):.5f}</td></tr>",
+                f"<tr><td style='padding-right:14px'>Current energy</td><td>{energy_now:.5f}</td></tr>",
+                f"<tr><td style='padding-right:14px'>|w|</td><td>{w_norm:.5f}</td></tr>",
+                f"<tr><td style='padding-right:14px'>|Z|/K</td><td>{z_norm:.5f}</td></tr>",
+            ]
+        )
+
+
+class LMSBall3DEntropyShellEnsembleWidget(_LMSEntropyShellMixin, LMSBall3DHydrodynamicEnsembleWidget):
+    def __init__(
+        self,
+        *,
+        controls: tuple[LMS3DControlSpec, ...] = ENTROPY_SHELL_HYDRO_DEFAULT_CONTROLS,
+        entropy_coordinate_mode: EntropyCoordinateMode = "kernel",
+        title: str = "LMS entropy-shell dynamics on S² / B³",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            controls=controls,
+            init_metric_mode="entropy",
+            entropy_coordinate_mode=entropy_coordinate_mode,
+            title=title,
+            **kwargs,
+        )
+
+    def _capture_async_recompute_job(self, *, reset_frame: bool) -> dict[str, Any]:
+        job = super()._capture_async_recompute_job(reset_frame=reset_frame)
+        job["time_backward"] = False
+        job["entropy_coordinate_mode"] = self._current_entropy_coordinate_mode()
+        job["constraint_mode"] = self._current_constraint_mode()
+        return job
+
+    def _compute_hydro_job_result(self, *, job: dict[str, Any], seq: int) -> dict[str, Any]:
+        prev_mode = self._job_entropy_coordinate_mode
+        prev_constraint = self._job_constraint_mode
+        self._job_entropy_coordinate_mode = self._canonical_entropy_coordinate_mode(
+            str(job.get("entropy_coordinate_mode", "kernel"))
+        )
+        self._job_constraint_mode = (
+            "constant_energy" if str(job.get("constraint_mode", "constant_entropy")) == "constant_energy" else "constant_entropy"
+        )
+        try:
+            return super()._compute_hydro_job_result(job=job, seq=seq)
+        finally:
+            self._job_entropy_coordinate_mode = prev_mode
+            self._job_constraint_mode = prev_constraint
+
+    def _simulate_mode(
+        self,
+        mode: str,
+        params: dict[str, float | int],
+        *,
+        entropy_increase: bool | None = None,
+        time_backward: bool | None = None,
+        w_mode: str | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ):
+        d = 3
+        n = int(params["N"])
+        K = float(params["K"])
+        entropy_flag = bool(self.toggle_entropy.value) if entropy_increase is None else bool(entropy_increase)
+        conformal_sign = -1.0 if entropy_flag else 1.0
+        omega = float(params["omega"])
+        dt = abs(float(params["dt"]))
+        steps = int(params["steps"])
+        axis = self._target_axis_from_params(params)
+
+        if mode == "poisson":
+            target = self._entropy_target_for_params(params)
+            constraint_mode = str(target.get("constraint_mode", "constant_entropy"))
+            base_points, w0, _ = self._poisson_reference_cloud(
+                n=n,
+                axis=axis,
+                r_poisson=float(target["r_poisson"]),
+                target_entropy=float(target["kernel_target"]),
+                refine_entropy=constraint_mode == "constant_entropy",
+            )
+        else:
+            x0_points, w0 = self._make_energy_shell_boundary_points(
+                n=n,
+                params=params,
+                mode=self._coerce_mode_to_active_family(mode),  # type: ignore[arg-type]
+                cancel_check=cancel_check,
+            )
+            base_points = self._recover_base_points_from_state(
+                x_points=x0_points,
+                w0=w0,
+            )
+
+        zeta0 = torch.eye(d, dtype=torch.float64)
+        rot_axis = torch.tensor(_angles_to_unit(float(params["ax_az"]), float(params["ax_el"])), dtype=torch.float64)
+        A = skew_symmetric_from_axis(rot_axis, rate=omega).to(dtype=torch.float64)
+        weights = torch.ones(n, dtype=torch.float64) / float(n)
+
+        return integrate_lms_reduced_euler(
+            w0=w0,
+            zeta0=zeta0,
+            base_points=base_points,
+            weights=weights,
+            A=A,
+            coupling=conformal_sign * K,
+            dt=max(dt, 1e-12),
+            steps=steps,
+            w_mode=str(self.mode_dropdown.value) if w_mode is None else str(w_mode),
+            project_rotation=True,
+            store_points="none",
+            store_dtype=torch.float32,
+            preallocate=True,
+            cancel_check=cancel_check,
+        )
+
+    def _render_frame(self, t: int) -> None:
+        super()._render_frame(t)
+        if self._steps <= 0 or not self._traj_cache:
+            return
+        params = self._params_cache if self._params_cache else self._params()
+        t = max(0, min(t, self._steps))
+        metric = self._metric_cache if self._metric_cache else {}
+        z_norm = float(metric.get("z_norm", np.zeros((self._steps + 1,), dtype=np.float64))[t]) if "z_norm" in metric else 0.0
+        w_norm = float(metric.get("w_norm", np.zeros((self._steps + 1,), dtype=np.float64))[t]) if "w_norm" in metric else 0.0
+        entropy_t = float(metric.get("entropy", np.zeros((self._steps + 1,), dtype=np.float64))[t]) if "entropy" in metric else 0.0
+        entropy_rate_t = float(metric.get("entropy_rate", np.zeros((self._steps + 1,), dtype=np.float64))[t]) if "entropy_rate" in metric else 0.0
+        var_total_t = float(metric.get("var_total", np.zeros((self._steps + 1,), dtype=np.float64))[t]) if "var_total" in metric else 0.0
+        var_perp_t = float(metric.get("var_perp", np.zeros((self._steps + 1,), dtype=np.float64))[t]) if "var_perp" in metric else 0.0
+        var_aligned_t = float(metric.get("var_aligned", np.zeros((self._steps + 1,), dtype=np.float64))[t]) if "var_aligned" in metric else 0.0
+        mode_hi, _, mode_max = self._ENERGY_MODES
+        rt_hi = float(self._ensemble_runtime.get(mode_hi, 0.0))
+        rt_poi = float(self._ensemble_runtime.get("poisson", 0.0))
+        rt_max = float(self._ensemble_runtime.get(mode_max, 0.0))
+        n_total = int(self._base_points_np.shape[0]) if self._base_points_np is not None else 0
+        n_display = int(len(self._display_indices)) if self._display_indices is not None else n_total
+        self.stats_html.value = (
+            self._busy_banner_html()
+            + "<b>Entropy-shell ensemble stats</b>"
+            "<table style='font-family:monospace;font-size:12px;margin-top:6px'>"
+            f"<tr><td style='padding-right:14px'>Displayed state</td><td>{self._init_mode_label(self._display_mode)}</td></tr>"
+            f"<tr><td style='padding-right:14px'>N total / shown</td><td>{n_total} / {n_display}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Runtime min/poi/max [s]</td><td>{rt_hi:.2f} / {rt_poi:.2f} / {rt_max:.2f}</td></tr>"
+            f"{self._entropy_shell_stats_rows(t=t, params=params, z_norm=z_norm, w_norm=w_norm)}"
+            f"<tr><td style='padding-right:14px'>Entropy</td><td>{entropy_t:.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>dS/dt</td><td>{entropy_rate_t:.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Var total</td><td>{var_total_t:.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Var perp(final-axis)</td><td>{var_perp_t:.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Var aligned(final-axis)</td><td>{var_aligned_t:.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Alignment direction</td><td>{'increase' if bool(self.toggle_entropy.value) else 'dissipate'}</td></tr>"
+            "</table>"
+        )
+
+
+class LMSBall3DEntropyShellTwoSheetWidget(_LMSEntropyShellMixin, LMSBall3DBackwardTwoSheetWidget):
+    def __init__(
+        self,
+        *,
+        controls: tuple[LMS3DControlSpec, ...] = ENTROPY_SHELL_DEFAULT_CONTROLS,
+        entropy_coordinate_mode: EntropyCoordinateMode = "kernel",
+        title: str = "LMS entropy-shell two-sheet dynamics on S² / B³",
+        force_backward_time: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            controls=controls,
+            entropy_coordinate_mode=entropy_coordinate_mode,
+            title=title,
+            force_backward_time=False,
+            **kwargs,
+        )
+
+    def _simulate(self, params: dict[str, float | int]):
+        d = 3
+        n = int(params["N"])
+        K = float(params["K"])
+        conformal_sign = -1.0 if bool(self.toggle_entropy.value) else 1.0
+        omega = float(params["omega"])
+        dt = abs(float(params["dt"]))
+        steps = int(params["steps"])
+        store_points, resolved_mode = self._resolve_store_points(n=n, steps=steps, d=d)
+        self._resolved_trajectory_mode = resolved_mode
+        axis = self._target_axis_from_params(params)
+
+        mode = self._coerce_mode_to_active_family(self._init_state_mode)
+        self._init_state_mode = mode  # type: ignore[assignment]
+        if mode == "poisson":
+            target = self._entropy_target_for_params(params)
+            constraint_mode = str(target.get("constraint_mode", "constant_entropy"))
+            base_points, w0, _ = self._poisson_reference_cloud(
+                n=n,
+                axis=axis,
+                r_poisson=float(target["r_poisson"]),
+                target_entropy=float(target["kernel_target"]),
+                refine_entropy=constraint_mode == "constant_entropy",
+            )
+        else:
+            x0_points, w0 = self._make_energy_shell_boundary_points(
+                n=n,
+                params=params,
+                mode=mode,  # type: ignore[arg-type]
+            )
+            base_points = self._recover_base_points_from_state(
+                x_points=x0_points,
+                w0=w0,
+            )
+
+        zeta0 = torch.eye(d, dtype=torch.float64)
+        rot_axis = torch.tensor(_angles_to_unit(float(params["ax_az"]), float(params["ax_el"])), dtype=torch.float64)
+        A = skew_symmetric_from_axis(rot_axis, rate=omega).to(dtype=torch.float64)
+        weights = torch.ones(n, dtype=torch.float64) / float(n)
+
+        return integrate_lms_reduced_euler(
+            w0=w0,
+            zeta0=zeta0,
+            base_points=base_points,
+            weights=weights,
+            A=A,
+            coupling=conformal_sign * K,
+            dt=max(dt, 1e-12),
+            steps=steps,
+            w_mode=str(self.mode_dropdown.value),
+            project_rotation=True,
+            store_points=store_points,
+            store_dtype=torch.float32,
+            preallocate=True,
+        )
+
+    def _render_frame(self, t: int) -> None:
+        super()._render_frame(t)
+        if self._steps <= 0 or not self._traj_cache:
+            return
+        params = self._params_cache if self._params_cache else self._params()
+        t = max(0, min(t, self._steps))
+        frame_name: Literal["lab", "body"] = "body" if self.view_frame_dropdown.value == "body" else "lab"
+        _, _, Z_series = self._frame_arrays()
+        w = np.asarray(self._traj_cache["w"][t], dtype=np.float64)
+        K = max(float(params["K"]), 1e-9)
+        z_norm = float(np.linalg.norm(Z_series[t]) / K)
+        w_norm = float(np.linalg.norm(w))
+        def _metric_at(key: str) -> float:
+            arr = self._metric_cache.get(key) if self._metric_cache else None
+            if arr is None or len(arr) <= t:
+                return 0.0
+            return float(arr[t])
+
+        self.stats_html.value = (
+            "<b>Entropy-shell two-sheet stats</b>"
+            "<table style='font-family:monospace;font-size:12px;margin-top:6px'>"
+            f"<tr><td style='padding-right:14px'>Displayed state</td><td>{self._init_mode_label(self._init_state_mode)}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Frame</td><td>{frame_name}</td></tr>"
+            f"{self._entropy_shell_stats_rows(t=t, params=params, z_norm=z_norm, w_norm=w_norm)}"
+            f"<tr><td style='padding-right:14px'>Entropy</td><td>{_metric_at('entropy'):.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Var to center</td><td>{_metric_at('var_to_center'):.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Var to conformal center</td><td>{_metric_at('var_to_conformal_center'):.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>||mean(x)|| emp</td><td>{_metric_at('bary_emp'):.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Alignment direction</td><td>{'increase' if bool(self.toggle_entropy.value) else 'dissipate'}</td></tr>"
+            "</table>"
+        )
+
+
+LMSBall3DHydrodynamicEnsembleWidget = LMSBall3DEntropyShellEnsembleWidget
+LMSBall3DBackwardTwoSheetWidget = LMSBall3DEntropyShellTwoSheetWidget
+
+
 __all__ = [
     "LMSBall3DWidget",
+    "LMSBall3DEntropyShellEnsembleWidget",
+    "LMSBall3DEntropyShellTwoSheetWidget",
     "LMSBall3DBackwardTwoSheetWidget",
     "LMSBall3DHydrodynamicEnsembleWidget",
     "LMS3DControlSpec",
     "DEFAULT_CONTROLS",
     "HYDRO_DEFAULT_CONTROLS",
+    "ENTROPY_SHELL_DEFAULT_CONTROLS",
+    "ENTROPY_SHELL_HYDRO_DEFAULT_CONTROLS",
+    "EnergyStateMode",
+    "EntropyCoordinateMode",
+    "ShellConstraintMode",
 ]
