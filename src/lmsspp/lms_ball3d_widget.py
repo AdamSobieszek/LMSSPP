@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import math
+from pathlib import Path
 import threading
 import time
 from typing import Any, Callable, Literal
@@ -455,12 +457,14 @@ class LMSBall3DWidget:
         self.toggle_entropy = widgets.ToggleButton(value=False, description="Entropy Direction: Dissipate")
         self.toggle_time_direction = widgets.ToggleButton(value=False, description="Time Direction: Forward")
         self.btn_recompute = widgets.Button(description="Recompute")
+        self.btn_export_iframe = widgets.Button(description="Export iframe snapshot")
         self.toggle_init_state = widgets.Button(description="Initial State: High Entropy")
         self.btn_toggle_frame = widgets.Button(description="Frame: Lab")
         self.btn_speed_half = widgets.Button(description="0.5x speed (1.0)")
         self.btn_speed_double = widgets.Button(description="2x speed (1.0)")
 
         self.stats_html = widgets.HTML("")
+        self.export_status_html = widgets.HTML("")
         button_col_layout = widgets.Layout(width="180px")
         for btn in (
             self.btn_play_forward,
@@ -468,6 +472,7 @@ class LMSBall3DWidget:
             self.toggle_entropy,
             self.toggle_time_direction,
             self.btn_recompute,
+            self.btn_export_iframe,
             self.toggle_init_state,
             self.btn_toggle_frame,
             self.btn_speed_half,
@@ -486,6 +491,10 @@ class LMSBall3DWidget:
             ],
             layout=widgets.Layout(align_items="flex-start", width=control_width),
         )
+        self._export_controls_row = widgets.HBox(
+            [self.btn_export_iframe, self.export_status_html],
+            layout=widgets.Layout(width=control_width, align_items="center"),
+        )
         params_box = widgets.VBox(sliders, layout=widgets.Layout(width=control_width))
         params_accordion = widgets.Accordion(
             children=[params_box],
@@ -496,6 +505,7 @@ class LMSBall3DWidget:
             [
                 widgets.HTML("<b>LMS B³/S² widget controls</b>"),
                 button_grid,
+                self._export_controls_row,
                 self.frame_slider,
                 widgets.HBox(
                     [self.mode_dropdown, self.layout_dropdown],
@@ -940,6 +950,7 @@ class LMSBall3DWidget:
         self.btn_speed_half.on_click(self._on_speed_half_clicked)
         self.btn_speed_double.on_click(self._on_speed_double_clicked)
         self.btn_recompute.on_click(self._on_recompute_clicked)
+        self.btn_export_iframe.on_click(self._on_export_iframe_clicked)
 
     def _params(self) -> dict[str, float | int]:
         params: dict[str, float | int] = {}
@@ -947,6 +958,142 @@ class LMSBall3DWidget:
             v = self._controls[spec.key].value
             params[spec.key] = int(v) if spec.integer else float(v)
         return params
+
+    @staticmethod
+    def _json_ready(value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (np.floating,)):
+            f = float(value)
+            return f if math.isfinite(f) else None
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, dict):
+            return {str(k): LMSBall3DWidget._json_ready(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [LMSBall3DWidget._json_ready(v) for v in value]
+        return value
+
+    def _set_export_status(self, message: str, *, error: bool = False) -> None:
+        color = "#b00020" if error else "#1f4e79"
+        self.export_status_html.value = (
+            f"<span style='font-family:monospace;font-size:12px;color:{color}'>{message}</span>"
+        )
+
+    def _default_export_snapshot_path(self) -> Path:
+        root = Path(__file__).resolve().parents[2]
+        out_dir = root / "exports" / "widget_snapshots"
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        return out_dir / f"{self.__class__.__name__}_{ts}.html"
+
+    def _export_additional_bundle_fields(self, *, traj_cache: dict[str, np.ndarray]) -> dict[str, Any]:
+        return {}
+
+    def _export_bundle_from_state(
+        self,
+        *,
+        traj_cache: dict[str, np.ndarray],
+        base_points: np.ndarray,
+        display_idx: np.ndarray | None,
+        metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        base = np.asarray(base_points, dtype=np.float64)
+        if display_idx is None:
+            disp = np.arange(base.shape[0], dtype=np.int32)
+        else:
+            disp = np.asarray(display_idx, dtype=np.int32)
+        if disp.size <= 0:
+            disp = np.arange(base.shape[0], dtype=np.int32)
+
+        bundle: dict[str, Any] = {
+            "w": np.asarray(traj_cache["w"], dtype=np.float64).tolist(),
+            "zeta": np.asarray(traj_cache["zeta"], dtype=np.float64).tolist(),
+            "z_lab": np.asarray(traj_cache["z_lab"], dtype=np.float64).tolist(),
+            "z_body": np.asarray(traj_cache["z_body"], dtype=np.float64).tolist(),
+            "Z_lab": np.asarray(traj_cache["Z_lab"], dtype=np.float64).tolist(),
+            "Z_body": np.asarray(traj_cache["Z_body"], dtype=np.float64).tolist(),
+            "base_points": base.tolist(),
+            "base_points_display": np.asarray(base[disp], dtype=np.float64).tolist(),
+            "display_indices": disp.astype(np.int64).tolist(),
+        }
+        if metrics is not None:
+            bundle["metrics"] = self._json_ready(metrics)
+        extra = self._export_additional_bundle_fields(traj_cache=traj_cache)
+        if extra:
+            bundle.update(self._json_ready(extra))
+        return bundle
+
+    def _export_init_info(self, params: dict[str, float | int]) -> dict[str, Any]:
+        mode_value = str(getattr(self, "_display_mode", getattr(self, "_init_state_mode", "poisson")))
+        try:
+            mode_label = self._init_mode_label(mode_value)
+        except Exception:
+            mode_label = mode_value
+        return {
+            "init_state_mode": mode_value,
+            "init_state_label": mode_label,
+            "entropy_direction": "increase" if bool(self.toggle_entropy.value) else "dissipate",
+            "time_direction": "backward" if bool(self.toggle_time_direction.value) else "forward",
+            "backend": str(self.mode_dropdown.value),
+            "viewing_frame": "body" if self.view_frame_dropdown.value == "body" else "lab",
+            "trajectory_mode": str(getattr(self, "_resolved_trajectory_mode", "memory")),
+            "steps": int(self._steps),
+            "N_displayed": int(len(self._display_indices)) if self._display_indices is not None else None,
+        }
+
+    def _export_iframe_payload(self) -> dict[str, Any]:
+        if not self._traj_cache or self._base_points_np is None:
+            raise RuntimeError("No computed trajectory is available to export.")
+        params = dict(self._params_cache if self._params_cache else self._params())
+        frame_name: Literal["lab", "body"] = "body" if self.view_frame_dropdown.value == "body" else "lab"
+        bundle = self._export_bundle_from_state(
+            traj_cache=self._traj_cache,
+            base_points=self._base_points_np,
+            display_idx=self._display_indices,
+            metrics={
+                "active_frame": frame_name,
+                "series": self._metric_cache if self._metric_cache else {},
+            },
+        )
+        metrics_figure = self._json_ready(self.metrics_fig.to_plotly_json())
+        return {
+            "schema_version": "lmsspp_widget_snapshot_v1",
+            "widget_kind": "lms_ball3d",
+            "title": str(self.title),
+            "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+            "params": self._json_ready(params),
+            "ui_state": {
+                "frame_default": int(self.frame_slider.value),
+                "frame_name_default": frame_name,
+                "show_paths": bool(self.show_paths.value),
+                "show_vectors": bool(self.show_vectors.value),
+            },
+            "init_info": self._json_ready(self._export_init_info(params)),
+            "stats_html_snapshot": str(self.stats_html.value),
+            "metrics_figure": metrics_figure,
+            "bundle": bundle,
+        }
+
+    def export_iframe_snapshot(self, out_path: str | Path | None = None) -> Path:
+        if out_path is None:
+            out_file = self._default_export_snapshot_path()
+        else:
+            out_file = Path(out_path).expanduser().resolve()
+        payload = self._export_iframe_payload()
+        try:
+            from .export.iframe_export import write_lms_widget_snapshot_html
+        except Exception:
+            from export.iframe_export import write_lms_widget_snapshot_html  # type: ignore
+        return write_lms_widget_snapshot_html(out_file, payload=payload)
+
+    def _on_export_iframe_clicked(self, _btn: widgets.Button) -> None:
+        try:
+            out_file = self.export_iframe_snapshot()
+            self._set_export_status(f"saved: {str(out_file)}")
+        except Exception as exc:
+            self._set_export_status(f"export failed: {str(exc)}", error=True)
 
     def _apply_root_layout(self) -> None:
         """Switch between side-by-side and stacked layouts."""
@@ -1439,6 +1586,55 @@ class LMSBall3DWidget:
         if h_uniform <= 1e-12:
             return 0.0
         return float(np.clip(h_raw / h_uniform, 0.0, 1.2))
+
+    def _kernel_entropy_proxy_series_numpy(
+        self,
+        *,
+        points_series: np.ndarray,
+        kappa: float = 14.0,
+        sample_size: int = 420,
+        chunk_frames: int = 12,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> np.ndarray:
+        """Compute normalized kernel-entropy proxy for all frames in chunks."""
+        pts = np.asarray(points_series, dtype=np.float64)
+        if pts.ndim != 3:
+            raise ValueError("points_series must have shape [T,N,d].")
+
+        t_count = int(pts.shape[0])
+        n = int(pts.shape[1])
+        if t_count <= 0:
+            return np.zeros((0,), dtype=np.float64)
+        if n <= 1:
+            return np.zeros((t_count,), dtype=np.float64)
+
+        idx = self._deterministic_subsample_indices(n, sample_size)
+        xs = np.ascontiguousarray(pts[:, idx, :], dtype=np.float64)
+        m = int(xs.shape[1])
+        if m <= 1:
+            return np.zeros((t_count,), dtype=np.float64)
+
+        rho_uniform = self._kernel_uniform_density(kappa=float(kappa), sample_count=m)
+        h_uniform = -math.log(max(rho_uniform, 1e-12))
+        if h_uniform <= 1e-12:
+            return np.zeros((t_count,), dtype=np.float64)
+
+        k = float(kappa)
+        entropy = np.empty((t_count,), dtype=np.float64)
+        chunk = max(1, int(chunk_frames))
+        eps = 1e-12
+        for s in range(0, t_count, chunk):
+            if cancel_check is not None and bool(cancel_check()):
+                raise _HydroRecomputeCancelled("Hydro metrics computation cancelled.")
+            e = min(t_count, s + chunk)
+            x_chunk = xs[s:e]
+            gram = np.matmul(x_chunk, np.swapaxes(x_chunk, 1, 2))
+            np.clip(gram, -1.0, 1.0, out=gram)
+            kernel = np.exp(k * (gram - 1.0))
+            density = kernel.mean(axis=2)
+            h_raw = -np.mean(np.log(np.maximum(density, eps)), axis=1)
+            entropy[s:e] = np.clip(h_raw / h_uniform, 0.0, 1.2)
+        return entropy
 
     def _refresh_metric_series(self, params: dict[str, float | int]) -> None:
         """Refresh full metric lines according to selected view frame."""
@@ -2855,6 +3051,27 @@ class LMSBall3DBackwardTwoSheetWidget(LMSBall3DWidget):
         self._bar_paths_frame_name = None
         self._bar_paths_inversion_on = None
 
+    def _export_additional_bundle_fields(self, *, traj_cache: dict[str, np.ndarray]) -> dict[str, Any]:
+        _ = traj_cache
+        if self._bar_cache is None:
+            self._build_outer_sheet_cache()
+        if self._bar_cache is None:
+            return {}
+        return {
+            "bar_sheet": {
+                "w": np.asarray(self._bar_cache["w"], dtype=np.float64).tolist(),
+                "z_lab": np.asarray(self._bar_cache["z_lab"], dtype=np.float64).tolist(),
+                "z_body": np.asarray(self._bar_cache["z_body"], dtype=np.float64).tolist(),
+                "Z_lab": np.asarray(self._bar_cache["Zhat_lab"], dtype=np.float64).tolist(),
+                "Z_body": np.asarray(self._bar_cache["Zhat_body"], dtype=np.float64).tolist(),
+            }
+        }
+
+    def _export_iframe_payload(self) -> dict[str, Any]:
+        payload = super()._export_iframe_payload()
+        payload["widget_kind"] = "lms_ball3d_two_sheet"
+        return payload
+
     def _recompute(self, *, reset_frame: bool) -> None:
         self._last_bar_path_frame = -10**9
         self._last_bar_overlay_frame = -10**9
@@ -3661,6 +3878,27 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
             return x_body
         return x_body @ zeta_t.T
 
+    @staticmethod
+    def _reconstruct_points_series_from_cache(
+        *,
+        traj_cache: dict[str, np.ndarray],
+        base_points: np.ndarray,
+        frame_name: Literal["lab", "body"],
+    ) -> np.ndarray:
+        """Vectorized reconstruction for all frames from reduced state."""
+        w_series = np.asarray(traj_cache["w"], dtype=np.float64)
+        zeta_series = np.asarray(traj_cache["zeta"], dtype=np.float64)
+        base = np.asarray(base_points, dtype=np.float64)
+        diff = base[None, :, :] - w_series[:, None, :]
+        den = np.einsum("tnd,tnd->tn", diff, diff)[:, :, None]
+        w2 = np.einsum("td,td->t", w_series, w_series)[:, None, None]
+        x_body = ((1.0 - w2) / np.maximum(den, 1e-12)) * diff - w_series[:, None, :]
+        norms = np.linalg.norm(x_body, axis=2, keepdims=True)
+        x_body = x_body / np.maximum(norms, 1e-12)
+        if frame_name == "body":
+            return x_body
+        return np.einsum("tnd,ted->tne", x_body, zeta_series, optimize=True)
+
     def _compute_mode_metrics(
         self,
         *,
@@ -3677,13 +3915,18 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         w_series = traj_cache["w"]
         t_count = z_series.shape[0]
         K = max(float(params["K"]), 1e-9)
+        base_points_used = base_points if sample_idx is None else base_points[sample_idx]
+        pts_series = self._reconstruct_points_series_from_cache(
+            traj_cache=traj_cache,
+            base_points=base_points_used,
+            frame_name=frame_name,
+        )
 
         w_norm = np.linalg.norm(w_series, axis=1)
         z_norm = np.linalg.norm(Z_series, axis=1) / K
         entropy = np.zeros(t_count, dtype=np.float64)
-        var_total = np.zeros(t_count, dtype=np.float64)
-        var_perp = np.zeros(t_count, dtype=np.float64)
-        var_aligned = np.zeros(t_count, dtype=np.float64)
+        mu_series = pts_series.mean(axis=1, keepdims=True)
+        centered_series = pts_series - mu_series
         entropy_kappa = 14.0
 
         axis_final = np.asarray(z_series[-1], dtype=np.float64)
@@ -3692,29 +3935,18 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
             axis_final = np.array([1.0, 0.0, 0.0], dtype=np.float64)
             axis_final_n = 1.0
         axis_final_u = axis_final / max(axis_final_n, 1e-12)
+        proj_final = np.einsum("tnd,d->tn", centered_series, axis_final_u, optimize=True)
+        perp_final = centered_series - proj_final[:, :, None] * axis_final_u[None, None, :]
+        var_aligned = np.mean(proj_final**2, axis=1)
+        var_perp = np.mean(np.sum(perp_final * perp_final, axis=2), axis=1)
+        var_total = var_aligned + var_perp
 
-        for t in range(t_count):
-            if cancel_check is not None and bool(cancel_check()):
-                raise _HydroRecomputeCancelled("Hydro metrics computation cancelled.")
-            pts = self._reconstruct_points_from_cache(
-                traj_cache=traj_cache,
-                base_points=base_points,
-                t=t,
-                frame_name=frame_name,
-            )
-            if sample_idx is not None:
-                pts = pts[sample_idx]
-
-            mu = pts.mean(axis=0, keepdims=True)
-            centered = pts - mu
-
-            proj_final = centered @ axis_final_u
-            perp_final = centered - proj_final[:, None] * axis_final_u[None, :]
-            var_aligned[t] = float(np.mean(proj_final**2))
-            var_perp[t] = float(np.mean(np.sum(perp_final * perp_final, axis=1)))
-            var_total[t] = var_aligned[t] + var_perp[t]
-
-            if self.init_metric_mode == "perp_variance":
+        if self.init_metric_mode == "perp_variance":
+            for t in range(t_count):
+                if cancel_check is not None and bool(cancel_check()):
+                    raise _HydroRecomputeCancelled("Hydro metrics computation cancelled.")
+                pts = pts_series[t]
+                mu = mu_series[t]
                 axis_dyn = np.asarray(z_series[t], dtype=np.float64)
                 axis_dyn_n = float(np.linalg.norm(axis_dyn))
                 if axis_dyn_n < 1e-12:
@@ -3732,12 +3964,13 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 perp_mean = perp_dyn.mean(axis=0, keepdims=True)
                 perp_dyn_var = float(np.mean(np.sum((perp_dyn - perp_mean) ** 2, axis=1)))
                 entropy[t] = float(np.clip(perp_dyn_var, 0.0, 1.0))
-            else:
-                entropy[t] = self._kernel_entropy_proxy_numpy(
-                    points=pts,
-                    kappa=entropy_kappa,
-                    sample_size=min(int(pts.shape[0]), 420),
-                )
+        else:
+            entropy = self._kernel_entropy_proxy_series_numpy(
+                points_series=pts_series,
+                kappa=entropy_kappa,
+                sample_size=min(int(pts_series.shape[1]), 420),
+                cancel_check=cancel_check,
+            )
 
         dt_eff = self._effective_dt(params, time_backward=time_backward)
         if abs(dt_eff) < 1e-12:
@@ -3811,15 +4044,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 stride_m = max(1, int(math.ceil(n_points / float(metric_cap))))
                 metric_idx = np.arange(0, n_points, stride_m, dtype=np.int32)[:metric_cap]
 
-            metrics_lab = self._compute_mode_metrics(
-                traj_cache=traj_cache,
-                base_points=base_points_np,
-                params=params,
-                frame_name="lab",
-                sample_idx=metric_idx,
-                time_backward=time_backward,
-                cancel_check=_cancel_check,
-            )
+            # Metrics are rotation-invariant scalars in this panel; compute once.
             metrics_body = self._compute_mode_metrics(
                 traj_cache=traj_cache,
                 base_points=base_points_np,
@@ -3829,6 +4054,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 time_backward=time_backward,
                 cancel_check=_cancel_check,
             )
+            metrics_lab = {k: np.asarray(v, dtype=np.float64).copy() for k, v in metrics_body.items()}
 
             ensemble_state[mode] = {
                 "traj": traj_cache,
@@ -3961,13 +4187,6 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 stride_m = max(1, int(math.ceil(n_points / float(metric_cap))))
                 metric_idx = np.arange(0, n_points, stride_m, dtype=np.int32)[:metric_cap]
 
-            metrics_lab = self._compute_mode_metrics(
-                traj_cache=traj_cache,
-                base_points=base_points_np,
-                params=params,
-                frame_name="lab",
-                sample_idx=metric_idx,
-            )
             metrics_body = self._compute_mode_metrics(
                 traj_cache=traj_cache,
                 base_points=base_points_np,
@@ -3975,6 +4194,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 frame_name="body",
                 sample_idx=metric_idx,
             )
+            metrics_lab = {k: np.asarray(v, dtype=np.float64).copy() for k, v in metrics_body.items()}
             self._ensemble_state[mode] = {
                 "traj": traj_cache,
                 "base_points": base_points_np,
@@ -4158,6 +4378,51 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
             f"<tr><td style='padding-right:14px'>Alignment force sign</td><td>{conformal_sign:+.0f}</td></tr>"
             "</table>"
         )
+
+    def _export_iframe_payload(self) -> dict[str, Any]:
+        if not self._ensemble_state:
+            raise RuntimeError("No computed ensemble trajectory is available to export.")
+        params = dict(self._params_cache if self._params_cache else self._params())
+        frame_name: Literal["lab", "body"] = "body" if self.view_frame_dropdown.value == "body" else "lab"
+        ensembles: dict[str, Any] = {}
+        for mode in self._ensemble_modes:
+            state = self._ensemble_state.get(mode)
+            if state is None:
+                continue
+            ensembles[mode] = {
+                "label": self._init_mode_label(mode),
+                "runtime_s": float(self._ensemble_runtime.get(mode, 0.0)),
+                "bundle": self._export_bundle_from_state(
+                    traj_cache=state["traj"],
+                    base_points=state["base_points"],
+                    display_idx=state["display_idx"],
+                    metrics={
+                        "lab": self._ensemble_metrics.get(mode, {}).get("lab", {}),
+                        "body": self._ensemble_metrics.get(mode, {}).get("body", {}),
+                    },
+                ),
+            }
+
+        metrics_figure = self._json_ready(self.metrics_fig.to_plotly_json())
+        return {
+            "schema_version": "lmsspp_widget_snapshot_v1",
+            "widget_kind": "lms_entropy_shell_ensemble",
+            "title": str(self.title),
+            "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+            "params": self._json_ready(params),
+            "ui_state": {
+                "frame_default": int(self.frame_slider.value),
+                "frame_name_default": frame_name,
+                "show_paths": bool(self.show_paths.value),
+                "show_vectors": bool(self.show_vectors.value),
+                "display_mode": str(self._display_mode),
+            },
+            "mode_order": [str(m) for m in self._ensemble_modes],
+            "init_info": self._json_ready(self._export_init_info(params)),
+            "stats_html_snapshot": str(self.stats_html.value),
+            "metrics_figure": metrics_figure,
+            "ensembles": ensembles,
+        }
 
 
 class _LMSEntropyShellMixin:
@@ -4513,6 +4778,7 @@ class _LMSEntropyShellMixin:
         children: list[widgets.Widget] = [
             self.controls_box.children[0],
             button_grid,
+            self._export_controls_row,
             self.frame_slider,
             self._shell_entropy_row,
             self._shell_energy_row,
@@ -4571,6 +4837,22 @@ class _LMSEntropyShellMixin:
         if hasattr(self, "entropy_coordinate_dropdown"):
             return self._canonical_entropy_coordinate_mode(str(self.entropy_coordinate_dropdown.value))
         return self._canonical_entropy_coordinate_mode(str(getattr(self, "entropy_coordinate_mode", "kernel")))
+
+    def _export_init_info(self, params: dict[str, float | int]) -> dict[str, Any]:
+        info = super()._export_init_info(params)
+        target = self._entropy_target_for_params(params)
+        info.update(
+            {
+                "constraint_mode": str(target.get("constraint_mode", "constant_entropy")),
+                "entropy_coordinate_mode": str(target.get("coord_mode", "kernel")),
+                "slider_target": float(target.get("slider_target", 0.0)),
+                "effective_target": float(target.get("effective_target", 0.0)),
+                "kernel_target": float(target.get("kernel_target", 0.0)),
+                "q_target": float(target.get("q_target", 0.0)),
+                "r_poisson": float(target.get("r_poisson", 0.0)),
+            }
+        )
+        return info
 
     def _params(self) -> dict[str, float | int]:
         params = super()._params()
@@ -4713,26 +4995,12 @@ class _LMSEntropyShellMixin:
         r_seed: float,
         target_entropy: float,
     ) -> float:
-        n = int(base_points.shape[0])
-        sample_size = min(n, 720 if n >= 1200 else 480)
-        sample_idx = torch.as_tensor(
-            self._deterministic_subsample_indices(n, sample_size),
-            dtype=torch.long,
-            device=base_points.device,
-        )
-        sample_points = base_points[sample_idx]
         kappa = float(self._entropy_shell_table().kernel_kappa)
 
         def h_of_r(r: float) -> float:
             w = -axis * float(np.clip(r, 0.0, 0.9995))
-            x = normalize(mobius_sphere(sample_points, w))
-            return float(
-                self._spherical_entropy_proxy_normalized_torch(
-                    points=x,
-                    kappa=kappa,
-                    sample_size=int(x.shape[0]),
-                ).detach()
-            )
+            x = normalize(mobius_sphere(base_points, w))
+            return self._entropy_shell_monitor_value(points=x, kappa=kappa)
 
         lo = 0.0
         hi = 0.9995
@@ -4772,6 +5040,46 @@ class _LMSEntropyShellMixin:
         cos_dir = torch.clamp(torch.dot(mean_u, axis), -1.0, 1.0)
         return torch.relu(torch.tensor(0.95, dtype=mean.dtype, device=mean.device) - cos_dir) ** 2
 
+    def _entropy_shell_objective_sample_idx(
+        self,
+        *,
+        n: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        # For moderate N, keep exact shell gradients on the full cloud.
+        if n <= 1200:
+            return None
+        m = min(n, 960)
+        return torch.randint(0, n, (m,), generator=self._torch_gen, dtype=torch.long, device=device)
+
+    def _entropy_shell_monitor_value(
+        self,
+        *,
+        points: torch.Tensor,
+        kappa: float,
+    ) -> float:
+        n = int(points.shape[0])
+        if n <= 1200:
+            val = self._spherical_entropy_proxy_normalized_torch(
+                points=points,
+                kappa=kappa,
+                sample_size=n,
+            )
+            return float(val.detach())
+
+        m = min(n, 1200)
+        vals: list[float] = []
+        for _ in range(2):
+            idx = torch.randint(0, n, (m,), generator=self._torch_gen, dtype=torch.long, device=points.device)
+            val = self._spherical_entropy_proxy_normalized_torch(
+                points=points,
+                kappa=kappa,
+                sample_size=m,
+                sample_idx=idx,
+            )
+            vals.append(float(val.detach()))
+        return 0.5 * (vals[0] + vals[1])
+
     def _optimize_energy_shell_boundary_points(
         self,
         *,
@@ -4783,12 +5091,6 @@ class _LMSEntropyShellMixin:
     ) -> torch.Tensor:
         kappa = float(self._entropy_shell_table().kernel_kappa)
         n = int(x_start.shape[0])
-        sample_size = min(n, 640 if n >= 1200 else 480)
-        sample_idx = torch.as_tensor(
-            self._deterministic_subsample_indices(n, sample_size),
-            dtype=torch.long,
-            device=x_start.device,
-        )
         x_var = torch.nn.Parameter(normalize(x_start.clone()))
         opt = torch.optim.Adam([x_var], lr=0.060 if minimize_energy else 0.070)
         max_iters = 150 if minimize_energy else 170
@@ -4798,13 +5100,40 @@ class _LMSEntropyShellMixin:
         lambda_dir = 42.0 if minimize_energy else 18.0
 
         x_prev = normalize(x_var.detach())
-        for _ in range(max_iters):
+        prev_obj = float("inf")
+        stable_steps = 0
+        min_iters = 42 if minimize_energy else 56
+        best_points = x_prev.detach().clone()
+        best_shell = float("inf")
+        best_tight_points: torch.Tensor | None = None
+        best_tight_rank: tuple[float, float] | None = None
+        best_loose_points: torch.Tensor | None = None
+        best_loose_rank: tuple[float, float] | None = None
+        with torch.no_grad():
+            init_shell_eval = self._entropy_shell_monitor_value(points=x_prev, kappa=kappa)
+            init_shell_err = float(abs(init_shell_eval - float(target_entropy)))
+            init_mean = x_prev.mean(dim=0)
+            init_q = float(torch.linalg.norm(init_mean))
+            init_cos_dir = float(torch.dot(init_mean / max(init_q, 1e-12), axis)) if init_q >= 0.05 else 1.0
+            init_feasible = init_shell_err <= 0.02 and (init_q < 0.05 or init_cos_dir >= 0.95)
+            if init_feasible:
+                init_energy_rank = -init_q * init_q if minimize_energy else init_q * init_q
+                init_rank = (init_energy_rank, init_shell_err)
+                if init_shell_err <= 0.01:
+                    best_tight_rank = init_rank
+                    best_tight_points = x_prev.detach().clone()
+                else:
+                    best_loose_rank = init_rank
+                    best_loose_points = x_prev.detach().clone()
+        for it in range(max_iters):
             if cancel_check is not None and bool(cancel_check()):
                 raise _HydroRecomputeCancelled("Entropy-shell initialization cancelled.")
             opt.zero_grad(set_to_none=True)
             x = normalize(x_var)
             mean = x.mean(dim=0)
             m_sq = torch.dot(mean, mean)
+            sample_idx = self._entropy_shell_objective_sample_idx(n=n, device=x.device)
+            sample_size = n if sample_idx is None else int(sample_idx.shape[0])
             entropy = self._spherical_entropy_proxy_normalized_torch(
                 points=x,
                 kappa=kappa,
@@ -4826,15 +5155,46 @@ class _LMSEntropyShellMixin:
                 x_step = normalize(x_prev + delta * scale)
                 x_var.copy_(x_step)
                 x_prev = x_step.detach()
+                shell_eval = self._entropy_shell_monitor_value(points=x_step, kappa=kappa)
+                shell_err = float(abs(shell_eval - float(target_entropy)))
+                mean_step = x_step.mean(dim=0)
+                q = float(torch.linalg.norm(mean_step))
+                cos_dir = float(torch.dot(mean_step / max(q, 1e-12), axis)) if q >= 0.05 else 1.0
+                feasible = shell_err <= 0.02 and (q < 0.05 or cos_dir >= 0.95)
+                obj = float(loss.detach())
+                if abs(prev_obj - obj) <= 3e-4:
+                    stable_steps += 1
+                else:
+                    stable_steps = 0
+                prev_obj = obj
+                if shell_err < best_shell:
+                    best_shell = shell_err
+                    best_points = x_step.detach().clone()
+                if feasible:
+                    energy_rank = -q * q if minimize_energy else q * q
+                    rank = (energy_rank, shell_err)
+                    if shell_err <= 0.01:
+                        if best_tight_rank is None or rank < best_tight_rank:
+                            best_tight_rank = rank
+                            best_tight_points = x_step.detach().clone()
+                    else:
+                        if best_loose_rank is None or rank < best_loose_rank:
+                            best_loose_rank = rank
+                            best_loose_points = x_step.detach().clone()
+                if it >= min_iters and feasible and stable_steps >= 8:
+                    break
 
         opt_refine = torch.optim.Adam([x_var], lr=0.045)
         x_prev = normalize(x_var.detach())
+        refine_stable = 0
         for _ in range(52):
             if cancel_check is not None and bool(cancel_check()):
                 raise _HydroRecomputeCancelled("Entropy-shell refinement cancelled.")
             opt_refine.zero_grad(set_to_none=True)
             x = normalize(x_var)
             mean = x.mean(dim=0)
+            sample_idx = self._entropy_shell_objective_sample_idx(n=n, device=x.device)
+            sample_size = n if sample_idx is None else int(sample_idx.shape[0])
             entropy = self._spherical_entropy_proxy_normalized_torch(
                 points=x,
                 kappa=kappa,
@@ -4855,8 +5215,37 @@ class _LMSEntropyShellMixin:
                 x_step = normalize(x_prev + delta * scale)
                 x_var.copy_(x_step)
                 x_prev = x_step.detach()
+                shell_eval = self._entropy_shell_monitor_value(points=x_step, kappa=kappa)
+                shell_err = float(abs(shell_eval - float(target_entropy)))
+                mean_step = x_step.mean(dim=0)
+                q = float(torch.linalg.norm(mean_step))
+                cos_dir = float(torch.dot(mean_step / max(q, 1e-12), axis)) if q >= 0.05 else 1.0
+                feasible = shell_err <= 0.02 and (q < 0.05 or cos_dir >= 0.95)
+                if shell_err < best_shell:
+                    best_shell = shell_err
+                    best_points = x_step.detach().clone()
+                if feasible:
+                    energy_rank = -q * q if minimize_energy else q * q
+                    rank = (energy_rank, shell_err)
+                    if shell_err <= 0.01:
+                        if best_tight_rank is None or rank < best_tight_rank:
+                            best_tight_rank = rank
+                            best_tight_points = x_step.detach().clone()
+                    else:
+                        if best_loose_rank is None or rank < best_loose_rank:
+                            best_loose_rank = rank
+                            best_loose_points = x_step.detach().clone()
+                if shell_err <= 0.008 and (q < 0.05 or cos_dir >= 0.97):
+                    refine_stable += 1
+                else:
+                    refine_stable = 0
+                if refine_stable >= 4:
+                    break
 
-        return normalize(self._flip_points_to_axis(normalize(x_var.detach()), axis))
+        chosen = best_tight_points if best_tight_points is not None else best_loose_points
+        if chosen is None:
+            chosen = best_points
+        return normalize(self._flip_points_to_axis(normalize(chosen), axis))
 
     def _candidate_signature(
         self,
@@ -4866,13 +5255,7 @@ class _LMSEntropyShellMixin:
         target_entropy: float,
     ) -> tuple[int, float, float]:
         kappa = float(self._entropy_shell_table().kernel_kappa)
-        entropy = float(
-            self._spherical_entropy_proxy_normalized_torch(
-                points=points,
-                kappa=kappa,
-                sample_size=min(int(points.shape[0]), 720),
-            ).detach()
-        )
+        entropy = self._entropy_shell_monitor_value(points=points, kappa=kappa)
         shell_err = abs(entropy - float(target_entropy))
         mean = points.mean(dim=0)
         q = float(torch.linalg.norm(mean))

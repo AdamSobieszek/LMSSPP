@@ -166,7 +166,8 @@ def lms_vector_field_autograd(
     create_graph: bool = False,
 ) -> Tensor:
     r"""Compute dw/dt=-grad_hyp Phi(w) via autograd."""
-    w_req = w if w.requires_grad else w.detach().clone().requires_grad_(True)
+    # Avoid an unnecessary clone in the runtime integrator path.
+    w_req = w if w.requires_grad else w.detach().requires_grad_(True)
     grad_hyp = hyperbolic_grad_autograd(
         w_req,
         base_points,
