@@ -53,7 +53,7 @@ class LMS3DControlSpec:
 
 DEFAULT_CONTROLS = (
     LMS3DControlSpec("r0", "Start radius |w|", 1e-4, 0.9999, 1e-4, 0.03, readout_format=".4f"),
-    LMS3DControlSpec("N", "Oscillators N", 8, 1000, 1, 150, integer=True, readout_format=".0f"),
+    LMS3DControlSpec("N", "Oscillators N", 8, 300, 1, 150, integer=True, readout_format=".0f"),
     LMS3DControlSpec("K", "Coupling K", 0.0, 5.0, 0.02, 1.0, readout_format=".2f"),
     LMS3DControlSpec("omega", "Rotation rate omega", -10.0, 10.0, 0.02, 3.0, readout_format=".2f"),
     LMS3DControlSpec("dt", "Time step dt", 1e-4, 8e-2, 1e-4, 5e-2, readout_format=".4f"),
@@ -80,7 +80,7 @@ HYDRO_DEFAULT_CONTROLS = (
 
 
 ENTROPY_SHELL_DEFAULT_CONTROLS = (
-    LMS3DControlSpec("N", "Oscillators N", 8, 1000, 1, 150, integer=True, readout_format=".0f"),
+    LMS3DControlSpec("N", "Oscillators N", 8, 300, 1, 150, integer=True, readout_format=".0f"),
     LMS3DControlSpec("K", "Coupling K", 0.0, 5.0, 0.02, 1.0, readout_format=".2f"),
     LMS3DControlSpec("omega", "Rotation rate omega", -10.0, 10.0, 0.02, 3.0, readout_format=".2f"),
     LMS3DControlSpec("dt", "Time step dt", 1e-4, 8e-2, 1e-4, 5e-2, readout_format=".4f"),
@@ -282,7 +282,7 @@ class LMSBall3DWidget:
         rng_seed: int = 0,
         point_size: int = 5,
         title: str = "Reduced LMS dynamics on S² (points) / B³ (order parameters)",
-        trajectory_mode: Literal["memory", "fps", "auto"] = "auto",
+        trajectory_mode: Literal["memory", "fps", "auto"] = "memory",
         thermo_mode: Literal["recompute", "approx", "exact"] = "recompute",
         init_metric_mode: InitMetricMode = "entropy",
         display_points_cap: int | None = None,
@@ -311,7 +311,6 @@ class LMSBall3DWidget:
         self._wire_count = 0
         self._camera_cache: dict[str, Any] | None = None
         self._default_camera_eye: dict[str, float] = {"x": 1.25, "y": 1.25, "z": 1.25}
-        self.pause_on_camera_drag = False
         self._in_frame_update = False
         self._paused_for_drag = False
         self._was_playing_before_drag = False
@@ -321,14 +320,12 @@ class LMSBall3DWidget:
         self._params_cache: dict[str, float | int] = {}
         self._last_overlay_frame = -10**9
         self._last_path_frame = -10**9
-        self._suppress_stats_panel_updates = False
         self._steps = 0
         self._resolved_trajectory_mode: Literal["memory", "fps"] = "memory"
         self._base_points_np: np.ndarray | None = None
         self._display_indices: np.ndarray | None = None
         self._base_interval_ms = 40
         self._playback_speed = 1.0
-        self._last_rendered_frame = 0
         self._init_state_mode: InitMode = self._active_mode_order()[0]
         # Inversion mapping remains available in code, but is not user-exposed in widget controls.
         self._inversion_enabled = False
@@ -443,11 +440,6 @@ class LMSBall3DWidget:
             show_repeat=False,
             layout=widgets.Layout(width="180px"),
         )
-        if hasattr(self.play, "repeat"):
-            try:
-                self.play.repeat = False
-            except Exception:
-                pass
         self.frame_slider = widgets.IntSlider(
             value=0,
             min=0,
@@ -1335,28 +1327,14 @@ class LMSBall3DWidget:
         return self._time_direction_sign(time_backward=time_backward) * dt_mag
 
     def _overlay_stride(self) -> int:
-        return 1
+        if not self._is_playing():
+            return 1
+        return max(1, min(16, int(round(self._playback_speed))))
 
     def _path_stride(self) -> int:
-        return 1
-
-    def _should_refresh_stats(self, *, force: bool = False) -> bool:
-        return True
-
-    def _set_stats_html(
-        self,
-        html: str,
-        *,
-        force: bool = False,
-        bypass_suppress: bool = False,
-    ) -> bool:
-        if (not bool(bypass_suppress)) and bool(getattr(self, "_suppress_stats_panel_updates", False)):
-            return False
-        if not self._should_refresh_stats(force=force):
-            return False
-        if str(self.stats_html.value) != str(html):
-            self.stats_html.value = str(html)
-        return True
+        if not self._is_playing():
+            return 1
+        return max(1, min(12, int(round(self._playback_speed * 0.8))))
 
     @staticmethod
     def _scale_camera_eye(camera: dict[str, Any], factor: float) -> dict[str, Any]:
@@ -2485,6 +2463,7 @@ class LMSBall3DWidget:
         show_paths = bool(self.show_paths.value)
         show_vectors = bool(self.show_vectors.value)
         force_update = (t == 0) or (t == self._steps)
+        path_update = force_update or (abs(t - self._last_path_frame) >= self._path_stride())
 
         idx = self._wire_count
         self._in_frame_update = True
@@ -2506,10 +2485,19 @@ class LMSBall3DWidget:
                 self.sphere_fig.data[idx + 3].y = [float(Z_hat_disp[1])]
                 self.sphere_fig.data[idx + 3].z = [float(Z_hat_disp[2])]
 
-                if show_paths:
-                    wp = self._traj_cache["w"][: t + 1]
-                    zp = z_series[: t + 1]
-                    Zp = Z_series[: t + 1] / K
+                if show_paths and path_update:
+                    path_decim = 1 if not self._is_playing() else max(1, (t + 1) // 1200)
+                    if path_decim > 1:
+                        path_idx = np.arange(0, t + 1, path_decim, dtype=np.int32)
+                        if path_idx[-1] != t:
+                            path_idx = np.concatenate([path_idx, np.array([t], dtype=np.int32)])
+                        wp = self._traj_cache["w"][path_idx]
+                        zp = z_series[path_idx]
+                        Zp = Z_series[path_idx] / K
+                    else:
+                        wp = self._traj_cache["w"][: t + 1]
+                        zp = z_series[: t + 1]
+                        Zp = Z_series[: t + 1] / K
 
                     wp_disp = self._maybe_invert_rows(wp, frame_name=frame_name, inv_ctx=inv_ctx)
                     zp_disp = self._maybe_invert_rows(zp, frame_name=frame_name, inv_ctx=inv_ctx)
@@ -2548,11 +2536,16 @@ class LMSBall3DWidget:
         finally:
             self._in_frame_update = False
 
-        self._last_path_frame = t
+        if path_update:
+            self._last_path_frame = t
+        overlay_update = force_update or (abs(t - self._last_overlay_frame) >= self._overlay_stride())
+        if not overlay_update:
+            return
         self._last_overlay_frame = t
 
         z_norm = float(np.linalg.norm(Z) / K)
         w_norm = float(np.linalg.norm(w))
+        z_abs = float(np.linalg.norm(z))
         def _metric_at(key: str) -> float:
             arr = self._metric_cache.get(key) if self._metric_cache else None
             if arr is None or len(arr) <= t:
@@ -2563,11 +2556,12 @@ class LMSBall3DWidget:
         var_to_center_t = _metric_at("var_to_center")
         var_to_conformal_center_t = _metric_at("var_to_conformal_center")
         bary_emp_t = _metric_at("bary_emp")
+        bary_conf_t = _metric_at("bary_conf")
         conformal_sign = -1.0 if bool(self.toggle_entropy.value) else 1.0
         time_sign = self._time_direction_sign()
         dt_eff = self._effective_dt(params)
 
-        stats_html = (
+        self.stats_html.value = (
             "<b>State statistics</b>"
             "<table style='font-family:monospace;font-size:12px;margin-top:6px'>"
             f"<tr><td style='padding-right:14px'>N</td><td>{int(params['N'])}</td></tr>"
@@ -2590,7 +2584,6 @@ class LMSBall3DWidget:
             f"<tr><td style='padding-right:14px'>||mean(x)|| emp</td><td>{bary_emp_t:.5f}</td></tr>"
             "</table>"
         )
-        self._set_stats_html(stats_html, force=force_update)
 
     def _on_control_change(self, _change: dict[str, Any]) -> None:
         if self._updating:
@@ -2659,10 +2652,7 @@ class LMSBall3DWidget:
     def _on_frame_change(self, change: dict[str, Any]) -> None:
         if self._updating:
             return
-        frame_new = int(change.get("new", self.frame_slider.value))
-        frame_new = max(int(self.frame_slider.min), min(int(self.frame_slider.max), frame_new))
-        self._render_frame(frame_new)
-        self._last_rendered_frame = frame_new
+        self._render_frame(int(change["new"]))
 
     def _on_recompute_clicked(self, _btn: widgets.Button) -> None:
         self._recompute(reset_frame=False)
@@ -2677,7 +2667,6 @@ class LMSBall3DWidget:
         self._set_playing(False)
         self.play.step = direction
         cur = int(self.frame_slider.value)
-        self._last_rendered_frame = cur
         if direction < 0 and cur <= self.frame_slider.min:
             # Requested behavior: reverse from frame 0 starts at the last frame.
             self.play.value = self.play.max
@@ -2744,8 +2733,6 @@ class LMSBall3DWidget:
         if cam_json is not None:
             self._camera_cache = cam_json
 
-        if not bool(getattr(self, "pause_on_camera_drag", False)):
-            return
         if now < self._ignore_camera_pause_until:
             return
         if changed and self._is_playing() and not self._paused_for_drag:
@@ -2804,7 +2791,10 @@ class LMSBall3DBackwardTwoSheetWidget(LMSBall3DWidget):
             self._recompute(reset_frame=False)
 
     def _path_stride(self) -> int:
-        return 1
+        """Backward/two-sheet view needs stronger throttling for base path traces."""
+        if not self._is_playing():
+            return 1
+        return max(8, min(48, int(round(self._playback_speed * 6.0))))
 
     def _scene_radius_default(self) -> float:
         return max(self.outer_radius_display, self.outer_radius_cap)
@@ -3380,7 +3370,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         self._recompute_busy_note = ""
         super().__init__(
             controls=controls,
-            trajectory_mode="auto",
+            trajectory_mode="memory",
             thermo_mode="recompute",
             init_metric_mode=canonical_mode,
             display_points_cap=self.display_points_cap,
@@ -3389,6 +3379,21 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
 
     def _build_controls(self) -> None:
         super()._build_controls()
+        mode_hi, mode_lo, mode_poi = self._ensemble_modes
+        self.ensemble_dropdown = widgets.Dropdown(
+            options=[
+                (f"Display: {self._init_mode_label(mode_hi)}", mode_hi),
+                (f"Display: {self._init_mode_label(mode_lo)}", mode_lo),
+                (f"Display: {self._init_mode_label(mode_poi)}", mode_poi),
+            ],
+            value=self._display_mode,
+            description="Displayed initialization",
+            layout=widgets.Layout(width=self._control_width),
+            style={"description_width": "initial"},
+        )
+        children = list(self.controls_box.children)
+        children.insert(3, widgets.HBox([self.ensemble_dropdown], layout=widgets.Layout(width=self._control_width)))
+        self.controls_box.children = tuple(children)
 
         # This widget computes all three modes in one recompute; the old init button
         # is repurposed to choose which ensemble is displayed on the sphere panel.
@@ -3413,7 +3418,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                         f"{self._init_mode_label(mode_poi).lower()})"
                     ),
                     f"{self._primary_metric_title()} and rate {self._primary_rate_series_name()} (all ensembles)",
-                    "Variance: total / perp / aligned",
+                    "Variance vs final-axis hyperplane: total / perp / aligned",
                 ),
                 vertical_spacing=0.12,
             )
@@ -3561,6 +3566,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
 
     def _bind_events(self) -> None:
         super()._bind_events()
+        self.ensemble_dropdown.observe(self._on_ensemble_display_change, names="value")
 
     def _set_recompute_busy(self, busy: bool, *, note: str = "") -> None:
         busy_flag = bool(busy)
@@ -3623,7 +3629,9 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
 
     def _capture_async_recompute_job(self, *, reset_frame: bool) -> dict[str, Any]:
         params = dict(self._params())
-        target_mode = self._coerce_mode_to_active_family(str(self._display_mode))
+        target_mode = self._coerce_mode_to_active_family(
+            str(getattr(self.ensemble_dropdown, "value", self._display_mode))
+        )
         return {
             "params": params,
             "prev_frame": int(self.frame_slider.value),
@@ -3736,7 +3744,20 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         cur = self._display_mode
         i = order.index(cur)
         nxt = order[(i + 1) % len(order)]
-        self._select_display_mode(nxt)
+        if hasattr(self, "ensemble_dropdown"):
+            self.ensemble_dropdown.value = nxt
+        else:
+            self._select_display_mode(nxt)
+            self._sync_init_state_button_label()
+            self._render_frame(int(self.frame_slider.value))
+
+    def _on_ensemble_display_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        mode = self._coerce_mode_to_active_family(str(change.get("new", self._display_mode)))
+        if mode not in self._ensemble_state:
+            return
+        self._select_display_mode(mode)
         self._sync_init_state_button_label()
         self._render_frame(int(self.frame_slider.value))
 
@@ -3783,7 +3804,6 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         ax_el = float(params["ax_el"])
         dt = self._effective_dt(params, time_backward=time_backward)
         steps = int(params["steps"])
-        store_points, _ = self._resolve_store_points(n=n, steps=steps, d=d)
 
         weights = torch.ones(n, dtype=torch.float64) / float(n)
         center_dir = torch.tensor(_angles_to_unit(w_az, w_el), dtype=torch.float64)
@@ -3832,7 +3852,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
             steps=steps,
             w_mode=str(self.mode_dropdown.value) if w_mode is None else str(w_mode),
             project_rotation=True,
-            store_points=store_points,
+            store_points="none",
             store_dtype=torch.float32,
             preallocate=True,
             cancel_check=cancel_check,
@@ -3896,20 +3916,11 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         t_count = z_series.shape[0]
         K = max(float(params["K"]), 1e-9)
         base_points_used = base_points if sample_idx is None else base_points[sample_idx]
-        x_key = "x_body" if frame_name == "body" else "x_lab"
-        x_cached = traj_cache.get(x_key)
-        if x_cached is not None:
-            pts_full = np.asarray(x_cached, dtype=np.float64)
-            if sample_idx is None:
-                pts_series = pts_full
-            else:
-                pts_series = np.ascontiguousarray(pts_full[:, sample_idx, :], dtype=np.float64)
-        else:
-            pts_series = self._reconstruct_points_series_from_cache(
-                traj_cache=traj_cache,
-                base_points=base_points_used,
-                frame_name=frame_name,
-            )
+        pts_series = self._reconstruct_points_series_from_cache(
+            traj_cache=traj_cache,
+            base_points=base_points_used,
+            frame_name=frame_name,
+        )
 
         w_norm = np.linalg.norm(w_series, axis=1)
         z_norm = np.linalg.norm(Z_series, axis=1) / K
@@ -4017,10 +4028,6 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 "Z_lab": np.ascontiguousarray(np.asarray(traj.Z.detach().cpu().numpy(), dtype=np.float32)),
                 "Z_body": np.ascontiguousarray(np.asarray(traj.Z_body.detach().cpu().numpy(), dtype=np.float32)),
             }
-            if traj.x_lab is not None:
-                traj_cache["x_lab"] = np.ascontiguousarray(np.asarray(traj.x_lab.detach().cpu().numpy(), dtype=np.float32))
-            if traj.x_body is not None:
-                traj_cache["x_body"] = np.ascontiguousarray(np.asarray(traj.x_body.detach().cpu().numpy(), dtype=np.float32))
 
             n_points = int(base_points_np.shape[0])
             if n_points <= self.display_points_cap:
@@ -4091,6 +4098,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
             self.play.value = frame_target
             if target_mode not in self._ensemble_state:
                 target_mode = self._ensemble_modes[0]
+                self.ensemble_dropdown.value = target_mode
         finally:
             self._updating = False
 
@@ -4163,10 +4171,6 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 "Z_lab": np.ascontiguousarray(np.asarray(traj.Z.detach().cpu().numpy(), dtype=np.float32)),
                 "Z_body": np.ascontiguousarray(np.asarray(traj.Z_body.detach().cpu().numpy(), dtype=np.float32)),
             }
-            if traj.x_lab is not None:
-                traj_cache["x_lab"] = np.ascontiguousarray(np.asarray(traj.x_lab.detach().cpu().numpy(), dtype=np.float32))
-            if traj.x_body is not None:
-                traj_cache["x_body"] = np.ascontiguousarray(np.asarray(traj.x_body.detach().cpu().numpy(), dtype=np.float32))
 
             n_points = int(base_points_np.shape[0])
             if n_points <= self.display_points_cap:
@@ -4212,9 +4216,10 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         finally:
             self._updating = False
 
-        target_mode = self._coerce_mode_to_active_family(str(self._display_mode))
+        target_mode = self._coerce_mode_to_active_family(str(getattr(self.ensemble_dropdown, "value", self._display_mode)))
         if target_mode not in self._ensemble_state:
             target_mode = self._ensemble_modes[0]
+            self.ensemble_dropdown.value = target_mode
         self._select_display_mode(target_mode)
         self._refresh_metric_series(params)
         self._render_frame(int(self.frame_slider.value))
@@ -4247,6 +4252,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         show_paths = bool(self.show_paths.value)
         show_vectors = bool(self.show_vectors.value)
         force_update = (t == 0) or (t == self._steps)
+        path_update = force_update or (abs(t - self._last_path_frame) >= self._path_stride())
 
         idx = self._wire_count
         self._in_frame_update = True
@@ -4268,10 +4274,19 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 self.sphere_fig.data[idx + 3].y = [float(Z_hat_disp[1])]
                 self.sphere_fig.data[idx + 3].z = [float(Z_hat_disp[2])]
 
-                if show_paths:
-                    wp = self._traj_cache["w"][: t + 1]
-                    zp = z_series[: t + 1]
-                    Zp = Z_series[: t + 1] / K
+                if show_paths and path_update:
+                    path_decim = 1 if not self._is_playing() else max(1, (t + 1) // 1200)
+                    if path_decim > 1:
+                        path_idx = np.arange(0, t + 1, path_decim, dtype=np.int32)
+                        if path_idx[-1] != t:
+                            path_idx = np.concatenate([path_idx, np.array([t], dtype=np.int32)])
+                        wp = self._traj_cache["w"][path_idx]
+                        zp = z_series[path_idx]
+                        Zp = Z_series[path_idx] / K
+                    else:
+                        wp = self._traj_cache["w"][: t + 1]
+                        zp = z_series[: t + 1]
+                        Zp = Z_series[: t + 1] / K
 
                     wp_disp = self._maybe_invert_rows(wp, frame_name=frame_name, inv_ctx=inv_ctx)
                     zp_disp = self._maybe_invert_rows(zp, frame_name=frame_name, inv_ctx=inv_ctx)
@@ -4310,7 +4325,11 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         finally:
             self._in_frame_update = False
 
-        self._last_path_frame = t
+        if path_update:
+            self._last_path_frame = t
+        overlay_update = force_update or (abs(t - self._last_overlay_frame) >= self._overlay_stride())
+        if not overlay_update:
+            return
         self._last_overlay_frame = t
 
         metric = self._metric_cache if self._metric_cache else {}
@@ -4333,12 +4352,18 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
 
         n_total = int(self._base_points_np.shape[0]) if self._base_points_np is not None else 0
         n_display = int(len(self._display_indices)) if self._display_indices is not None else n_total
-        stats_html = (
+        mode_hi, mode_lo, _ = self._ensemble_modes
+        rt_high = float(self._ensemble_runtime.get(mode_hi, 0.0))
+        rt_low = float(self._ensemble_runtime.get(mode_lo, 0.0))
+        rt_poi = float(self._ensemble_runtime.get("poisson", 0.0))
+        self.stats_html.value = (
             self._busy_banner_html()
             + "<b>Hydrodynamic Ensemble Stats</b>"
             "<table style='font-family:monospace;font-size:12px;margin-top:6px'>"
             f"<tr><td style='padding-right:14px'>Displayed mode</td><td>{self._init_mode_label(self._display_mode)}</td></tr>"
             f"<tr><td style='padding-right:14px'>N total / shown</td><td>{n_total} / {n_display}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Runtime high/low/poisson [s]</td>"
+            f"<td>{rt_high:.2f} / {rt_low:.2f} / {rt_poi:.2f}</td></tr>"
             f"<tr><td style='padding-right:14px'>dt eff</td><td>{dt_eff:+.4f}</td></tr>"
             f"<tr><td style='padding-right:14px'>Time direction</td><td>{'backward' if time_sign < 0 else 'forward'}</td></tr>"
             f"<tr><td style='padding-right:14px'>|w|</td><td>{w_norm:.5f}</td></tr>"
@@ -4346,14 +4371,13 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
             f"<tr><td style='padding-right:14px'>{self._primary_metric_title()}</td><td>{entropy_t:.5f}</td></tr>"
             f"<tr><td style='padding-right:14px'>{self._primary_rate_series_name()}</td><td>{entropy_rate_t:.5f}</td></tr>"
             f"<tr><td style='padding-right:14px'>Var total</td><td>{var_total_t:.5f}</td></tr>"
-            f"<tr><td style='padding-right:14px'>Var perp</td><td>{var_perp_t:.5f}</td></tr>"
-            f"<tr><td style='padding-right:14px'>Var aligned</td><td>{var_aligned_t:.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Var perp(final-axis)</td><td>{var_perp_t:.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Var aligned(final-axis)</td><td>{var_aligned_t:.5f}</td></tr>"
             f"<tr><td style='padding-right:14px'>Entropy direction</td>"
             f"<td>{'increase' if bool(self.toggle_entropy.value) else 'dissipate'}</td></tr>"
             f"<tr><td style='padding-right:14px'>Alignment force sign</td><td>{conformal_sign:+.0f}</td></tr>"
             "</table>"
         )
-        self._set_stats_html(stats_html, force=force_update)
 
     def _export_iframe_payload(self) -> dict[str, Any]:
         if not self._ensemble_state:
@@ -4419,7 +4443,7 @@ class _LMSEntropyShellMixin:
     def __init__(self, *, entropy_coordinate_mode: EntropyCoordinateMode = "kernel", **kwargs: Any) -> None:
         entropy0_init = float(np.clip(float(kwargs.pop("entropy0", 0.84)), 0.0, 1.0))
         energy0_init = float(np.clip(float(kwargs.pop("energy0", 0.35)), 0.0, 1.0))
-        constraint_init_raw = str(kwargs.pop("constraint_mode", "constant_energy")).strip().lower()
+        constraint_init_raw = str(kwargs.pop("constraint_mode", "constant_entropy")).strip().lower()
         constraint_init: ShellConstraintMode = "constant_energy" if constraint_init_raw in {"energy", "constant_energy"} else "constant_entropy"
         self.entropy_coordinate_mode = self._canonical_entropy_coordinate_mode(entropy_coordinate_mode)
         self._job_entropy_coordinate_mode: EntropyCoordinateMode | None = None
@@ -4558,10 +4582,10 @@ class _LMSEntropyShellMixin:
 
     def _sync_entropy_button_label(self) -> None:
         if bool(self.toggle_entropy.value):
-            self.toggle_entropy.description = "Arrow of Time: Reversed"
+            self.toggle_entropy.description = "Align: Increase"
             self.toggle_entropy.button_style = "warning"
         else:
-            self.toggle_entropy.description = "Arrow of Time: Align"
+            self.toggle_entropy.description = "Align: Dissipate"
             self.toggle_entropy.button_style = "success"
 
     def _sync_constraint_button_label(self) -> None:
@@ -4574,7 +4598,7 @@ class _LMSEntropyShellMixin:
             self.constraint_toggle.button_style = "info"
 
     def _sync_recompute_button_label(self) -> None:
-        if hasattr(self, "_ensemble_modes"):
+        if hasattr(self, "ensemble_dropdown"):
             if self._current_constraint_mode() == "constant_energy":
                 self.btn_recompute.description = "Recompute S states"
             else:
@@ -4602,6 +4626,14 @@ class _LMSEntropyShellMixin:
         self._shell_energy_row.layout.border_radius = "6px"
 
     def _refresh_state_selector_labels(self) -> None:
+        if hasattr(self, "ensemble_dropdown"):
+            mode_hi, mode_lo, mode_poi = self._ENERGY_MODES
+            self.ensemble_dropdown.options = [
+                (f"Display: {self._init_mode_label(mode_hi)}", mode_hi),
+                (f"Display: {self._init_mode_label(mode_lo)}", mode_lo),
+                (f"Display: {self._init_mode_label(mode_poi)}", mode_poi),
+            ]
+            self.ensemble_dropdown.description = "Displayed state"
         if hasattr(self, "metrics_fig") and len(getattr(self.metrics_fig.layout, "annotations", ())) > 0:
             # Keep row-1 title consistent with the active initialization family.
             mode_hi, mode_lo, mode_poi = self._ENERGY_MODES
@@ -4670,8 +4702,8 @@ class _LMSEntropyShellMixin:
         )
 
         self.constraint_toggle = widgets.ToggleButton(
-            value=True,
-            description="Constraint: Energy",
+            value=False,
+            description="Constraint: Entropy",
             layout=widgets.Layout(width="360px"),
         )
         self.shell_entropy_slider = widgets.FloatSlider(
@@ -4679,7 +4711,7 @@ class _LMSEntropyShellMixin:
             min=0.0,
             max=1.0,
             step=1e-3,
-            description="Initial State Entropy",
+            description="Entropy S0",
             readout=True,
             readout_format=".3f",
             continuous_update=False,
@@ -4691,7 +4723,7 @@ class _LMSEntropyShellMixin:
             min=0.0,
             max=1.0,
             step=1e-3,
-            description="Initial Energy shell",
+            description="Energy shell q0",
             readout=True,
             readout_format=".3f",
             continuous_update=False,
@@ -4701,9 +4733,14 @@ class _LMSEntropyShellMixin:
         self._shell_entropy_row = widgets.HBox([self.shell_entropy_slider], layout=widgets.Layout(width=self._control_width))
         self._shell_energy_row = widgets.HBox([self.shell_energy_slider], layout=widgets.Layout(width=self._control_width))
 
+        if hasattr(self, "ensemble_dropdown"):
+            self.ensemble_dropdown.description = "Displayed state"
+
         self.mode_dropdown.layout = widgets.Layout(width="220px")
         self.layout_dropdown.layout = widgets.Layout(width="360px")
-        self.btn_recompute.description = "Recompute all energy states" if hasattr(self, "_ensemble_modes") else "Recompute state"
+        self.btn_recompute.description = (
+            "Recompute all energy states" if hasattr(self, "ensemble_dropdown") else "Recompute state"
+        )
         self._sync_entropy_button_label()
         self._sync_constraint_button_label()
         self._sync_recompute_button_label()
@@ -4743,9 +4780,13 @@ class _LMSEntropyShellMixin:
             button_grid,
             self._export_controls_row,
             self.frame_slider,
-            self._shell_energy_row,
             self._shell_entropy_row,
+            self._shell_energy_row,
         ]
+        if hasattr(self, "ensemble_dropdown"):
+            children.append(
+                widgets.HBox([self.ensemble_dropdown], layout=widgets.Layout(width=self._control_width))
+            )
         children.append(
             widgets.HBox(
                 [self.mode_dropdown, self.entropy_coordinate_dropdown, self.layout_dropdown],
@@ -5323,6 +5364,7 @@ class _LMSEntropyShellMixin:
         return "".join(
             [
                 f"<tr><td style='padding-right:14px'>Initialization constraint</td><td>{constraint_label}</td></tr>",
+                f"<tr><td style='padding-right:14px'>Entropy coordinate</td><td>{str(target['coord_mode'])}</td></tr>",
                 target_row,
                 f"<tr><td style='padding-right:14px'>Poisson radius</td><td>{float(target['r_poisson']):.5f}</td></tr>",
                 f"<tr><td style='padding-right:14px'>Current energy</td><td>{energy_now:.5f}</td></tr>",
@@ -5348,9 +5390,6 @@ class LMSBall3DEntropyShellEnsembleWidget(_LMSEntropyShellMixin, LMSBall3DHydrod
             title=title,
             **kwargs,
         )
-        # Base/hydro stats panel writes generic content; entropy-shell subclasses
-        # render their own stats block and should not double-write per frame.
-        self._suppress_stats_panel_updates = True
 
     def _capture_async_recompute_job(self, *, reset_frame: bool) -> dict[str, Any]:
         job = super()._capture_async_recompute_job(reset_frame=reset_frame)
@@ -5392,7 +5431,6 @@ class LMSBall3DEntropyShellEnsembleWidget(_LMSEntropyShellMixin, LMSBall3DHydrod
         omega = float(params["omega"])
         dt = abs(float(params["dt"]))
         steps = int(params["steps"])
-        store_points, _ = self._resolve_store_points(n=n, steps=steps, d=d)
         axis = self._target_axis_from_params(params)
 
         if mode == "poisson":
@@ -5433,7 +5471,7 @@ class LMSBall3DEntropyShellEnsembleWidget(_LMSEntropyShellMixin, LMSBall3DHydrod
             steps=steps,
             w_mode=str(self.mode_dropdown.value) if w_mode is None else str(w_mode),
             project_rotation=True,
-            store_points=store_points,
+            store_points="none",
             store_dtype=torch.float32,
             preallocate=True,
             cancel_check=cancel_check,
@@ -5445,7 +5483,6 @@ class LMSBall3DEntropyShellEnsembleWidget(_LMSEntropyShellMixin, LMSBall3DHydrod
             return
         params = self._params_cache if self._params_cache else self._params()
         t = max(0, min(t, self._steps))
-        force_update = (t == 0) or (t == self._steps)
         metric = self._metric_cache if self._metric_cache else {}
         z_norm = float(metric.get("z_norm", np.zeros((self._steps + 1,), dtype=np.float64))[t]) if "z_norm" in metric else 0.0
         w_norm = float(metric.get("w_norm", np.zeros((self._steps + 1,), dtype=np.float64))[t]) if "w_norm" in metric else 0.0
@@ -5454,23 +5491,28 @@ class LMSBall3DEntropyShellEnsembleWidget(_LMSEntropyShellMixin, LMSBall3DHydrod
         var_total_t = float(metric.get("var_total", np.zeros((self._steps + 1,), dtype=np.float64))[t]) if "var_total" in metric else 0.0
         var_perp_t = float(metric.get("var_perp", np.zeros((self._steps + 1,), dtype=np.float64))[t]) if "var_perp" in metric else 0.0
         var_aligned_t = float(metric.get("var_aligned", np.zeros((self._steps + 1,), dtype=np.float64))[t]) if "var_aligned" in metric else 0.0
+        mode_hi, _, mode_max = self._ENERGY_MODES
+        rt_hi = float(self._ensemble_runtime.get(mode_hi, 0.0))
+        rt_poi = float(self._ensemble_runtime.get("poisson", 0.0))
+        rt_max = float(self._ensemble_runtime.get(mode_max, 0.0))
         n_total = int(self._base_points_np.shape[0]) if self._base_points_np is not None else 0
         n_display = int(len(self._display_indices)) if self._display_indices is not None else n_total
-        stats_html = (
+        self.stats_html.value = (
             self._busy_banner_html()
             + "<b>Entropy-shell ensemble stats</b>"
             "<table style='font-family:monospace;font-size:12px;margin-top:6px'>"
             f"<tr><td style='padding-right:14px'>Displayed state</td><td>{self._init_mode_label(self._display_mode)}</td></tr>"
             f"<tr><td style='padding-right:14px'>N total / shown</td><td>{n_total} / {n_display}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Runtime min/poi/max [s]</td><td>{rt_hi:.2f} / {rt_poi:.2f} / {rt_max:.2f}</td></tr>"
             f"{self._entropy_shell_stats_rows(t=t, params=params, z_norm=z_norm, w_norm=w_norm)}"
             f"<tr><td style='padding-right:14px'>Entropy</td><td>{entropy_t:.5f}</td></tr>"
             f"<tr><td style='padding-right:14px'>dS/dt</td><td>{entropy_rate_t:.5f}</td></tr>"
             f"<tr><td style='padding-right:14px'>Var total</td><td>{var_total_t:.5f}</td></tr>"
-            f"<tr><td style='padding-right:14px'>Var perp</td><td>{var_perp_t:.5f}</td></tr>"
-            f"<tr><td style='padding-right:14px'>Var aligned</td><td>{var_aligned_t:.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Var perp(final-axis)</td><td>{var_perp_t:.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Var aligned(final-axis)</td><td>{var_aligned_t:.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Alignment direction</td><td>{'increase' if bool(self.toggle_entropy.value) else 'dissipate'}</td></tr>"
             "</table>"
         )
-        self._set_stats_html(stats_html, force=force_update, bypass_suppress=True)
 
 
 class LMSBall3DEntropyShellTwoSheetWidget(_LMSEntropyShellMixin, LMSBall3DBackwardTwoSheetWidget):
@@ -5490,9 +5532,6 @@ class LMSBall3DEntropyShellTwoSheetWidget(_LMSEntropyShellMixin, LMSBall3DBackwa
             force_backward_time=False,
             **kwargs,
         )
-        # Base/backward stats panel writes generic content; entropy-shell subclass
-        # writes its own panel and should avoid double writes while playing.
-        self._suppress_stats_panel_updates = True
 
     def _simulate(self, params: dict[str, float | int]):
         d = 3
@@ -5556,7 +5595,6 @@ class LMSBall3DEntropyShellTwoSheetWidget(_LMSEntropyShellMixin, LMSBall3DBackwa
             return
         params = self._params_cache if self._params_cache else self._params()
         t = max(0, min(t, self._steps))
-        force_update = (t == 0) or (t == self._steps)
         frame_name: Literal["lab", "body"] = "body" if self.view_frame_dropdown.value == "body" else "lab"
         _, _, Z_series = self._frame_arrays()
         w = np.asarray(self._traj_cache["w"][t], dtype=np.float64)
@@ -5569,7 +5607,7 @@ class LMSBall3DEntropyShellTwoSheetWidget(_LMSEntropyShellMixin, LMSBall3DBackwa
                 return 0.0
             return float(arr[t])
 
-        stats_html = (
+        self.stats_html.value = (
             "<b>Entropy-shell two-sheet stats</b>"
             "<table style='font-family:monospace;font-size:12px;margin-top:6px'>"
             f"<tr><td style='padding-right:14px'>Displayed state</td><td>{self._init_mode_label(self._init_state_mode)}</td></tr>"
@@ -5579,9 +5617,9 @@ class LMSBall3DEntropyShellTwoSheetWidget(_LMSEntropyShellMixin, LMSBall3DBackwa
             f"<tr><td style='padding-right:14px'>Var to center</td><td>{_metric_at('var_to_center'):.5f}</td></tr>"
             f"<tr><td style='padding-right:14px'>Var to conformal center</td><td>{_metric_at('var_to_conformal_center'):.5f}</td></tr>"
             f"<tr><td style='padding-right:14px'>||mean(x)|| emp</td><td>{_metric_at('bary_emp'):.5f}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Alignment direction</td><td>{'increase' if bool(self.toggle_entropy.value) else 'dissipate'}</td></tr>"
             "</table>"
         )
-        self._set_stats_html(stats_html, force=force_update, bypass_suppress=True)
 
 
 LMSBall3DHydrodynamicEnsembleWidget = LMSBall3DEntropyShellEnsembleWidget

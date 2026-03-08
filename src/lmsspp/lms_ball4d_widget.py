@@ -1,7 +1,8 @@
-"""4D Plotly widget for reduced LMS dynamics on S^3 / B^4.
+"""High-dimensional Plotly widget for reduced LMS entropy-shell dynamics.
 
-This widget keeps LMS dynamics in ambient dimension d=4 and renders the S^3
-boundary into R^3 via stereographic inversion charts.
+This widget supports ambient dimension d>=4. It renders boundary dynamics into
+R^3 via stereographic inversion charts (dipole pair) and can switch the right
+panel to a covariance-matrix view.
 
 Enhancements over the single-chart view:
 - Dipole charts: two simultaneous inversion charts with opposite poles.
@@ -12,7 +13,7 @@ Enhancements over the single-chart view:
 from __future__ import annotations
 
 import math
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
 import torch
@@ -26,21 +27,38 @@ except Exception as exc:  # pragma: no cover
 try:
     from .LMS import (
         integrate_lms_reduced_euler,
+        mobius_sphere,
         normalize,
         random_points_on_sphere,
     )
-    from .lms_ball3d_widget import LMS3DControlSpec, LMSBall3DWidget
+    from .lms_ball3d_widget import (
+        EnergyStateMode,
+        EntropyCoordinateMode,
+        LMS3DControlSpec,
+        LMSBall3DWidget,
+        ShellConstraintMode,
+        _HydroRecomputeCancelled,
+        _LMSEntropyShellMixin,
+    )
 except Exception:
     from LMS import (  # type: ignore
         integrate_lms_reduced_euler,
+        mobius_sphere,
         normalize,
         random_points_on_sphere,
     )
-    from lms_ball3d_widget import LMS3DControlSpec, LMSBall3DWidget  # type: ignore
+    from lms_ball3d_widget import (  # type: ignore
+        EnergyStateMode,
+        EntropyCoordinateMode,
+        LMS3DControlSpec,
+        LMSBall3DWidget,
+        ShellConstraintMode,
+        _HydroRecomputeCancelled,
+        _LMSEntropyShellMixin,
+    )
 
 
 LMS4D_DEFAULT_CONTROLS = (
-    LMS3DControlSpec("r0", "Start radius |w|", 1e-4, 0.9999, 1e-4, 0.03, readout_format=".4f"),
     LMS3DControlSpec("N", "Oscillators N", 8, 300, 1, 150, integer=True, readout_format=".0f"),
     LMS3DControlSpec("K", "Coupling K", 0.0, 5.0, 0.02, 1.0, readout_format=".2f"),
     LMS3DControlSpec("omega", "Rotation rate omega", -10.0, 10.0, 0.02, 3.0, readout_format=".2f"),
@@ -71,38 +89,64 @@ LMS4D_DEFAULT_CONTROLS = (
 )
 
 
-def _angles_to_unit4(az: float, el: float, fourth: float) -> np.ndarray:
+def _angles_to_unit_nd(az: float, el: float, fourth: float, d: int) -> np.ndarray:
+    if int(d) < 4:
+        raise ValueError("ambient dimension must be >= 4.")
     c = math.cos(float(el))
-    vec = np.array(
+    vec = np.zeros((int(d),), dtype=np.float64)
+    vec[:4] = np.array(
         [c * math.cos(float(az)), c * math.sin(float(az)), math.sin(float(el)), float(fourth)],
         dtype=np.float64,
     )
     nrm = float(np.linalg.norm(vec))
     if nrm < 1e-12:
-        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        vec[0] = 1.0
+        return vec
     return vec / nrm
 
 
-class LMSBall4DWidget(LMSBall3DWidget):
-    """Reduced LMS widget in B^4 with S^3 rendered through inversion charts."""
+class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
+    """Entropy-shell LMS widget in B^d (d>=4) with dipole inversion charts."""
 
     def __init__(
         self,
         *,
         controls: tuple[LMS3DControlSpec, ...] = LMS4D_DEFAULT_CONTROLS,
-        title: str = "Reduced LMS dynamics on S³ (dipole charts in R³) / B⁴",
+        ambient_dim: int = 4,
+        entropy_coordinate_mode: EntropyCoordinateMode = "kernel",
+        right_panel_default: Literal["dipole", "cov_lab", "cov_body"] | None = None,
+        title: str = "LMS entropy-shell dynamics on S^{d-1} (dipole charts / covariance)",
         **kwargs: Any,
     ) -> None:
-        super().__init__(controls=controls, title=title, **kwargs)
+        self.ambient_dim = max(4, int(ambient_dim))
+        self._entropy_calibration_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self._right_panel_default = right_panel_default
+        super().__init__(
+            controls=controls,
+            title=title,
+            entropy_coordinate_mode=entropy_coordinate_mode,
+            **kwargs,
+        )
         self._inversion_enabled = True
+        mode_default = (
+            right_panel_default
+            if right_panel_default is not None
+            else ("cov_lab" if self.ambient_dim > 4 else "dipole")
+        )
+        if mode_default in {"dipole", "cov_lab", "cov_body"} and self.secondary_panel_dropdown.value != mode_default:
+            prev = self._updating
+            self._updating = True
+            self.secondary_panel_dropdown.value = mode_default
+            self._updating = prev
         self._apply_projection_visual_mode()
         self._sync_secondary_panel()
         self._render_frame(int(self.frame_slider.value))
 
+    def _controls_header_html(self) -> str:
+        return f"<b>LMS entropy-shell B^{self.ambient_dim}/S^{self.ambient_dim - 1} dipole widget controls</b>"
+
     def _build_controls(self) -> None:
         super()._build_controls()
-        if self.controls_box.children and isinstance(self.controls_box.children[0], widgets.HTML):
-            self.controls_box.children[0].value = "<b>LMS B⁴/S³ dipole-inversion widget controls</b>"
 
         self.secondary_panel_dropdown = widgets.Dropdown(
             options=[
@@ -121,8 +165,13 @@ class LMSBall4DWidget(LMSBall3DWidget):
         children.insert(5, row)
         self.controls_box.children = tuple(children)
 
-        self.toggle_init_state.disabled = True
-        self.toggle_init_state.tooltip = "4D widget currently uses Poisson initialization only."
+        if self.ambient_dim != 3 and hasattr(self, "entropy_coordinate_dropdown"):
+            prev = self._updating
+            self._updating = True
+            self.entropy_coordinate_dropdown.options = [("Kernel entropy", "kernel")]
+            self.entropy_coordinate_dropdown.value = "kernel"
+            self.entropy_coordinate_dropdown.disabled = True
+            self._updating = prev
 
     @staticmethod
     def _make_projection_figure(*, point_size: int, title: str, uirev: str) -> go.FigureWidget:
@@ -257,11 +306,11 @@ class LMSBall4DWidget(LMSBall3DWidget):
         return fig
 
     @staticmethod
-    def _make_covariance_figure(*, uirev: str) -> go.FigureWidget:
+    def _make_covariance_figure(*, uirev: str, dim: int) -> go.FigureWidget:
         fig = go.FigureWidget()
         fig.add_trace(
             go.Heatmap(
-                z=np.zeros((4, 4), dtype=np.float64),
+                z=np.zeros((int(dim), int(dim)), dtype=np.float64),
                 colorscale="RdBu",
                 zmid=0.0,
                 zmin=-1.0,
@@ -269,7 +318,8 @@ class LMSBall4DWidget(LMSBall3DWidget):
                 colorbar=dict(title="cov"),
             )
         )
-        labels = ["x₁", "x₂", "x₃", "x₄"]
+        labels = [f"x{i+1}" for i in range(int(dim))]
+        tick_vals = list(range(int(dim)))
         fig.update_layout(
             title="Covariance around empirical center",
             template="plotly_white",
@@ -277,10 +327,10 @@ class LMSBall4DWidget(LMSBall3DWidget):
             height=760,
             margin=dict(l=58, r=32, t=64, b=52),
             uirevision=uirev,
-            xaxis=dict(tickmode="array", tickvals=[0, 1, 2, 3], ticktext=labels, side="top"),
+            xaxis=dict(tickmode="array", tickvals=tick_vals, ticktext=labels, side="top"),
             yaxis=dict(
                 tickmode="array",
-                tickvals=[0, 1, 2, 3],
+                tickvals=tick_vals,
                 ticktext=labels,
                 autorange="reversed",
                 scaleanchor="x",
@@ -304,7 +354,7 @@ class LMSBall4DWidget(LMSBall3DWidget):
             title="Dipole chart (antipode inversion pole)",
             uirev="lms-ball4d-dipole",
         )
-        self.cov_fig = self._make_covariance_figure(uirev="lms-ball4d-cov")
+        self.cov_fig = self._make_covariance_figure(uirev="lms-ball4d-cov", dim=self.ambient_dim)
         self.secondary_panel_box = widgets.Box(
             children=(self.sphere_fig_dual,),
             layout=widgets.Layout(width="760px", height="760px"),
@@ -367,26 +417,26 @@ class LMSBall4DWidget(LMSBall3DWidget):
         self._sync_mode_button_labels()
 
     def _sync_init_state_button_label(self) -> None:
-        self._init_state_mode = "poisson"
-        self.toggle_init_state.description = "Initial State: Poisson (fixed)"
-        self.toggle_init_state.button_style = "info"
+        super()._sync_init_state_button_label()
 
     def _on_init_state_clicked(self, _btn: widgets.Button) -> None:
-        return
+        super()._on_init_state_clicked(_btn)
 
     @staticmethod
-    def _safe_unit4(v: np.ndarray) -> np.ndarray:
-        arr = np.asarray(v, dtype=np.float64).reshape(4)
+    def _safe_unit(v: np.ndarray, *, d: int) -> np.ndarray:
+        arr = np.asarray(v, dtype=np.float64).reshape(int(d))
         n = float(np.linalg.norm(arr))
         if n < 1e-12:
-            return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            out = np.zeros((int(d),), dtype=np.float64)
+            out[0] = 1.0
+            return out
         return arr / n
 
-    @staticmethod
-    def _orthonormal_tangent_basis(pole: np.ndarray) -> np.ndarray:
-        p = LMSBall4DWidget._safe_unit4(pole)
+    def _orthonormal_tangent_basis(self, pole: np.ndarray) -> np.ndarray:
+        d = int(self.ambient_dim)
+        p = self._safe_unit(pole, d=d)
         basis: list[np.ndarray] = []
-        for cand in np.eye(4, dtype=np.float64):
+        for cand in np.eye(d, dtype=np.float64):
             v = cand - float(np.dot(cand, p)) * p
             for b in basis:
                 v = v - float(np.dot(v, b)) * b
@@ -396,7 +446,7 @@ class LMSBall4DWidget(LMSBall3DWidget):
             if len(basis) == 3:
                 break
         if len(basis) < 3:
-            projector = np.eye(4, dtype=np.float64) - np.outer(p, p)
+            projector = np.eye(d, dtype=np.float64) - np.outer(p, p)
             u, s, _ = np.linalg.svd(projector)
             for i, sv in enumerate(s):
                 if sv <= 1e-10:
@@ -410,27 +460,30 @@ class LMSBall4DWidget(LMSBall3DWidget):
                 if len(basis) == 3:
                     break
         if len(basis) < 3:
-            basis = [
-                np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
-                np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64),
-                np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float64),
-            ]
+            basis = []
+            for i in range(3):
+                v = np.zeros((d,), dtype=np.float64)
+                v[i] = 1.0
+                basis.append(v)
         return np.stack(basis[:3], axis=1)
 
     def _majority_cluster_direction(self, *, frame_name: Literal["lab", "body"]) -> np.ndarray:
+        d = int(self.ambient_dim)
         z_key = "z_body" if frame_name == "body" else "z_lab"
         z_series = self._traj_cache.get(z_key)
         if z_series is not None and len(z_series) > 0:
             z_last = np.asarray(z_series[-1], dtype=np.float64).reshape(-1)
-            if z_last.shape[0] == 4 and float(np.linalg.norm(z_last)) > 1e-12:
-                return self._safe_unit4(z_last)
+            if z_last.shape[0] == d and float(np.linalg.norm(z_last)) > 1e-12:
+                return self._safe_unit(z_last, d=d)
 
         w_series = self._traj_cache.get("w")
         if w_series is not None and len(w_series) > 0:
             w_last = np.asarray(w_series[-1], dtype=np.float64).reshape(-1)
-            if w_last.shape[0] == 4 and float(np.linalg.norm(w_last)) > 1e-12:
-                return self._safe_unit4(-w_last)
-        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            if w_last.shape[0] == d and float(np.linalg.norm(w_last)) > 1e-12:
+                return self._safe_unit(-w_last, d=d)
+        out = np.zeros((d,), dtype=np.float64)
+        out[0] = 1.0
+        return out
 
     def _inversion_context_pair(
         self,
@@ -457,8 +510,8 @@ class LMSBall4DWidget(LMSBall3DWidget):
         _, secondary = self._inversion_context_pair(frame_name=frame_name)
         return secondary
 
-    @staticmethod
     def _stereographic_project_rows(
+        self,
         x: np.ndarray,
         *,
         pole: np.ndarray,
@@ -470,12 +523,13 @@ class LMSBall4DWidget(LMSBall3DWidget):
         single = arr.ndim == 1
         if single:
             arr = arr[None, :]
-        if arr.shape[1] != 4:
-            raise ValueError("stereographic projection expects vectors in R^4.")
+        d = int(self.ambient_dim)
+        if arr.shape[1] != d:
+            raise ValueError(f"stereographic projection expects vectors in R^{d}.")
 
-        pole_u = LMSBall4DWidget._safe_unit4(pole)
-        basis_43 = np.asarray(basis, dtype=np.float64).reshape(4, 3)
-        y3 = arr @ basis_43
+        pole_u = self._safe_unit(pole, d=d)
+        basis_d3 = np.asarray(basis, dtype=np.float64).reshape(d, 3)
+        y3 = arr @ basis_d3
         y4 = arr @ pole_u
         den = 1.0 - y4[:, None]
         den_safe = np.where(np.abs(den) < eps, np.where(den >= 0.0, eps, -eps), den)
@@ -498,7 +552,7 @@ class LMSBall4DWidget(LMSBall3DWidget):
             return arr
         if arr.ndim == 2 and arr.shape[1] == 3:
             return arr
-        if arr.shape[-1] != 4:
+        if arr.shape[-1] != int(self.ambient_dim):
             return arr
         if inv_ctx is None:
             inv_ctx = self._inversion_context(frame_name=frame_name)
@@ -675,12 +729,12 @@ class LMSBall4DWidget(LMSBall3DWidget):
             self.metrics_fig.update_yaxes(range=[-lim, lim], row=2, col=1)
 
     @staticmethod
-    def _covariance_matrix(points: np.ndarray) -> np.ndarray:
+    def _covariance_matrix(points: np.ndarray, *, d: int) -> np.ndarray:
         pts = np.asarray(points, dtype=np.float64)
-        if pts.ndim != 2 or pts.shape[1] != 4:
-            raise ValueError("covariance expects points with shape [N,4].")
+        if pts.ndim != 2 or pts.shape[1] != int(d):
+            raise ValueError(f"covariance expects points with shape [N,{int(d)}].")
         if pts.shape[0] <= 1:
-            return np.zeros((4, 4), dtype=np.float64)
+            return np.zeros((int(d), int(d)), dtype=np.float64)
         mu = pts.mean(axis=0, keepdims=True)
         centered = pts - mu
         return (centered.T @ centered) / float(max(pts.shape[0], 1))
@@ -692,13 +746,11 @@ class LMSBall4DWidget(LMSBall3DWidget):
             pts = np.asarray(x_series[t], dtype=np.float64)
         else:
             pts = np.asarray(self._points_at_frame(t, None, frame_name=frame_name), dtype=np.float64)
-        cov = self._covariance_matrix(pts)
+        cov = self._covariance_matrix(pts, d=self.ambient_dim)
         eig = np.linalg.eigvalsh(cov)
         vmax = float(max(np.max(np.abs(cov)), 1e-9))
-        title = (
-            f"Covariance ({frame_name} frame) at t={int(t)} "
-            f"| eig=[{eig[0]:.3f}, {eig[1]:.3f}, {eig[2]:.3f}, {eig[3]:.3f}]"
-        )
+        eig_txt = ", ".join(f"{float(v):.3f}" for v in eig[: min(6, eig.shape[0])])
+        title = f"Covariance ({frame_name} frame) at t={int(t)} | eig=[{eig_txt}]"
         with self.cov_fig.batch_update():
             self.cov_fig.data[0].z = cov.tolist()
             self.cov_fig.data[0].zmin = -vmax
@@ -822,55 +874,359 @@ class LMSBall4DWidget(LMSBall3DWidget):
         self._dual_last_path_frame = -10**9
         super()._recompute(reset_frame=reset_frame)
 
-    @staticmethod
-    def _skew_plane_rotation(axis: torch.Tensor, *, rate: float) -> torch.Tensor:
-        if axis.numel() != 4:
-            raise ValueError("axis must be a 4-vector.")
-        a = normalize(axis.view(1, 4))[0]
-        e4 = torch.zeros((4,), dtype=axis.dtype, device=axis.device)
-        e4[3] = 1.0
-        b = e4 - torch.dot(e4, a) * a
-        b_norm = float(torch.linalg.norm(b))
-        if b_norm < 1e-10:
-            e1 = torch.zeros((4,), dtype=axis.dtype, device=axis.device)
-            e1[0] = 1.0
-            b = e1 - torch.dot(e1, a) * a
-        b = normalize(b.view(1, 4))[0]
-        return (torch.outer(b, a) - torch.outer(a, b)) * float(rate)
+    def _target_axis_from_params(self, params: dict[str, float | int]) -> torch.Tensor:
+        axis = torch.tensor(
+            _angles_to_unit_nd(
+                float(params["w_az"]),
+                float(params["w_el"]),
+                float(params.get("w_4", 0.0)),
+                self.ambient_dim,
+            ),
+            dtype=torch.float64,
+        )
+        return normalize(axis.unsqueeze(0))[0]
 
-    def _simulate(self, params: dict[str, float | int]):
-        d = 4
-        n = int(params["N"])
-        K = float(params["K"])
-        conformal_sign = -1.0 if bool(self.toggle_entropy.value) else 1.0
-        omega = float(params["omega"])
-        r0 = float(params["r0"])
-        w_az = float(params["w_az"])
-        w_el = float(params["w_el"])
-        w_4 = float(params.get("w_4", 0.0))
-        ax_az = float(params["ax_az"])
-        ax_el = float(params["ax_el"])
-        ax_4 = float(params.get("ax_4", 0.0))
-        dt = self._effective_dt(params)
-        steps = int(params["steps"])
-        store_points, resolved_mode = self._resolve_store_points(n=n, steps=steps, d=d)
-        self._resolved_trajectory_mode = resolved_mode
-        self._init_state_mode = "poisson"
+    def _rotation_axis_from_params(self, params: dict[str, float | int]) -> torch.Tensor:
+        axis = torch.tensor(
+            _angles_to_unit_nd(
+                float(params["ax_az"]),
+                float(params["ax_el"]),
+                float(params.get("ax_4", 0.0)),
+                self.ambient_dim,
+            ),
+            dtype=torch.float64,
+        )
+        return normalize(axis.unsqueeze(0))[0]
 
-        weights = torch.ones(n, dtype=torch.float64) / float(n)
-        center_dir = torch.tensor(_angles_to_unit4(w_az, w_el, w_4), dtype=torch.float64)
+    def _entropy_calibration_base_points(self, *, sample_count: int) -> torch.Tensor:
+        key = (int(self.ambient_dim), int(sample_count))
+        cached = self._entropy_calibration_cache.get(key)
+        if cached is not None:
+            return cached
+        gen = torch.Generator().manual_seed(1729 + 1009 * int(self.ambient_dim) + int(sample_count))
+        base = random_points_on_sphere(
+            int(sample_count),
+            d=int(self.ambient_dim),
+            generator=gen,
+            dtype=torch.float64,
+        )
+        self._entropy_calibration_cache[key] = base
+        return base
+
+    def _poisson_entropy_at_radius(self, *, axis: torch.Tensor, r: float, sample_count: int = 900) -> float:
+        base = self._entropy_calibration_base_points(sample_count=int(sample_count))
+        w = -axis * float(np.clip(r, 0.0, 0.9995))
+        x = normalize(mobius_sphere(base, w))
+        return self._entropy_shell_monitor_value(points=x, kappa=14.0)
+
+    def _radius_for_poisson_entropy(self, *, axis: torch.Tensor, target_entropy: float) -> float:
+        lo = 0.0
+        hi = 0.9995
+        h_lo = self._poisson_entropy_at_radius(axis=axis, r=lo)
+        h_hi = self._poisson_entropy_at_radius(axis=axis, r=hi)
+        target = float(np.clip(float(target_entropy), min(h_hi, h_lo), max(h_hi, h_lo)))
+        if target >= h_lo:
+            return lo
+        if target <= h_hi:
+            return hi
+        for _ in range(26):
+            mid = 0.5 * (lo + hi)
+            h_mid = self._poisson_entropy_at_radius(axis=axis, r=mid)
+            if h_mid > target:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    def _entropy_target_for_params(
+        self,
+        params: dict[str, float | int],
+        *,
+        coord_mode: EntropyCoordinateMode | None = None,
+    ) -> dict[str, float | str]:
+        if int(self.ambient_dim) == 3:
+            return super()._entropy_target_for_params(params, coord_mode=coord_mode)
+
+        _ = coord_mode
+        constraint_mode: ShellConstraintMode = self._current_constraint_mode()
+        slider_entropy = float(np.clip(float(params.get("entropy0", 0.84)), 0.0, 1.0))
+        slider_energy = float(np.clip(float(params.get("energy0", 0.35)), 0.0, 1.0))
+        axis = self._target_axis_from_params(params)
+
+        if constraint_mode == "constant_energy":
+            q_target = slider_energy
+            r_poisson = self._q_target_to_radius(d=int(self.ambient_dim), q_target=q_target)
+            kernel_target = self._poisson_entropy_at_radius(axis=axis, r=r_poisson)
+            return {
+                "coord_mode": "kernel",
+                "constraint_mode": constraint_mode,
+                "slider_target": slider_energy,
+                "effective_target": kernel_target,
+                "kernel_target": kernel_target,
+                "r_poisson": r_poisson,
+                "q_target": q_target,
+            }
+
+        kernel_target = slider_entropy
+        r_poisson = self._radius_for_poisson_entropy(axis=axis, target_entropy=kernel_target)
+        q_target = self._radius_to_q_target(d=int(self.ambient_dim), r=float(r_poisson))
+        return {
+            "coord_mode": "kernel",
+            "constraint_mode": constraint_mode,
+            "slider_target": slider_entropy,
+            "effective_target": kernel_target,
+            "kernel_target": kernel_target,
+            "r_poisson": r_poisson,
+            "q_target": q_target,
+        }
+
+    def _poisson_reference_cloud(
+        self,
+        *,
+        n: int,
+        axis: torch.Tensor,
+        r_poisson: float,
+        target_entropy: float | None = None,
+        refine_entropy: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         base_points = random_points_on_sphere(
+            n,
+            d=int(self.ambient_dim),
+            generator=self._torch_gen,
+            dtype=torch.float64,
+        )
+        r_refined = float(np.clip(r_poisson, 0.0, 0.9995))
+        if refine_entropy and target_entropy is not None:
+            r_refined = self._refine_poisson_radius_for_sample(
+                base_points=base_points,
+                axis=axis,
+                r_seed=float(r_poisson),
+                target_entropy=float(target_entropy),
+            )
+        w_poisson = -axis * float(np.clip(r_refined, 0.0, 0.9995))
+        x_poisson = normalize(mobius_sphere(base_points, w_poisson))
+        return base_points, w_poisson, x_poisson
+
+    def _optimize_constant_energy_entropy_extreme(
+        self,
+        *,
+        n: int,
+        axis: torch.Tensor,
+        q_target: float,
+        maximize_entropy: bool,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> torch.Tensor:
+        d = int(self.ambient_dim)
+        x0 = random_points_on_sphere(
             n,
             d=d,
             generator=self._torch_gen,
             dtype=torch.float64,
         )
-        r0_clip = float(np.clip(r0, 0.0, 0.999999))
-        w0 = -center_dir * r0_clip
+        if q_target > 1e-9:
+            mix = float(np.clip(q_target, 0.0, 0.95))
+            x0 = normalize((1.0 - mix) * x0 + mix * axis.unsqueeze(0))
+
+        x_var = torch.nn.Parameter(normalize(x0.clone()))
+        opt = torch.optim.Adam([x_var], lr=0.064 if maximize_entropy else 0.070)
+        lambda_q = 520.0
+        lambda_dir = 34.0 if q_target > 0.05 else 0.0
+        lambda_ent = 24.0
+        move_cap = 0.056 if maximize_entropy else 0.050
+        max_iters = 180 if maximize_entropy else 170
+        q_tol = max(5e-4, 0.015 * (1.0 - float(q_target)))
+        stable = 0
+        best = normalize(x_var.detach())
+        best_rank: tuple[float, float] | None = None
+        x_prev = best
+        for _ in range(max_iters):
+            if cancel_check is not None and bool(cancel_check()):
+                raise _HydroRecomputeCancelled("Constant-energy entropy optimization cancelled.")
+            opt.zero_grad(set_to_none=True)
+            x = normalize(x_var)
+            mean = x.mean(dim=0)
+            q = torch.linalg.norm(mean)
+            q_loss = (q - float(q_target)) ** 2
+            dir_loss = self._energy_shell_dir_loss(mean=mean, axis=axis)
+            sample_idx = self._entropy_shell_objective_sample_idx(n=n, device=x.device)
+            sample_size = n if sample_idx is None else int(sample_idx.shape[0])
+            entropy = self._spherical_entropy_proxy_normalized_torch(
+                points=x,
+                kappa=14.0,
+                sample_size=sample_size,
+                sample_idx=sample_idx,
+            )
+            entropy_term = -entropy if maximize_entropy else entropy
+            loss = lambda_q * q_loss + lambda_dir * dir_loss + lambda_ent * entropy_term
+            loss.backward()
+            opt.step()
+
+            with torch.no_grad():
+                x_new = normalize(x_var)
+                delta = x_new - x_prev
+                delta_norm = torch.linalg.norm(delta, dim=1, keepdim=True)
+                scale = torch.clamp(move_cap / (delta_norm + 1e-12), max=1.0)
+                x_step = normalize(x_prev + delta * scale)
+                x_var.copy_(x_step)
+                x_prev = x_step.detach()
+                mean_step = x_step.mean(dim=0)
+                q_now = float(torch.linalg.norm(mean_step))
+                entropy_now = self._entropy_shell_monitor_value(points=x_step, kappa=14.0)
+                rank = ((-entropy_now) if maximize_entropy else entropy_now, abs(q_now - float(q_target)))
+                if best_rank is None or rank < best_rank:
+                    best_rank = rank
+                    best = x_step.detach().clone()
+                if abs(q_now - float(q_target)) <= q_tol:
+                    stable += 1
+                else:
+                    stable = 0
+                if stable >= 6:
+                    break
+
+        out = normalize(best)
+        return normalize(self._flip_points_to_axis(out, axis))
+
+    def _make_energy_shell_boundary_points(
+        self,
+        *,
+        n: int,
+        params: dict[str, float | int],
+        mode: EnergyStateMode,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        target_info = self._entropy_target_for_params(params)
+        constraint_mode = str(target_info.get("constraint_mode", "constant_entropy"))
+        axis = self._target_axis_from_params(params)
+        _, w_poisson, x_poisson = self._poisson_reference_cloud(
+            n=n,
+            axis=axis,
+            r_poisson=float(target_info["r_poisson"]),
+            target_entropy=float(target_info["kernel_target"]),
+            refine_entropy=constraint_mode == "constant_entropy",
+        )
+        if mode == "poisson":
+            return x_poisson, w_poisson
+
+        weights = torch.ones(n, dtype=torch.float64) / float(n)
+        if constraint_mode == "constant_energy":
+            x_final = self._optimize_constant_energy_entropy_extreme(
+                n=n,
+                axis=axis,
+                q_target=float(target_info["q_target"]),
+                maximize_entropy=(mode == "max_energy"),
+                cancel_check=cancel_check,
+            )
+            w0 = self._estimate_w_from_boundary_points(
+                points=x_final,
+                weights=weights,
+                d=int(self.ambient_dim),
+                fallback_dir=axis,
+            )
+            return x_final, w0
+
+        if mode == "min_energy":
+            x_final = self._optimize_energy_shell_boundary_points(
+                x_start=x_poisson,
+                axis=axis,
+                target_entropy=float(target_info["kernel_target"]),
+                minimize_energy=True,
+                cancel_check=cancel_check,
+            )
+            w0 = self._estimate_w_from_boundary_points(
+                points=x_final,
+                weights=weights,
+                d=int(self.ambient_dim),
+                fallback_dir=axis,
+            )
+            return x_final, w0
+
+        best_points: torch.Tensor | None = None
+        best_key: tuple[int, float, float] | None = None
+        for sigma in (0.10, 0.18, 0.26):
+            if cancel_check is not None and bool(cancel_check()):
+                raise _HydroRecomputeCancelled("Entropy-shell maximum-energy restarts cancelled.")
+            x_start = self._tangent_perturbation(points=x_poisson, sigma=float(sigma))
+            x_candidate = self._optimize_energy_shell_boundary_points(
+                x_start=x_start,
+                axis=axis,
+                target_entropy=float(target_info["kernel_target"]),
+                minimize_energy=False,
+                cancel_check=cancel_check,
+            )
+            key = self._candidate_signature(
+                points=x_candidate,
+                axis=axis,
+                target_entropy=float(target_info["kernel_target"]),
+            )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_points = x_candidate
+        if best_points is None:
+            best_points = x_poisson
+        w0 = self._estimate_w_from_boundary_points(
+            points=best_points,
+            weights=weights,
+            d=int(self.ambient_dim),
+            fallback_dir=axis,
+        )
+        return best_points, w0
+
+    @staticmethod
+    def _skew_plane_rotation(axis: torch.Tensor, *, rate: float) -> torch.Tensor:
+        d = int(axis.numel())
+        if d < 4:
+            raise ValueError("axis dimension must be >= 4.")
+        a = normalize(axis.view(1, d))[0]
+        e_last = torch.zeros((d,), dtype=axis.dtype, device=axis.device)
+        e_last[-1] = 1.0
+        b = e_last - torch.dot(e_last, a) * a
+        b_norm = float(torch.linalg.norm(b))
+        if b_norm < 1e-10:
+            e1 = torch.zeros((d,), dtype=axis.dtype, device=axis.device)
+            e1[0] = 1.0
+            b = e1 - torch.dot(e1, a) * a
+        b = normalize(b.view(1, d))[0]
+        return (torch.outer(b, a) - torch.outer(a, b)) * float(rate)
+
+    def _simulate(self, params: dict[str, float | int]):
+        d = int(self.ambient_dim)
+        n = int(params["N"])
+        K = float(params["K"])
+        conformal_sign = -1.0 if bool(self.toggle_entropy.value) else 1.0
+        omega = float(params["omega"])
+        dt = abs(float(params["dt"]))
+        steps = int(params["steps"])
+        store_points, resolved_mode = self._resolve_store_points(n=n, steps=steps, d=d)
+        self._resolved_trajectory_mode = resolved_mode
+        axis = self._target_axis_from_params(params)
+
+        mode = self._coerce_mode_to_active_family(self._init_state_mode)
+        self._init_state_mode = mode  # type: ignore[assignment]
+        if mode == "poisson":
+            target = self._entropy_target_for_params(params)
+            constraint_mode = str(target.get("constraint_mode", "constant_entropy"))
+            base_points, w0, _ = self._poisson_reference_cloud(
+                n=n,
+                axis=axis,
+                r_poisson=float(target["r_poisson"]),
+                target_entropy=float(target["kernel_target"]),
+                refine_entropy=constraint_mode == "constant_entropy",
+            )
+        else:
+            x0_points, w0 = self._make_energy_shell_boundary_points(
+                n=n,
+                params=params,
+                mode=mode,  # type: ignore[arg-type]
+            )
+            base_points = self._recover_base_points_from_state(
+                x_points=x0_points,
+                w0=w0,
+            )
 
         zeta0 = torch.eye(d, dtype=torch.float64)
-        axis = torch.tensor(_angles_to_unit4(ax_az, ax_el, ax_4), dtype=torch.float64)
-        A = self._skew_plane_rotation(axis, rate=omega).to(dtype=torch.float64)
+        rot_axis = self._rotation_axis_from_params(params)
+        A = self._skew_plane_rotation(rot_axis, rate=omega).to(dtype=torch.float64)
+        weights = torch.ones(n, dtype=torch.float64) / float(n)
 
         return integrate_lms_reduced_euler(
             w0=w0,
@@ -879,7 +1235,7 @@ class LMSBall4DWidget(LMSBall3DWidget):
             weights=weights,
             A=A,
             coupling=conformal_sign * K,
-            dt=dt,
+            dt=max(dt, 1e-12),
             steps=steps,
             w_mode=str(self.mode_dropdown.value),
             project_rotation=True,

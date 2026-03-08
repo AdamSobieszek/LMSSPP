@@ -93,9 +93,6 @@ def dynamic_sinkhorn_chain(
     T = len(nodes_list) - 1
     assert len(mu_list) == T + 1
 
-    device = nodes_list[0].device
-    d = nodes_list[0].shape[1]
-
     # Make sure mu's are normalized
     mu_list = [m / (m.sum() + tiny) for m in mu_list]
 
