@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Any, Callable, Literal
@@ -287,6 +288,7 @@ class LMSBall3DWidget:
         init_metric_mode: InitMetricMode = "entropy",
         display_points_cap: int | None = None,
         memory_budget_mb: int = 512,
+        export_media_folder: str | None = None,
     ) -> None:
         self.control_specs = controls
         self.w_mode = w_mode
@@ -300,6 +302,8 @@ class LMSBall3DWidget:
             int(display_points_cap) if display_points_cap is not None and int(display_points_cap) > 0 else None
         )
         self.memory_budget_mb = int(memory_budget_mb)
+        self.export_media_folder = str(export_media_folder).strip() if export_media_folder else None
+        self._resolved_export_media_folder: str | None = None
         if self.trajectory_mode not in {"memory", "fps", "auto"}:
             raise ValueError("trajectory_mode must be 'memory', 'fps', or 'auto'.")
         if self.thermo_mode not in {"recompute", "approx", "exact"}:
@@ -308,6 +312,7 @@ class LMSBall3DWidget:
         self._updating = False
         self._torch_gen = torch.Generator().manual_seed(self.rng_seed)
         self._controls: dict[str, widgets.Widget] = {}
+        self._export_widget_meta: dict[int, dict[str, Any]] = {}
         self._wire_count = 0
         self._camera_cache: dict[str, Any] | None = None
         self._default_camera_eye: dict[str, float] = {"x": 1.25, "y": 1.25, "z": 1.25}
@@ -384,6 +389,7 @@ class LMSBall3DWidget:
                     style=slider_style,
                 )
             self._controls[spec.key] = w
+            self._register_export_widget(w, control_id=spec.key, state_key=spec.key)
             marker = self._make_slider_reference_marker(spec)
             if marker is None:
                 sliders.append(w)
@@ -432,6 +438,11 @@ class LMSBall3DWidget:
         )
         self.show_paths = widgets.Checkbox(value=True, description="show paths", indent=False)
         self.show_vectors = widgets.Checkbox(value=True, description="show vectors", indent=False)
+        self._register_export_widget(self.mode_dropdown, control_id="mode_dropdown", state_key="backend")
+        self._register_export_widget(self.layout_dropdown, control_id="layout_dropdown", state_key="layout_mode")
+        self._register_export_widget(self.view_frame_dropdown, control_id="view_frame_dropdown", state_key="frame_name")
+        self._register_export_widget(self.show_paths, control_id="show_paths", state_key="show_paths")
+        self._register_export_widget(self.show_vectors, control_id="show_vectors", state_key="show_vectors")
 
         self.play = widgets.Play(
             value=0,
@@ -448,6 +459,7 @@ class LMSBall3DWidget:
                 self.play.repeat = False
             except Exception:
                 pass
+        self._register_export_widget(self.play, control_id="play", state_key="frame")
         self.frame_slider = widgets.IntSlider(
             value=0,
             min=0,
@@ -459,6 +471,7 @@ class LMSBall3DWidget:
             style={"description_width": "initial"},
         )
         widgets.jslink((self.play, "value"), (self.frame_slider, "value"))
+        self._register_export_widget(self.frame_slider, control_id="frame_slider", state_key="frame")
 
         self.btn_play_forward = widgets.Button(description="Forward ▶")
         self.btn_play_backward = widgets.Button(description="◀ Backward")
@@ -466,13 +479,41 @@ class LMSBall3DWidget:
         self.toggle_time_direction = widgets.ToggleButton(value=False, description="Time Direction: Forward")
         self.btn_recompute = widgets.Button(description="Recompute")
         self.btn_export_iframe = widgets.Button(description="Export iframe snapshot")
+        self.btn_export_webm = widgets.Button(description="Export WebM set")
         self.toggle_init_state = widgets.Button(description="Initial State: High Entropy")
         self.btn_toggle_frame = widgets.Button(description="Frame: Lab")
         self.btn_speed_half = widgets.Button(description="0.5x speed (1.0)")
         self.btn_speed_double = widgets.Button(description="2x speed (1.0)")
+        self._register_export_widget(self.btn_play_forward, control_id="btn_play_forward")
+        self._register_export_widget(self.btn_play_backward, control_id="btn_play_backward")
+        self._register_export_widget(self.toggle_entropy, control_id="toggle_entropy", state_key="alignment_direction")
+        self._register_export_widget(self.toggle_time_direction, control_id="toggle_time_direction", state_key="time_direction")
+        self._register_export_widget(self.btn_recompute, control_id="btn_recompute")
+        self._register_export_widget(self.btn_export_iframe, control_id="btn_export_iframe", hidden_in_export=True)
+        self._register_export_widget(self.btn_export_webm, control_id="btn_export_webm", hidden_in_export=True)
+        self._register_export_widget(self.toggle_init_state, control_id="toggle_init_state", state_key="init_state")
+        self._register_export_widget(
+            self.btn_toggle_frame,
+            control_id="btn_toggle_frame",
+            state_key="frame_name",
+            label_binding="frame_name_button",
+        )
+        self._register_export_widget(
+            self.btn_speed_half,
+            control_id="btn_speed_half",
+            state_key="playback_speed",
+            label_binding="speed_buttons",
+        )
+        self._register_export_widget(
+            self.btn_speed_double,
+            control_id="btn_speed_double",
+            state_key="playback_speed",
+            label_binding="speed_buttons",
+        )
 
         self.stats_html = widgets.HTML("")
         self.export_status_html = widgets.HTML("")
+        self._register_export_widget(self.export_status_html, control_id="export_status_html", hidden_in_export=True)
         button_col_layout = widgets.Layout(width="180px")
         for btn in (
             self.btn_play_forward,
@@ -481,6 +522,7 @@ class LMSBall3DWidget:
             self.toggle_time_direction,
             self.btn_recompute,
             self.btn_export_iframe,
+            self.btn_export_webm,
             self.toggle_init_state,
             self.btn_toggle_frame,
             self.btn_speed_half,
@@ -500,7 +542,7 @@ class LMSBall3DWidget:
             layout=widgets.Layout(align_items="flex-start", width=control_width),
         )
         self._export_controls_row = widgets.HBox(
-            [self.btn_export_iframe, self.export_status_html],
+            [self.btn_export_iframe, self.btn_export_webm, self.export_status_html],
             layout=widgets.Layout(width=control_width, align_items="center"),
         )
         params_box = widgets.VBox(sliders, layout=widgets.Layout(width=control_width))
@@ -937,28 +979,185 @@ class LMSBall3DWidget:
         self.metrics_fig.update_yaxes(range=[-1.05, 1.05], row=2, col=1)
         self.metrics_fig.update_yaxes(range=[-0.05, 1.20], row=3, col=1)
 
+    def _register_export_widget(
+        self,
+        widget: widgets.Widget,
+        *,
+        control_id: str,
+        state_key: str | None = None,
+        label_binding: str | None = None,
+        hidden_in_export: bool = False,
+    ) -> None:
+        meta = dict(self._export_widget_meta.get(id(widget), {}))
+        meta["control_id"] = str(control_id)
+        if state_key is not None:
+            meta["state_key"] = str(state_key)
+        if label_binding is not None:
+            meta["label_binding"] = str(label_binding)
+        if hidden_in_export:
+            meta["hidden_in_export"] = True
+        self._export_widget_meta[id(widget)] = meta
+
+    def _set_export_action(
+        self,
+        widget: widgets.Widget,
+        *,
+        action_kind: str,
+        state_key: str | None = None,
+        label_binding: str | None = None,
+        hidden_in_export: bool | None = None,
+    ) -> None:
+        meta = dict(self._export_widget_meta.get(id(widget), {}))
+        meta["action_kind"] = str(action_kind)
+        if state_key is not None:
+            meta["state_key"] = str(state_key)
+        if label_binding is not None:
+            meta["label_binding"] = str(label_binding)
+        if hidden_in_export is not None:
+            meta["hidden_in_export"] = bool(hidden_in_export)
+        self._export_widget_meta[id(widget)] = meta
+
+    def _bind_export_observe(
+        self,
+        widget: widgets.Widget,
+        handler: Callable[[dict[str, Any]], None],
+        *,
+        action_kind: str,
+        state_key: str | None = None,
+        label_binding: str | None = None,
+        hidden_in_export: bool | None = None,
+        names: str | tuple[str, ...] = "value",
+    ) -> None:
+        widget.observe(handler, names=names)
+        self._set_export_action(
+            widget,
+            action_kind=action_kind,
+            state_key=state_key,
+            label_binding=label_binding,
+            hidden_in_export=hidden_in_export,
+        )
+
+    def _bind_export_click(
+        self,
+        widget: widgets.Widget,
+        handler: Callable[[widgets.Button], None],
+        *,
+        action_kind: str,
+        state_key: str | None = None,
+        label_binding: str | None = None,
+        hidden_in_export: bool | None = None,
+    ) -> None:
+        widget.on_click(handler)
+        self._set_export_action(
+            widget,
+            action_kind=action_kind,
+            state_key=state_key,
+            label_binding=label_binding,
+            hidden_in_export=hidden_in_export,
+        )
+
     def _bind_events(self) -> None:
-        for w in self._controls.values():
-            w.observe(self._on_control_change, names="value")
-        self.mode_dropdown.observe(self._on_control_change, names="value")
-        self.view_frame_dropdown.observe(self._on_visual_change, names="value")
+        for spec in self.control_specs:
+            self._bind_export_observe(
+                self._controls[spec.key],
+                self._on_control_change,
+                action_kind="backend_notice",
+                state_key=spec.key,
+            )
+        self._bind_export_observe(
+            self.mode_dropdown,
+            self._on_control_change,
+            action_kind="backend_notice",
+            state_key="backend",
+        )
+        self._bind_export_observe(
+            self.view_frame_dropdown,
+            self._on_visual_change,
+            action_kind="frame_name_set",
+            state_key="frame_name",
+        )
         self.layout_top_view.observe(self._on_layout_change, names="value")
-        self.layout_dropdown.observe(self._on_layout_dropdown_change, names="value")
-        self.show_paths.observe(self._on_visual_change, names="value")
-        self.show_vectors.observe(self._on_visual_change, names="value")
-        self.toggle_time_direction.observe(self._on_time_direction_change, names="value")
-        self.frame_slider.observe(self._on_frame_change, names="value")
+        self._bind_export_observe(
+            self.layout_dropdown,
+            self._on_layout_dropdown_change,
+            action_kind="layout_set",
+            state_key="layout_mode",
+        )
+        self._bind_export_observe(
+            self.show_paths,
+            self._on_visual_change,
+            action_kind="show_paths_toggle",
+            state_key="show_paths",
+        )
+        self._bind_export_observe(
+            self.show_vectors,
+            self._on_visual_change,
+            action_kind="show_vectors_toggle",
+            state_key="show_vectors",
+        )
+        self._bind_export_observe(
+            self.toggle_time_direction,
+            self._on_time_direction_change,
+            action_kind="backend_notice",
+            state_key="time_direction",
+        )
+        self._bind_export_observe(
+            self.frame_slider,
+            self._on_frame_change,
+            action_kind="frame_set",
+            state_key="frame",
+        )
+        self._set_export_action(self.play, action_kind="play", state_key="frame", label_binding="play_button")
         self.sphere_fig.layout.scene.on_change(self._on_camera_changed, "camera")
         self.sphere_fig.on_edits_completed(self._on_plot_edits_completed)
-        self.btn_play_forward.on_click(self._on_play_forward_clicked)
-        self.btn_play_backward.on_click(self._on_play_backward_clicked)
-        self.toggle_entropy.observe(self._on_entropy_direction_change, names="value")
-        self.toggle_init_state.on_click(self._on_init_state_clicked)
-        self.btn_toggle_frame.on_click(self._on_toggle_frame_clicked)
-        self.btn_speed_half.on_click(self._on_speed_half_clicked)
-        self.btn_speed_double.on_click(self._on_speed_double_clicked)
-        self.btn_recompute.on_click(self._on_recompute_clicked)
-        self.btn_export_iframe.on_click(self._on_export_iframe_clicked)
+        self._bind_export_click(self.btn_play_forward, self._on_play_forward_clicked, action_kind="play_forward")
+        self._bind_export_click(self.btn_play_backward, self._on_play_backward_clicked, action_kind="play_backward")
+        self._bind_export_observe(
+            self.toggle_entropy,
+            self._on_entropy_direction_change,
+            action_kind="backend_notice",
+            state_key="alignment_direction",
+        )
+        self._bind_export_click(
+            self.toggle_init_state,
+            self._on_init_state_clicked,
+            action_kind="backend_notice",
+            state_key="init_state",
+        )
+        self._bind_export_click(
+            self.btn_toggle_frame,
+            self._on_toggle_frame_clicked,
+            action_kind="frame_name_toggle",
+            state_key="frame_name",
+            label_binding="frame_name_button",
+        )
+        self._bind_export_click(
+            self.btn_speed_half,
+            self._on_speed_half_clicked,
+            action_kind="speed_half",
+            state_key="playback_speed",
+            label_binding="speed_buttons",
+        )
+        self._bind_export_click(
+            self.btn_speed_double,
+            self._on_speed_double_clicked,
+            action_kind="speed_double",
+            state_key="playback_speed",
+            label_binding="speed_buttons",
+        )
+        self._bind_export_click(self.btn_recompute, self._on_recompute_clicked, action_kind="backend_notice")
+        self._bind_export_click(
+            self.btn_export_iframe,
+            self._on_export_iframe_clicked,
+            action_kind="backend_notice",
+            hidden_in_export=True,
+        )
+        self._bind_export_click(
+            self.btn_export_webm,
+            self._on_export_webm_clicked,
+            action_kind="backend_notice",
+            hidden_in_export=True,
+        )
 
     def _params(self) -> dict[str, float | int]:
         params: dict[str, float | int] = {}
@@ -990,11 +1189,50 @@ class LMSBall3DWidget:
             f"<span style='font-family:monospace;font-size:12px;color:{color}'>{message}</span>"
         )
 
+    def _export_root_dir(self) -> Path:
+        return Path(__file__).resolve().parents[2] / "exports" / "widget_snapshots"
+
     def _default_export_snapshot_path(self) -> Path:
-        root = Path(__file__).resolve().parents[2]
-        out_dir = root / "exports" / "widget_snapshots"
+        out_dir = self._export_root_dir()
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         return out_dir / f"{self.__class__.__name__}_{ts}.html"
+
+    @staticmethod
+    def _sanitize_export_folder_name(name: str) -> str:
+        raw = str(name).strip()
+        if not raw:
+            return "widget_media"
+        clean = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("._-")
+        return clean or "widget_media"
+
+    def _resolve_export_media_dir(self, out_dir: str | Path | None = None) -> Path:
+        root = self._export_root_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        if out_dir is not None:
+            candidate = Path(out_dir).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            return candidate.resolve()
+
+        if self._resolved_export_media_folder is None:
+            if self.export_media_folder:
+                folder = self._sanitize_export_folder_name(self.export_media_folder)
+            else:
+                params = dict(self._params_cache if self._params_cache else self._params())
+                init_mode = str(getattr(self, "_display_mode", getattr(self, "_init_state_mode", "state")))
+                constraint_mode = "default"
+                if hasattr(self, "_current_constraint_mode"):
+                    try:
+                        constraint_mode = str(getattr(self, "_current_constraint_mode")())
+                    except Exception:
+                        constraint_mode = "default"
+                ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                steps = int(params.get("steps", 0))
+                folder = self._sanitize_export_folder_name(
+                    f"{self._export_widget_kind()}_{init_mode}_{constraint_mode}_s{steps}_{ts}"
+                )
+            self._resolved_export_media_folder = folder
+        return (root / self._resolved_export_media_folder).resolve()
 
     def _export_additional_bundle_fields(self, *, traj_cache: dict[str, np.ndarray]) -> dict[str, Any]:
         return {}
@@ -1051,37 +1289,368 @@ class LMSBall3DWidget:
             "N_displayed": int(len(self._display_indices)) if self._display_indices is not None else None,
         }
 
+    def _export_widget_kind(self) -> str:
+        return "lms_ball3d"
+
+    def _export_backend_notice(self) -> str:
+        return "This snapshot is static. This control needs a Python backend to recompute trajectories."
+
+    def _export_scene_trace_roles(self) -> dict[str, int]:
+        idx = int(self._wire_count)
+        return {
+            "points_marker": idx + 0,
+            "w_marker": idx + 1,
+            "z_marker": idx + 2,
+            "Z_marker": idx + 3,
+            "w_path": idx + 4,
+            "z_path": idx + 5,
+            "Z_path": idx + 6,
+            "w_vector": idx + 7,
+            "z_vector": idx + 8,
+            "Z_vector": idx + 9,
+        }
+
+    @staticmethod
+    def _export_widget_layout(widget: widgets.Widget) -> dict[str, Any]:
+        layout = getattr(widget, "layout", None)
+        if layout is None:
+            return {}
+        keys = (
+            "width",
+            "height",
+            "display",
+            "margin",
+            "justify_content",
+            "align_items",
+            "flex_flow",
+        )
+        out: dict[str, Any] = {}
+        for key in keys:
+            value = getattr(layout, key, None)
+            if value not in (None, ""):
+                out[key] = str(value)
+        return out
+
+    @staticmethod
+    def _export_is_hidden_widget(widget: widgets.Widget, meta: dict[str, Any] | None = None) -> bool:
+        if meta is not None and bool(meta.get("hidden_in_export")):
+            return True
+        layout = getattr(widget, "layout", None)
+        if layout is None:
+            return False
+        return str(getattr(layout, "display", "") or "").strip().lower() == "none"
+
+    @staticmethod
+    def _export_dropdown_options(widget: widgets.Dropdown) -> list[dict[str, Any]]:
+        options = getattr(widget, "options", ())
+        out: list[dict[str, Any]] = []
+        for opt in options:
+            if isinstance(opt, tuple) and len(opt) == 2:
+                label, value = opt
+            else:
+                label = opt
+                value = opt
+            out.append({"label": str(label), "value": LMSBall3DWidget._json_ready(value)})
+        return out
+
+    def _export_accordion_titles(self, widget: widgets.Accordion) -> list[str]:
+        titles: list[str] = []
+        for i in range(len(widget.children)):
+            try:
+                title = widget.get_title(i)
+            except Exception:
+                title = None
+            titles.append(str(title or f"Section {i + 1}"))
+        return titles
+
+    def _export_serialize_control_node(self, widget: widgets.Widget) -> dict[str, Any] | None:
+        meta = dict(self._export_widget_meta.get(id(widget), {}))
+        if self._export_is_hidden_widget(widget, meta):
+            return None
+
+        layout = self._export_widget_layout(widget)
+        if isinstance(widget, widgets.Accordion):
+            children = [self._export_serialize_control_node(child) for child in widget.children]
+            kept = [child for child in children if child is not None]
+            if not kept:
+                return None
+            return {
+                "node_type": "container",
+                "widget_type": "accordion",
+                "layout": layout,
+                "titles": self._export_accordion_titles(widget),
+                "selected_index": self._json_ready(getattr(widget, "selected_index", 0)),
+                "children": kept,
+            }
+
+        if isinstance(widget, widgets.HBox):
+            children = [self._export_serialize_control_node(child) for child in widget.children]
+            kept = [child for child in children if child is not None]
+            if not kept:
+                return None
+            return {
+                "node_type": "container",
+                "widget_type": "hbox",
+                "layout": layout,
+                "children": kept,
+            }
+
+        if isinstance(widget, widgets.VBox):
+            children = [self._export_serialize_control_node(child) for child in widget.children]
+            kept = [child for child in children if child is not None]
+            if not kept:
+                return None
+            return {
+                "node_type": "container",
+                "widget_type": "vbox",
+                "layout": layout,
+                "children": kept,
+            }
+
+        if isinstance(widget, widgets.HTML):
+            value = str(getattr(widget, "value", ""))
+            if value == "":
+                return None
+            return {
+                "node_type": "leaf",
+                "widget_type": "html",
+                "layout": layout,
+                "value": value,
+            }
+
+        node: dict[str, Any] = {
+            "node_type": "leaf",
+            "layout": layout,
+            "control_id": meta.get("control_id"),
+            "action_kind": meta.get("action_kind"),
+            "state_key": meta.get("state_key"),
+            "label_binding": meta.get("label_binding"),
+        }
+
+        if isinstance(widget, widgets.Button) and not isinstance(widget, widgets.ToggleButton):
+            node.update(
+                {
+                    "widget_type": "button",
+                    "description": str(getattr(widget, "description", "")),
+                    "button_style": str(getattr(widget, "button_style", "") or ""),
+                    "disabled": bool(getattr(widget, "disabled", False)),
+                }
+            )
+            return node
+
+        if isinstance(widget, widgets.ToggleButton):
+            node.update(
+                {
+                    "widget_type": "togglebutton",
+                    "description": str(getattr(widget, "description", "")),
+                    "button_style": str(getattr(widget, "button_style", "") or ""),
+                    "value": bool(getattr(widget, "value", False)),
+                    "disabled": bool(getattr(widget, "disabled", False)),
+                }
+            )
+            return node
+
+        if isinstance(widget, widgets.Dropdown):
+            node.update(
+                {
+                    "widget_type": "dropdown",
+                    "description": str(getattr(widget, "description", "")),
+                    "value": self._json_ready(getattr(widget, "value", None)),
+                    "options": self._export_dropdown_options(widget),
+                    "disabled": bool(getattr(widget, "disabled", False)),
+                }
+            )
+            return node
+
+        if isinstance(widget, widgets.Checkbox):
+            node.update(
+                {
+                    "widget_type": "checkbox",
+                    "description": str(getattr(widget, "description", "")),
+                    "value": bool(getattr(widget, "value", False)),
+                    "disabled": bool(getattr(widget, "disabled", False)),
+                }
+            )
+            return node
+
+        if isinstance(widget, widgets.IntSlider):
+            node.update(
+                {
+                    "widget_type": "intslider",
+                    "description": str(getattr(widget, "description", "")),
+                    "value": int(getattr(widget, "value", 0)),
+                    "min": int(getattr(widget, "min", 0)),
+                    "max": int(getattr(widget, "max", 0)),
+                    "step": int(getattr(widget, "step", 1)),
+                    "readout_format": str(getattr(widget, "readout_format", ".0f")),
+                    "disabled": bool(getattr(widget, "disabled", False)),
+                }
+            )
+            return node
+
+        if isinstance(widget, widgets.FloatSlider):
+            node.update(
+                {
+                    "widget_type": "floatslider",
+                    "description": str(getattr(widget, "description", "")),
+                    "value": float(getattr(widget, "value", 0.0)),
+                    "min": float(getattr(widget, "min", 0.0)),
+                    "max": float(getattr(widget, "max", 1.0)),
+                    "step": float(getattr(widget, "step", 0.01)),
+                    "readout_format": str(getattr(widget, "readout_format", ".2f")),
+                    "disabled": bool(getattr(widget, "disabled", False)),
+                }
+            )
+            return node
+
+        if isinstance(widget, widgets.Play):
+            node.update(
+                {
+                    "widget_type": "play",
+                    "description": str(getattr(widget, "description", "Play")),
+                    "value": int(getattr(widget, "value", 0)),
+                    "min": int(getattr(widget, "min", 0)),
+                    "max": int(getattr(widget, "max", 0)),
+                    "step": int(getattr(widget, "step", 1)),
+                    "interval": int(getattr(widget, "interval", 40)),
+                    "disabled": bool(getattr(widget, "disabled", False)),
+                }
+            )
+            return node
+
+        return None
+
+    def _export_controls_manifest(self) -> dict[str, Any]:
+        node = self._export_serialize_control_node(self.controls_box)
+        if node is None:
+            return {"node_type": "container", "widget_type": "vbox", "layout": {}, "children": []}
+        return node
+
+    def _export_capture_ui_state(self) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "frame": int(self.frame_slider.value),
+            "frame_name": "body" if self.view_frame_dropdown.value == "body" else "lab",
+            "show_paths": bool(self.show_paths.value),
+            "show_vectors": bool(self.show_vectors.value),
+            "layout_mode": "top" if bool(self.layout_top_view.value) else "side",
+            "playback_speed": float(getattr(self, "_playback_speed", 1.0)),
+        }
+        if hasattr(self, "_display_mode"):
+            state["display_mode"] = str(getattr(self, "_display_mode"))
+        elif hasattr(self, "_init_state_mode"):
+            state["display_mode"] = str(getattr(self, "_init_state_mode"))
+        return state
+
+    def _export_restore_ui_state(self, state: dict[str, Any]) -> None:
+        prev_updating = self._updating
+        self._updating = True
+        try:
+            frame_name = "body" if str(state.get("frame_name", "lab")) == "body" else "lab"
+            self.view_frame_dropdown.value = frame_name
+            if "display_mode" in state and hasattr(self, "_select_display_mode"):
+                try:
+                    self._select_display_mode(str(state["display_mode"]))
+                except Exception:
+                    pass
+            self.frame_slider.value = int(state.get("frame", 0))
+            self.play.value = int(state.get("frame", 0))
+        finally:
+            self._updating = prev_updating
+        self._refresh_metric_series(self._params_cache if self._params_cache else self._params())
+        self._render_frame(int(state.get("frame", 0)))
+
+    def _export_metrics_figures(self) -> dict[str, Any]:
+        saved = self._export_capture_ui_state()
+        out: dict[str, Any] = {}
+        try:
+            for frame_name in ("lab", "body"):
+                self._export_restore_ui_state({**saved, "frame_name": frame_name})
+                out[frame_name] = self._json_ready(self.metrics_fig.to_plotly_json())
+        finally:
+            self._export_restore_ui_state(saved)
+        return out
+
+    def _export_display_modes_for_stats(self) -> list[str]:
+        return [str(getattr(self, "_init_state_mode", "poisson"))]
+
+    def _export_stats_snapshots(self) -> dict[str, Any]:
+        saved = self._export_capture_ui_state()
+        out: dict[str, Any] = {}
+        try:
+            display_modes = self._export_display_modes_for_stats()
+            multi_mode = len(display_modes) > 1
+            for frame_name in ("lab", "body"):
+                if multi_mode:
+                    out[frame_name] = {}
+                    for mode in display_modes:
+                        self._export_restore_ui_state({**saved, "frame_name": frame_name, "display_mode": mode})
+                        frames: list[str] = []
+                        for t in range(self._steps + 1):
+                            self._render_frame(int(t))
+                            frames.append(str(self.stats_html.value))
+                        out[frame_name][mode] = frames
+                else:
+                    self._export_restore_ui_state({**saved, "frame_name": frame_name, "display_mode": display_modes[0]})
+                    frames = []
+                    for t in range(self._steps + 1):
+                        self._render_frame(int(t))
+                        frames.append(str(self.stats_html.value))
+                    out[frame_name] = frames
+        finally:
+            self._export_restore_ui_state(saved)
+        return out
+
+    def _export_payload_trajectory_data(self, frame_name: str) -> dict[str, Any]:
+        return {
+            "bundle": self._export_bundle_from_state(
+                traj_cache=self._traj_cache,
+                base_points=self._base_points_np,
+                display_idx=self._display_indices,
+                metrics={
+                    "active_frame": frame_name,
+                    "series": self._metric_cache if self._metric_cache else {},
+                },
+            )
+        }
+
     def _export_iframe_payload(self) -> dict[str, Any]:
         if not self._traj_cache or self._base_points_np is None:
             raise RuntimeError("No computed trajectory is available to export.")
         params = dict(self._params_cache if self._params_cache else self._params())
-        frame_name: Literal["lab", "body"] = "body" if self.view_frame_dropdown.value == "body" else "lab"
-        bundle = self._export_bundle_from_state(
-            traj_cache=self._traj_cache,
-            base_points=self._base_points_np,
-            display_idx=self._display_indices,
-            metrics={
-                "active_frame": frame_name,
-                "series": self._metric_cache if self._metric_cache else {},
-            },
-        )
-        metrics_figure = self._json_ready(self.metrics_fig.to_plotly_json())
+        ui_state = self._export_capture_ui_state()
+        saved = dict(ui_state)
+        try:
+            self._export_restore_ui_state(saved)
+            scene_figure_template = self._json_ready(self.sphere_fig.to_plotly_json())
+            metrics_figures = self._export_metrics_figures()
+            stats_snapshots = self._json_ready(self._export_stats_snapshots())
+        finally:
+            self._export_restore_ui_state(saved)
+        frame_name: Literal["lab", "body"] = "body" if str(ui_state.get("frame_name", "lab")) == "body" else "lab"
         return {
-            "schema_version": "lmsspp_widget_snapshot_v1",
-            "widget_kind": "lms_ball3d",
+            "schema_version": "lmsspp_widget_snapshot_v2",
+            "widget_kind": self._export_widget_kind(),
             "title": str(self.title),
             "exported_at_utc": datetime.now(timezone.utc).isoformat(),
             "params": self._json_ready(params),
             "ui_state": {
-                "frame_default": int(self.frame_slider.value),
+                "frame_default": int(ui_state.get("frame", 0)),
                 "frame_name_default": frame_name,
-                "show_paths": bool(self.show_paths.value),
-                "show_vectors": bool(self.show_vectors.value),
+                "show_paths": bool(ui_state.get("show_paths", True)),
+                "show_vectors": bool(ui_state.get("show_vectors", True)),
+                "layout_default": str(ui_state.get("layout_mode", "top")),
+                "playback_speed": float(ui_state.get("playback_speed", 1.0)),
+                "base_interval_ms": int(getattr(self, "_base_interval_ms", 40)),
+                "display_mode_default": ui_state.get("display_mode"),
             },
             "init_info": self._json_ready(self._export_init_info(params)),
-            "stats_html_snapshot": str(self.stats_html.value),
-            "metrics_figure": metrics_figure,
-            "bundle": bundle,
+            "backend_notice": self._export_backend_notice(),
+            "controls_manifest": self._json_ready(self._export_controls_manifest()),
+            "scene_figure_template": scene_figure_template,
+            "metrics_figures": metrics_figures,
+            "scene_trace_roles": self._json_ready(self._export_scene_trace_roles()),
+            "stats_snapshots": stats_snapshots,
+            **self._json_ready(self._export_payload_trajectory_data(frame_name)),
         }
 
     def export_iframe_snapshot(self, out_path: str | Path | None = None) -> Path:
@@ -1091,10 +1660,18 @@ class LMSBall3DWidget:
             out_file = Path(out_path).expanduser().resolve()
         payload = self._export_iframe_payload()
         try:
-            from .export.iframe_export import write_lms_widget_snapshot_html
+            from .export.widget_snapshot_export import write_lms_widget_snapshot_html
         except Exception:
-            from export.iframe_export import write_lms_widget_snapshot_html  # type: ignore
+            from export.widget_snapshot_export import write_lms_widget_snapshot_html  # type: ignore
         return write_lms_widget_snapshot_html(out_file, payload=payload)
+
+    def export_webm_set(self, out_dir: str | Path | None = None) -> Path:
+        target_dir = self._resolve_export_media_dir(out_dir)
+        try:
+            from .export.widget_media_export import write_lms_widget_webm_bundle
+        except Exception:
+            from export.widget_media_export import write_lms_widget_webm_bundle  # type: ignore
+        return write_lms_widget_webm_bundle(self, target_dir)
 
     def _on_export_iframe_clicked(self, _btn: widgets.Button) -> None:
         try:
@@ -1102,6 +1679,14 @@ class LMSBall3DWidget:
             self._set_export_status(f"saved: {str(out_file)}")
         except Exception as exc:
             self._set_export_status(f"export failed: {str(exc)}", error=True)
+
+    def _on_export_webm_clicked(self, _btn: widgets.Button) -> None:
+        try:
+            self._set_export_status("exporting WebM set...")
+            out_dir = self.export_webm_set()
+            self._set_export_status(f"saved media: {str(out_dir)}")
+        except Exception as exc:
+            self._set_export_status(f"webm export failed: {str(exc)}", error=True)
 
     def _apply_root_layout(self) -> None:
         """Switch between side-by-side and stacked layouts."""
@@ -3077,10 +3662,27 @@ class LMSBall3DBackwardTwoSheetWidget(LMSBall3DWidget):
             }
         }
 
-    def _export_iframe_payload(self) -> dict[str, Any]:
-        payload = super()._export_iframe_payload()
-        payload["widget_kind"] = "lms_ball3d_two_sheet"
-        return payload
+    def _export_widget_kind(self) -> str:
+        return "lms_ball3d_two_sheet"
+
+    def _export_scene_trace_roles(self) -> dict[str, int]:
+        roles = dict(super()._export_scene_trace_roles())
+        idx = int(self._bar_start_idx)
+        if idx >= 0:
+            roles.update(
+                {
+                    "bar_w_marker": idx + 0,
+                    "bar_z_marker": idx + 1,
+                    "bar_Z_marker": idx + 2,
+                    "bar_w_path": idx + 3,
+                    "bar_z_path": idx + 4,
+                    "bar_Z_path": idx + 5,
+                    "bar_w_vector": idx + 6,
+                    "bar_z_vector": idx + 7,
+                    "bar_Z_vector": idx + 8,
+                }
+            )
+        return roles
 
     def _recompute(self, *, reset_frame: bool) -> None:
         self._last_bar_path_frame = -10**9
@@ -3561,6 +4163,12 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
 
     def _bind_events(self) -> None:
         super()._bind_events()
+        self._set_export_action(
+            self.toggle_init_state,
+            action_kind="display_mode_cycle",
+            state_key="display_mode",
+            label_binding="display_mode_button",
+        )
 
     def _set_recompute_busy(self, busy: bool, *, note: str = "") -> None:
         busy_flag = bool(busy)
@@ -4355,11 +4963,15 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         )
         self._set_stats_html(stats_html, force=force_update)
 
-    def _export_iframe_payload(self) -> dict[str, Any]:
+    def _export_widget_kind(self) -> str:
+        return "lms_entropy_shell_ensemble"
+
+    def _export_display_modes_for_stats(self) -> list[str]:
+        return [str(mode) for mode in self._ensemble_modes]
+
+    def _export_payload_trajectory_data(self, frame_name: str) -> dict[str, Any]:
         if not self._ensemble_state:
             raise RuntimeError("No computed ensemble trajectory is available to export.")
-        params = dict(self._params_cache if self._params_cache else self._params())
-        frame_name: Literal["lab", "body"] = "body" if self.view_frame_dropdown.value == "body" else "lab"
         ensembles: dict[str, Any] = {}
         for mode in self._ensemble_modes:
             state = self._ensemble_state.get(mode)
@@ -4378,26 +4990,10 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                     },
                 ),
             }
-
-        metrics_figure = self._json_ready(self.metrics_fig.to_plotly_json())
         return {
-            "schema_version": "lmsspp_widget_snapshot_v1",
-            "widget_kind": "lms_entropy_shell_ensemble",
-            "title": str(self.title),
-            "exported_at_utc": datetime.now(timezone.utc).isoformat(),
-            "params": self._json_ready(params),
-            "ui_state": {
-                "frame_default": int(self.frame_slider.value),
-                "frame_name_default": frame_name,
-                "show_paths": bool(self.show_paths.value),
-                "show_vectors": bool(self.show_vectors.value),
-                "display_mode": str(self._display_mode),
-            },
             "mode_order": [str(m) for m in self._ensemble_modes],
-            "init_info": self._json_ready(self._export_init_info(params)),
-            "stats_html_snapshot": str(self.stats_html.value),
-            "metrics_figure": metrics_figure,
             "ensembles": ensembles,
+            "display_mode_colors": {str(mode): str(self._mode_colors.get(mode, "royalblue")) for mode in self._ensemble_modes},
         }
 
 
@@ -4700,6 +5296,26 @@ class _LMSEntropyShellMixin:
         )
         self._shell_entropy_row = widgets.HBox([self.shell_entropy_slider], layout=widgets.Layout(width=self._control_width))
         self._shell_energy_row = widgets.HBox([self.shell_energy_slider], layout=widgets.Layout(width=self._control_width))
+        self._register_export_widget(
+            self.entropy_coordinate_dropdown,
+            control_id="entropy_coordinate_dropdown",
+            state_key="entropy_coordinate_mode",
+        )
+        self._register_export_widget(
+            self.constraint_toggle,
+            control_id="constraint_toggle",
+            state_key="constraint_mode",
+        )
+        self._register_export_widget(
+            self.shell_entropy_slider,
+            control_id="shell_entropy_slider",
+            state_key="shell_entropy",
+        )
+        self._register_export_widget(
+            self.shell_energy_slider,
+            control_id="shell_energy_slider",
+            state_key="shell_energy",
+        )
 
         self.mode_dropdown.layout = widgets.Layout(width="220px")
         self.layout_dropdown.layout = widgets.Layout(width="360px")
@@ -4764,10 +5380,30 @@ class _LMSEntropyShellMixin:
 
     def _bind_events(self) -> None:
         super()._bind_events()
-        self.entropy_coordinate_dropdown.observe(self._on_entropy_coordinate_change, names="value")
-        self.constraint_toggle.observe(self._on_constraint_mode_change, names="value")
-        self.shell_entropy_slider.observe(self._on_shell_slider_change, names="value")
-        self.shell_energy_slider.observe(self._on_shell_slider_change, names="value")
+        self._bind_export_observe(
+            self.entropy_coordinate_dropdown,
+            self._on_entropy_coordinate_change,
+            action_kind="backend_notice",
+            state_key="entropy_coordinate_mode",
+        )
+        self._bind_export_observe(
+            self.constraint_toggle,
+            self._on_constraint_mode_change,
+            action_kind="backend_notice",
+            state_key="constraint_mode",
+        )
+        self._bind_export_observe(
+            self.shell_entropy_slider,
+            self._on_shell_slider_change,
+            action_kind="backend_notice",
+            state_key="shell_entropy",
+        )
+        self._bind_export_observe(
+            self.shell_energy_slider,
+            self._on_shell_slider_change,
+            action_kind="backend_notice",
+            state_key="shell_energy",
+        )
 
     def _on_entropy_coordinate_change(self, change: dict[str, Any]) -> None:
         if self._updating or change.get("name") != "value":
