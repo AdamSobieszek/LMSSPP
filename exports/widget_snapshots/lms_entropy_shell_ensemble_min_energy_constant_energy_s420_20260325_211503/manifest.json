@@ -1,0 +1,172 @@
+{
+  "items": [
+    {
+      "src": "20260325_211503_scene.webm",
+      "label": "20260325_211503 scene",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_entropy_shell_ensemble",
+        "params": {
+          "N": 1800,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 420,
+          "entropy0": 0.84,
+          "energy0": 0.35
+        },
+        "ui_state": {
+          "frame": 0,
+          "frame_name": "lab",
+          "show_paths": true,
+          "show_vectors": true,
+          "layout_mode": "top",
+          "playback_speed": 1.0,
+          "display_mode": "min_energy"
+        },
+        "init_info": {
+          "init_state_mode": "min_energy",
+          "init_state_label": "Min Entropy",
+          "entropy_direction": "dissipate",
+          "time_direction": "forward",
+          "backend": "autograd",
+          "viewing_frame": "lab",
+          "trajectory_mode": "memory",
+          "steps": 420,
+          "N_displayed": 900,
+          "constraint_mode": "constant_energy",
+          "entropy_coordinate_mode": "kernel",
+          "slider_target": 0.35,
+          "effective_target": 0.9420168752811557,
+          "kernel_target": 0.9420168752811557,
+          "q_target": 0.35,
+          "r_poisson": 0.26631689993194096
+        },
+        "camera": {
+          "up": {
+            "x": -0.408248290463863,
+            "y": -0.408248290463863,
+            "z": 0.8164965809277261
+          },
+          "center": {
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          "eye": {
+            "x": 1.0096026751421945,
+            "y": 1.0096026751421947,
+            "z": 1.0096026751421945
+          },
+          "projection": {
+            "type": "perspective"
+          }
+        },
+        "frame_span": {
+          "start_frame": 0,
+          "end_frame": 420,
+          "count": 421,
+          "direction": "forward"
+        },
+        "video_profile": {
+          "codec": "libvpx-vp9",
+          "pixel_format": "yuv420p",
+          "fps": 20,
+          "crf": 35,
+          "audio": "none"
+        },
+        "panel": "scene"
+      }
+    },
+    {
+      "src": "20260325_211503_metrics.webm",
+      "label": "20260325_211503 metrics",
+      "kind": "video",
+      "meta": {
+        "run_tag": "20260325_211503",
+        "exported_at_utc": "2026-03-25T21:47:32.367918+00:00",
+        "widget_kind": "lms_entropy_shell_ensemble",
+        "params": {
+          "N": 1800,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 420,
+          "entropy0": 0.84,
+          "energy0": 0.35
+        },
+        "ui_state": {
+          "frame": 0,
+          "frame_name": "lab",
+          "show_paths": true,
+          "show_vectors": true,
+          "layout_mode": "top",
+          "playback_speed": 1.0,
+          "display_mode": "min_energy"
+        },
+        "init_info": {
+          "init_state_mode": "min_energy",
+          "init_state_label": "Min Entropy",
+          "entropy_direction": "dissipate",
+          "time_direction": "forward",
+          "backend": "autograd",
+          "viewing_frame": "lab",
+          "trajectory_mode": "memory",
+          "steps": 420,
+          "N_displayed": 900,
+          "constraint_mode": "constant_energy",
+          "entropy_coordinate_mode": "kernel",
+          "slider_target": 0.35,
+          "effective_target": 0.9420168752811557,
+          "kernel_target": 0.9420168752811557,
+          "q_target": 0.35,
+          "r_poisson": 0.26631689993194096
+        },
+        "camera": {
+          "up": {
+            "x": -0.408248290463863,
+            "y": -0.408248290463863,
+            "z": 0.8164965809277261
+          },
+          "center": {
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          "eye": {
+            "x": 1.0096026751421945,
+            "y": 1.0096026751421947,
+            "z": 1.0096026751421945
+          },
+          "projection": {
+            "type": "perspective"
+          }
+        },
+        "frame_span": {
+          "start_frame": 0,
+          "end_frame": 420,
+          "count": 421,
+          "direction": "forward"
+        },
+        "video_profile": {
+          "codec": "libvpx-vp9",
+          "pixel_format": "yuv420p",
+          "fps": 20,
+          "crf": 35,
+          "audio": "none"
+        },
+        "panel": "metrics"
+      }
+    }
+  ],
+  "title": "LMS entropy-shell dynamics on S² / B³",
+  "description": "LMS widget trajectory media exports"
+}

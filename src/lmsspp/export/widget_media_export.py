@@ -94,7 +94,7 @@ def _next_run_tag(out_dir: Path) -> str:
     base = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     tag = base
     idx = 1
-    while (out_dir / f"{tag}_scene.webm").exists() or (out_dir / f"{tag}_metrics.webm").exists():
+    while (out_dir / f"{tag}_scene.webm").exists() or (out_dir / f"{tag}_metrics.png").exists():
         tag = f"{base}_{idx:02d}"
         idx += 1
     return tag
@@ -123,13 +123,14 @@ def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(_as_json(payload), indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _append_manifest_items(
+def _append_manifest_item(
     *,
     out_dir: Path,
     title: str,
     scene_name: str,
-    metrics_name: str,
-    run_meta: dict[str, Any],
+    metrics_image_name: str,
+    item_meta: dict[str, Any],
+    run_tag: str,
 ) -> None:
     manifest_path = out_dir / "manifest.json"
     manifest = _load_manifest(manifest_path, title=title)
@@ -137,20 +138,32 @@ def _append_manifest_items(
     if not isinstance(items, list):
         items = []
         manifest["items"] = items
+    else:
+        # Migrate away from the old convention that exported a separate metrics video.
+        filtered: list[Any] = []
+        for entry in items:
+            if isinstance(entry, dict):
+                src = str(entry.get("src", "")).strip().lower()
+                if src.endswith("metrics.webm") or src.endswith("_metrics.webm"):
+                    continue
+            filtered.append(entry)
+        items[:] = filtered
 
     scene_item = {
         "src": scene_name,
-        "label": f"{run_meta['run_tag']} scene",
+        "label": f"Scene {run_tag}",
         "kind": "video",
-        "meta": {**run_meta, "panel": "scene"},
+        "meta": item_meta,
+        "tabs": [
+            {
+                "id": "metrics",
+                "label": "Metrics",
+                "src": metrics_image_name,
+                "kind": "image",
+            }
+        ],
     }
-    metrics_item = {
-        "src": metrics_name,
-        "label": f"{run_meta['run_tag']} metrics",
-        "kind": "video",
-        "meta": {**run_meta, "panel": "metrics"},
-    }
-    items.extend([scene_item, metrics_item])
+    items.append(scene_item)
     _write_manifest(manifest_path, manifest)
 
 
@@ -165,6 +178,12 @@ def write_lms_widget_webm_bundle(widget: Any, out_dir: str | Path) -> Path:
 
     out_path = Path(out_dir).expanduser().resolve()
     out_path.mkdir(parents=True, exist_ok=True)
+    # Remove legacy metrics videos from previous exporter versions in this folder.
+    for old_metrics in out_path.glob("*metrics.webm"):
+        try:
+            old_metrics.unlink()
+        except Exception:
+            pass
 
     params = dict(widget._params_cache if getattr(widget, "_params_cache", None) else widget._params())
     ui_state = dict(widget._export_capture_ui_state() if hasattr(widget, "_export_capture_ui_state") else {})
@@ -187,11 +206,10 @@ def write_lms_widget_webm_bundle(widget: Any, out_dir: str | Path) -> Path:
 
     run_tag = _next_run_tag(out_path)
     scene_name = f"{run_tag}_scene.webm"
-    metrics_name = f"{run_tag}_metrics.webm"
+    metrics_image_name = f"{run_tag}_metrics.png"
     scene_path = out_path / scene_name
-    metrics_path = out_path / metrics_name
+    metrics_image_path = out_path / metrics_image_name
     scene_thumb_path = out_path / f"{run_tag}_scene.jpg"
-    metrics_thumb_path = out_path / f"{run_tag}_metrics.jpg"
 
     saved_ui_state = dict(ui_state)
     saved_camera = camera
@@ -199,7 +217,6 @@ def write_lms_widget_webm_bundle(widget: Any, out_dir: str | Path) -> Path:
     was_playing = bool(widget._is_playing()) if hasattr(widget, "_is_playing") else False
 
     scene_writer = None
-    metrics_writer = None
     first_scene = None
     first_metrics = None
     try:
@@ -219,7 +236,6 @@ def write_lms_widget_webm_bundle(widget: Any, out_dir: str | Path) -> Path:
             "output_params": ["-pix_fmt", "yuv420p", "-b:v", "0", "-crf", "35", "-an"],
         }
         scene_writer = imageio.get_writer(str(scene_path), **writer_kwargs)
-        metrics_writer = imageio.get_writer(str(metrics_path), **writer_kwargs)
 
         for frame_idx in frame_indices:
             widget._render_frame(int(frame_idx))
@@ -230,29 +246,25 @@ def write_lms_widget_webm_bundle(widget: Any, out_dir: str | Path) -> Path:
                 height=scene_h,
                 scale=1,
             )
-            metrics_png = widget.metrics_fig.to_image(
-                format="png",
-                engine="kaleido",
-                width=metrics_w,
-                height=metrics_h,
-                scale=1,
-            )
             scene_arr = np.asarray(Image.open(BytesIO(scene_png)).convert("RGB"), dtype=np.uint8)
-            metrics_arr = np.asarray(Image.open(BytesIO(metrics_png)).convert("RGB"), dtype=np.uint8)
 
             if first_scene is None:
                 first_scene = scene_arr
             if first_metrics is None:
-                first_metrics = metrics_arr
+                metrics_png = widget.metrics_fig.to_image(
+                    format="png",
+                    engine="kaleido",
+                    width=metrics_w,
+                    height=metrics_h,
+                    scale=1,
+                )
+                first_metrics = np.asarray(Image.open(BytesIO(metrics_png)).convert("RGB"), dtype=np.uint8)
 
             scene_writer.append_data(scene_arr)
-            metrics_writer.append_data(metrics_arr)
 
     finally:
         if scene_writer is not None:
             scene_writer.close()
-        if metrics_writer is not None:
-            metrics_writer.close()
 
         if hasattr(widget, "_export_restore_ui_state"):
             widget._export_restore_ui_state(saved_ui_state)
@@ -272,36 +284,21 @@ def write_lms_widget_webm_bundle(widget: Any, out_dir: str | Path) -> Path:
         raise RuntimeError("No frames were captured for media export.")
 
     Image.fromarray(first_scene).save(scene_thumb_path, format="JPEG", quality=82)
-    Image.fromarray(first_metrics).save(metrics_thumb_path, format="JPEG", quality=82)
+    Image.fromarray(first_metrics).save(metrics_image_path, format="PNG")
 
-    run_meta = {
-        "run_tag": run_tag,
-        "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+    item_meta = {
         "widget_kind": str(widget._export_widget_kind() if hasattr(widget, "_export_widget_kind") else "lms_widget"),
         "params": _as_json(params),
-        "ui_state": _as_json(ui_state),
-        "init_info": _as_json(init_info),
-        "camera": _as_json(camera),
-        "frame_span": {
-            "start_frame": int(frame_indices[0]),
-            "end_frame": int(frame_indices[-1]),
-            "count": int(len(frame_indices)),
-            "direction": "forward" if direction_sign >= 0 else "backward",
-        },
-        "video_profile": {
-            "codec": "libvpx-vp9",
-            "pixel_format": "yuv420p",
-            "fps": 20,
-            "crf": 35,
-            "audio": "none",
-        },
+        "init_state_mode": init_info.get("init_state_mode"),
+        "init_state_label": init_info.get("init_state_label"),
     }
-    _append_manifest_items(
+    _append_manifest_item(
         out_dir=out_path,
         title=title,
         scene_name=scene_name,
-        metrics_name=metrics_name,
-        run_meta=run_meta,
+        metrics_image_name=metrics_image_name,
+        item_meta=_as_json(item_meta),
+        run_tag=run_tag,
     )
     return out_path
 
