@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>W-alpha Widget Preview</title>
+    <style>
+      :root {
+        --bg: #f4f7fb;
+        --panel: #ffffff;
+        --muted: #5f6b7a;
+        --ink: #102033;
+        --border: #d8e1ec;
+        --accent: #2456d3;
+        --accent-soft: rgba(36, 86, 211, 0.12);
+        --warm: #ef4444;
+        --shadow: 0 20px 60px rgba(30, 41, 59, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top left, rgba(44, 183, 165, 0.15), transparent 28%),
+          radial-gradient(circle at top right, rgba(91, 20, 125, 0.18), transparent 30%),
+          linear-gradient(180deg, #fbfdff 0%, var(--bg) 100%);
+      }
+
+      .page {
+        width: min(1400px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 24px 0 40px;
+      }
+
+      .card {
+        background: rgba(255, 255, 255, 0.9);
+        border: 1px solid rgba(216, 225, 236, 0.9);
+        border-radius: 28px;
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(10px);
+        overflow: hidden;
+      }
+
+      .header {
+        padding: 28px 28px 18px;
+        border-bottom: 1px solid rgba(216, 225, 236, 0.8);
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 14px;
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font: 600 12px/1.2 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0 0 10px;
+        font-size: clamp(2rem, 4vw, 3.2rem);
+        line-height: 1;
+        letter-spacing: -0.04em;
+      }
+
+      .summary {
+        max-width: 980px;
+        margin: 0 0 20px;
+        color: var(--muted);
+        font: 400 1rem/1.6 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      .controls {
+        display: grid;
+        gap: 12px;
+      }
+
+      .range-row {
+        display: grid;
+        gap: 10px;
+      }
+
+      input[type="range"] {
+        width: 100%;
+        accent-color: var(--accent);
+      }
+
+      .readout {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 12px;
+        color: #314155;
+        font: 500 0.94rem/1.4 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      .content {
+        padding: 24px 28px 28px;
+        display: grid;
+        gap: 24px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 20px;
+      }
+
+      .panel {
+        display: grid;
+        gap: 10px;
+      }
+
+      .panel-title {
+        text-align: center;
+        font: 600 1.2rem/1.2 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      .panel-subtitle,
+      .panel-note {
+        text-align: center;
+        color: var(--muted);
+        font: 500 0.92rem/1.45 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      .panel-note {
+        font-style: italic;
+      }
+
+      .frame {
+        width: 100%;
+        background: #fff;
+        border: 1px solid var(--border);
+        border-radius: 24px;
+        box-shadow: 0 10px 30px rgba(30, 41, 59, 0.08);
+      }
+
+      .footer {
+        border-radius: 22px;
+        padding: 16px 18px;
+        background: linear-gradient(135deg, rgba(36, 86, 211, 0.06), rgba(44, 183, 165, 0.08));
+        color: #344155;
+        font: 400 0.95rem/1.7 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      @media (max-width: 980px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+
+        .page {
+          width: min(100vw - 20px, 760px);
+          padding-top: 12px;
+        }
+
+        .header,
+        .content {
+          padding-left: 16px;
+          padding-right: 16px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <section class="card">
+        <header class="header">
+          <div class="eyebrow">LMSSPP Preview</div>
+          <h1>Radial kernel family in x-space and information geometry</h1>
+          <p class="summary">
+            Interactive parameter α in [0, 1]. The left column uses α, the middle column stays fixed
+            at α = 1, and the right column uses 2 − α.
+          </p>
+          <div class="controls">
+            <div class="range-row">
+              <input id="alpha-slider" type="range" min="0" max="1" step="0.01" value="0" />
+            </div>
+            <div class="readout">
+              <span id="alpha-label">α = 0</span>
+              <span>critical α = 1</span>
+              <span id="dual-label">dual 2 − α = 2</span>
+            </div>
+          </div>
+        </header>
+        <div class="content">
+          <div class="grid" id="field-grid"></div>
+          <div class="grid" id="chart-grid"></div>
+          <div class="footer">
+            For α ≈ 0 the left field is close to quadratic and the right field is close to
+            logarithmic/inversive. As α increases toward 1, the left chart tightens toward the
+            unit-speed critical regime while the right chart moves toward the same critical endpoint
+            from the logarithmic side.
+          </div>
+        </div>
+      </section>
+    </main>
+    <script>
+      function fmt(x) {
+        if (Math.abs(x) < 1e-10) return "0";
+        if (Math.abs(x - Math.round(x)) < 1e-10) return String(Math.round(x));
+        return x.toFixed(2);
+      }
+
+      function sampleCurve(alpha, pMax = 4, steps = 220) {
+        const pts = [];
+        const eps = 1e-3;
+        if (Math.abs(alpha - 1) < 1e-6) {
+          return pts;
+        }
+        for (let i = 0; i <= steps; i += 1) {
+          const p = eps + (pMax - eps) * (i / steps);
+          let w;
+          if (Math.abs(alpha - 2) < 1e-6) {
+            w = Math.log(p);
+          } else {
+            const r = Math.pow(Math.abs(1 - alpha) * p, 1 / (1 - alpha));
+            w = (Math.pow(r, 2 - alpha) - 1) / ((2 - alpha) * (1 - alpha));
+          }
+          if (Number.isFinite(w)) {
+            pts.push({ p, w });
+          }
+        }
+        return pts;
+      }
+
+      function curveBounds(points, fallback = { min: -2, max: 2 }) {
+        if (!points.length) return fallback;
+        let min = Infinity;
+        let max = -Infinity;
+        for (const pt of points) {
+          min = Math.min(min, pt.w);
+          max = Math.max(max, pt.w);
+        }
+        const pad = 0.15 * Math.max(1, max - min);
+        return { min: min - pad, max: max + pad };
+      }
+
+      function panelShell(title, subtitle, note, innerHtml) {
+        return `
+          <section class="panel">
+            <div class="panel-title">${title}</div>
+            <div class="panel-subtitle">${subtitle}</div>
+            ${note ? `<div class="panel-note">${note}</div>` : ""}
+            ${innerHtml}
+          </section>
+        `;
+      }
+
+      function vectorFieldSvg(alpha, fixed = false) {
+        const size = 320;
+        const half = 2.2;
+        const grid = 13;
+        const center = size / 2;
+        const direction = alpha <= 1 ? 1 : -1;
+        const rings = [];
+        const contours = [];
+        const arrows = [];
+
+        for (let k = 1; k <= 5; k += 1) {
+          const rr = (k / 6) * (size * 0.44);
+          rings.push(
+            `<circle cx="${center}" cy="${center}" r="${rr}" fill="none" stroke="rgba(255,255,255,0.82)" stroke-dasharray="8 8" stroke-width="1.5"></circle>`
+          );
+        }
+
+        for (let k = 1; k <= 8; k += 1) {
+          const rr = (k / 9) * (size * 0.49);
+          contours.push(
+            `<circle cx="${center}" cy="${center}" r="${rr}" fill="none" stroke="rgba(0,0,0,0.18)" stroke-width="1"></circle>`
+          );
+        }
+
+        for (let i = 0; i < grid; i += 1) {
+          for (let j = 0; j < grid; j += 1) {
+            const x = -half + (2 * half * i) / (grid - 1);
+            const y = -half + (2 * half * j) / (grid - 1);
+            const r = Math.hypot(x, y);
+            if (r < 0.22) {
+              continue;
+            }
+            const ux = x / r;
+            const uy = y / r;
+            const px = fixed ? ux : direction * ux;
+            const py = fixed ? uy : direction * uy;
+            const p = (1 / Math.max(1e-6, Math.abs(1 - alpha))) * Math.pow(r, 1 - alpha);
+            const mag = fixed ? 0.21 : Math.min(0.42, 0.07 + 0.08 * Math.min(3, p));
+            const x1 = center + (x / half) * (size * 0.44);
+            const y1 = center - (y / half) * (size * 0.44);
+            const x2 = center + ((x + px * mag) / half) * (size * 0.44);
+            const y2 = center - ((y + py * mag) / half) * (size * 0.44);
+            arrows.push(`
+              <g>
+                <line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="rgba(255,255,255,0.9)" stroke-width="2"></line>
+                <polygon points="${x2},${y2} ${x2 - 6 * px - 3 * py},${y2 + 6 * py - 3 * px} ${x2 - 6 * px + 3 * py},${y2 + 6 * py + 3 * px}" fill="rgba(255,255,255,0.9)"></polygon>
+              </g>
+            `);
+          }
+        }
+
+        return `
+          <svg viewBox="0 0 ${size} ${size}" class="frame" role="img" aria-label="Vector field panel">
+            <defs>
+              <radialGradient id="bg-${fixed ? "critical" : alpha.toFixed(3)}" cx="50%" cy="50%" r="65%">
+                <stop offset="0%" stop-color="#5b147d"></stop>
+                <stop offset="55%" stop-color="#365d9d"></stop>
+                <stop offset="80%" stop-color="#2cb7a5"></stop>
+                <stop offset="100%" stop-color="#d1df3f"></stop>
+              </radialGradient>
+            </defs>
+            <rect x="0" y="0" width="${size}" height="${size}" fill="url(#bg-${fixed ? "critical" : alpha.toFixed(3)})"></rect>
+            ${contours.join("")}
+            ${rings.join("")}
+            ${arrows.join("")}
+            <circle cx="${center}" cy="${center}" r="6" fill="#ef4444"></circle>
+          </svg>
+        `;
+      }
+
+      function curveSvg(alpha, fixed = false) {
+        const width = 360;
+        const height = 220;
+        const margin = { left: 46, right: 16, top: 14, bottom: 36 };
+        const innerW = width - margin.left - margin.right;
+        const innerH = height - margin.top - margin.bottom;
+        const pMax = 4;
+        const points = fixed ? [] : sampleCurve(alpha);
+        const { min, max } = curveBounds(points);
+        const xScale = (p) => margin.left + (p / pMax) * innerW;
+        const yScale = (w) => margin.top + ((max - w) / (max - min || 1)) * innerH;
+        const path = points.map((pt, idx) => `${idx === 0 ? "M" : "L"}${xScale(pt.p)} ${yScale(pt.w)}`).join(" ");
+        const zeroY = yScale(0);
+        const xGrid = [0, 1, 2, 3, 4]
+          .map((gx) => `<line x1="${xScale(gx)}" x2="${xScale(gx)}" y1="${margin.top}" y2="${height - margin.bottom}" stroke="#e5e7eb"></line>`)
+          .join("");
+        const yGrid = [-2, -1, 0, 1, 2]
+          .map((gy) => `<line x1="${margin.left}" x2="${width - margin.right}" y1="${yScale(gy)}" y2="${yScale(gy)}" stroke="#e5e7eb"></line>`)
+          .join("");
+        const special = fixed
+          ? `
+            <line x1="195" x2="195" y1="14" y2="184" stroke="#2563eb" stroke-width="4"></line>
+            <circle cx="195" cy="120" r="4.5" fill="#ef4444"></circle>
+            <text x="180" y="208" text-anchor="middle" font-size="14" fill="#111827">Ṕ = (1 − α)P</text>
+            <text x="18" y="110" text-anchor="middle" font-size="14" fill="#111827" transform="rotate(-90 18 110)">W</text>
+            <text x="220" y="68" text-anchor="start" font-size="16" fill="#111827">Ṕ ≡ 1</text>
+          `
+          : `
+            ${path ? `<path d="${path}" fill="none" stroke="#2563eb" stroke-width="3"></path>` : ""}
+            <circle cx="${xScale(1)}" cy="${yScale(0)}" r="4.5" fill="#ef4444"></circle>
+            <text x="${width / 2}" y="${height - 8}" text-anchor="middle" font-size="14" fill="#111827">P = |∇W|</text>
+            <text x="18" y="${height / 2}" text-anchor="middle" font-size="14" fill="#111827" transform="rotate(-90 18 ${height / 2})">W</text>
+          `;
+
+        return `
+          <svg viewBox="0 0 ${width} ${height}" class="frame" role="img" aria-label="Chart panel">
+            <rect x="0" y="0" width="${width}" height="${height}" fill="#fafafa"></rect>
+            ${fixed ? `
+              <line x1="46" x2="46" y1="14" y2="184" stroke="#111827" stroke-width="1.5"></line>
+              <line x1="46" x2="344" y1="184" y2="184" stroke="#111827" stroke-width="1.5"></line>
+              ${[46, 120, 194, 268, 342].map((x) => `<line x1="${x}" x2="${x}" y1="14" y2="184" stroke="#e5e7eb"></line>`).join("")}
+              ${[30, 75, 120, 165].map((y) => `<line x1="46" x2="344" y1="${y}" y2="${y}" stroke="#e5e7eb"></line>`).join("")}
+              <line x1="46" x2="344" y1="120" y2="120" stroke="#9ca3af"></line>
+            ` : `
+              ${xGrid}
+              ${yGrid}
+              <line x1="${margin.left}" x2="${width - margin.right}" y1="${zeroY}" y2="${zeroY}" stroke="#9ca3af"></line>
+              <line x1="${margin.left}" x2="${margin.left}" y1="${margin.top}" y2="${height - margin.bottom}" stroke="#111827" stroke-width="1.5"></line>
+              <line x1="${margin.left}" x2="${width - margin.right}" y1="${height - margin.bottom}" y2="${height - margin.bottom}" stroke="#111827" stroke-width="1.5"></line>
+            `}
+            ${special}
+          </svg>
+        `;
+      }
+
+      function variableLabel(alpha) {
+        if (Math.abs(alpha - 2) < 1e-6) {
+          return "W = -log r, ∇W = -x/|x|²";
+        }
+        if (Math.abs(alpha - 1) < 1e-6) {
+          return "W = r - 1, ∇W = x/|x|";
+        }
+        return `∇W = (1/(1-${fmt(alpha)})) |x|^{-α} x`;
+      }
+
+      function render(alpha) {
+        const dualAlpha = 2 - alpha;
+        document.getElementById("alpha-label").textContent = `α = ${fmt(alpha)}`;
+        document.getElementById("dual-label").textContent = `dual 2 − α = ${fmt(dualAlpha)}`;
+
+        document.getElementById("field-grid").innerHTML = [
+          panelShell("Variable left field", `α = ${fmt(alpha)}`, variableLabel(alpha), vectorFieldSvg(alpha, false)),
+          panelShell("Fixed critical field", "α = 1", "W = r - 1, ∇W = x / |x|", vectorFieldSvg(1, true)),
+          panelShell("Variable right field", `α = ${fmt(dualAlpha)}`, variableLabel(dualAlpha), vectorFieldSvg(dualAlpha, false))
+        ].join("");
+
+        document.getElementById("chart-grid").innerHTML = [
+          panelShell("Variable left chart", `α = ${fmt(alpha)}`, "", curveSvg(alpha, false)),
+          panelShell("Fixed critical chart", "α = 1", "", curveSvg(1, true)),
+          panelShell("Variable right chart", `α = ${fmt(dualAlpha)}`, "", curveSvg(dualAlpha, false))
+        ].join("");
+      }
+
+      const slider = document.getElementById("alpha-slider");
+      slider.addEventListener("input", (event) => {
+        render(Number(event.target.value));
+      });
+
+      render(Number(slider.value));
+    </script>
+  </body>
+</html>

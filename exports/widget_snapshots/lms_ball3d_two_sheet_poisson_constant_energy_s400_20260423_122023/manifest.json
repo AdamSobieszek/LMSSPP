@@ -1,0 +1,37 @@
+{
+  "items": [
+    {
+      "src": "20260423_122023_scene.webm",
+      "label": "Scene 20260423_122023",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_ball3d_two_sheet",
+        "params": {
+          "N": 150,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 400,
+          "entropy0": 0.84,
+          "energy0": 0.022000000000000002
+        },
+        "init_state_mode": "poisson",
+        "init_state_label": "Poisson"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260423_122023_metrics.png",
+          "kind": "image"
+        }
+      ]
+    }
+  ],
+  "title": "LMS entropy-shell two-sheet dynamics on S² / B³",
+  "description": "LMS widget trajectory media exports"
+}

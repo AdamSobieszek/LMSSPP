@@ -1,0 +1,254 @@
+{
+  "items": [
+    {
+      "src": "20260327_194453_scene.webm",
+      "label": "Scene 20260327_194453",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_entropy_shell_ensemble",
+        "params": {
+          "N": 1800,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 420,
+          "entropy0": 0.84,
+          "energy0": 0.35
+        },
+        "init_state_mode": "min_energy",
+        "init_state_label": "Min Entropy"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260327_194453_metrics.png",
+          "kind": "image"
+        }
+      ]
+    },
+    {
+      "src": "20260327_194706_scene.webm",
+      "label": "Scene 20260327_194706",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_entropy_shell_ensemble",
+        "params": {
+          "N": 1800,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 420,
+          "entropy0": 0.84,
+          "energy0": 0.35
+        },
+        "init_state_mode": "poisson",
+        "init_state_label": "Poisson"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260327_194706_metrics.png",
+          "kind": "image"
+        }
+      ]
+    },
+    {
+      "src": "20260327_200532_scene.webm",
+      "label": "Scene 20260327_200532",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_entropy_shell_ensemble",
+        "params": {
+          "N": 1800,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 420,
+          "entropy0": 0.84,
+          "energy0": 0.35
+        },
+        "init_state_mode": "max_energy",
+        "init_state_label": "Max Entropy"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260327_200532_metrics.png",
+          "kind": "image"
+        }
+      ]
+    },
+    {
+      "src": "20260327_200744_scene.webm",
+      "label": "Scene 20260327_200744",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_entropy_shell_ensemble",
+        "params": {
+          "N": 1800,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 420,
+          "entropy0": 0.84,
+          "energy0": 0.987
+        },
+        "init_state_mode": "max_energy",
+        "init_state_label": "Max Entropy"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260327_200744_metrics.png",
+          "kind": "image"
+        }
+      ]
+    },
+    {
+      "src": "20260327_201153_scene.webm",
+      "label": "Scene 20260327_201153",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_entropy_shell_ensemble",
+        "params": {
+          "N": 1800,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 420,
+          "entropy0": 0.84,
+          "energy0": 0.987
+        },
+        "init_state_mode": "min_energy",
+        "init_state_label": "Min Entropy"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260327_201153_metrics.png",
+          "kind": "image"
+        }
+      ]
+    },
+    {
+      "src": "20260327_201558_scene.webm",
+      "label": "Scene 20260327_201558",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_entropy_shell_ensemble",
+        "params": {
+          "N": 1800,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 420,
+          "entropy0": 0.84,
+          "energy0": 0.987
+        },
+        "init_state_mode": "poisson",
+        "init_state_label": "Poisson"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260327_201558_metrics.png",
+          "kind": "image"
+        }
+      ]
+    },
+    {
+      "src": "20260327_210332_scene.webm",
+      "label": "Scene 20260327_210332",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_entropy_shell_ensemble",
+        "params": {
+          "N": 1800,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 420,
+          "entropy0": 0.84,
+          "energy0": 0.987
+        },
+        "init_state_mode": "poisson",
+        "init_state_label": "Poisson"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260327_210332_metrics.png",
+          "kind": "image"
+        }
+      ]
+    },
+    {
+      "src": "20260327_211131_scene.webm",
+      "label": "Scene 20260327_211131",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_entropy_shell_ensemble",
+        "params": {
+          "N": 1800,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 420,
+          "entropy0": 0.84,
+          "energy0": 0.987
+        },
+        "init_state_mode": "max_energy",
+        "init_state_label": "Max Entropy"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260327_211131_metrics.png",
+          "kind": "image"
+        }
+      ]
+    }
+  ],
+  "title": "LMS entropy-shell dynamics on S² / B³",
+  "description": "LMS widget trajectory media exports"
+}

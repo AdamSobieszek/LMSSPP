@@ -22,7 +22,17 @@ except Exception as exc:  # pragma: no cover
     raise ImportError("lms_ball3d_widget requires plotly and ipywidgets.") from exc
 
 try:
+    from .core.canonical_gauge import (
+        ball_to_rapidity,
+        busemann_cloud_potential,
+        canonical_center,
+        canonical_residual,
+        local_busemann_initializer,
+        rapidity_to_ball,
+    )
     from .LMS import (
+        clamp_to_ball,
+        dot,
         integrate_lms_reduced_euler,
         mobius_sphere,
         normalize,
@@ -30,7 +40,17 @@ try:
         skew_symmetric_from_axis,
     )
 except Exception:
+    from core.canonical_gauge import (  # type: ignore
+        ball_to_rapidity,
+        busemann_cloud_potential,
+        canonical_center,
+        canonical_residual,
+        local_busemann_initializer,
+        rapidity_to_ball,
+    )
     from LMS import (  # type: ignore
+        clamp_to_ball,
+        dot,
         integrate_lms_reduced_euler,
         mobius_sphere,
         normalize,
@@ -128,6 +148,7 @@ InitMetricMode = Literal["entropy", "perp_variance"]
 EnergyStateMode = Literal["min_energy", "poisson", "max_energy"]
 EntropyCoordinateMode = Literal["kernel", "continuum_poisson"]
 ShellConstraintMode = Literal["constant_entropy", "constant_energy"]
+CenterEstimationMode = Literal["poisson_shrink", "busemann_exact"]
 
 
 class _HydroRecomputeCancelled(Exception):
@@ -280,6 +301,7 @@ class LMSBall3DWidget:
         *,
         controls: tuple[LMS3DControlSpec, ...] = DEFAULT_CONTROLS,
         w_mode: str = "autograd",
+        center_estimation_mode: CenterEstimationMode = "poisson_shrink",
         rng_seed: int = 0,
         point_size: int = 5,
         title: str = "Reduced LMS dynamics on S² (points) / B³ (order parameters)",
@@ -292,6 +314,7 @@ class LMSBall3DWidget:
     ) -> None:
         self.control_specs = controls
         self.w_mode = w_mode
+        self.center_estimation_mode = self._canonical_center_estimation_mode(center_estimation_mode)
         self.rng_seed = int(rng_seed)
         self.point_size = int(point_size)
         self.title = self._sanitize_plot_text(title)
@@ -335,6 +358,7 @@ class LMSBall3DWidget:
         self._playback_speed = 1.0
         self._last_rendered_frame = 0
         self._init_state_mode: InitMode = self._active_mode_order()[0]
+        self._job_center_estimation_mode: CenterEstimationMode | None = None
         # Inversion mapping remains available in code, but is not user-exposed in widget controls.
         self._inversion_enabled = False
 
@@ -401,13 +425,21 @@ class LMSBall3DWidget:
                     )
                 )
 
-        mode_row_width = "430px"
-        layout_row_width = "510px"
         self.mode_dropdown = widgets.Dropdown(
             options=["explicit", "autograd"],
             value=self.w_mode,
             description="Computational backend",
-            layout=widgets.Layout(width=mode_row_width),
+            layout=widgets.Layout(width="220px"),
+            style={"description_width": "initial"},
+        )
+        self.center_estimation_dropdown = widgets.Dropdown(
+            options=[
+                ("Poisson shrink", "poisson_shrink"),
+                ("Exact Busemann", "busemann_exact"),
+            ],
+            value=self.center_estimation_mode,
+            description="Center inversion",
+            layout=widgets.Layout(width="260px"),
             style={"description_width": "initial"},
         )
         self.layout_dropdown = widgets.Dropdown(
@@ -417,7 +449,7 @@ class LMSBall3DWidget:
             ],
             value="top",
             description="Layout",
-            layout=widgets.Layout(width=layout_row_width),
+            layout=widgets.Layout(width="420px"),
             style={"description_width": "initial"},
         )
         self.view_frame_dropdown = widgets.Dropdown(
@@ -439,6 +471,11 @@ class LMSBall3DWidget:
         self.show_paths = widgets.Checkbox(value=True, description="show paths", indent=False)
         self.show_vectors = widgets.Checkbox(value=True, description="show vectors", indent=False)
         self._register_export_widget(self.mode_dropdown, control_id="mode_dropdown", state_key="backend")
+        self._register_export_widget(
+            self.center_estimation_dropdown,
+            control_id="center_estimation_dropdown",
+            state_key="center_estimation_mode",
+        )
         self._register_export_widget(self.layout_dropdown, control_id="layout_dropdown", state_key="layout_mode")
         self._register_export_widget(self.view_frame_dropdown, control_id="view_frame_dropdown", state_key="frame_name")
         self._register_export_widget(self.show_paths, control_id="show_paths", state_key="show_paths")
@@ -558,7 +595,7 @@ class LMSBall3DWidget:
                 self._export_controls_row,
                 self.frame_slider,
                 widgets.HBox(
-                    [self.mode_dropdown, self.layout_dropdown],
+                    [self.mode_dropdown, self.center_estimation_dropdown, self.layout_dropdown],
                     layout=widgets.Layout(width=control_width, justify_content="space-between"),
                 ),
                 widgets.HBox([self.show_paths, self.show_vectors]),
@@ -1071,6 +1108,12 @@ class LMSBall3DWidget:
             state_key="backend",
         )
         self._bind_export_observe(
+            self.center_estimation_dropdown,
+            self._on_center_estimation_change,
+            action_kind="backend_notice",
+            state_key="center_estimation_mode",
+        )
+        self._bind_export_observe(
             self.view_frame_dropdown,
             self._on_visual_change,
             action_kind="frame_name_set",
@@ -1167,6 +1210,21 @@ class LMSBall3DWidget:
         return params
 
     @staticmethod
+    def _canonical_center_estimation_mode(mode: str) -> CenterEstimationMode:
+        value = str(mode).strip().lower()
+        if value in {"busemann", "exact", "finite_n_busemann", "busemann_exact", "finite-n-busemann"}:
+            return "busemann_exact"
+        return "poisson_shrink"
+
+    def _current_center_estimation_mode(self) -> CenterEstimationMode:
+        if self._job_center_estimation_mode is not None:
+            return self._job_center_estimation_mode
+        dropdown = getattr(self, "center_estimation_dropdown", None)
+        if dropdown is not None:
+            return self._canonical_center_estimation_mode(str(dropdown.value))
+        return self._canonical_center_estimation_mode(str(getattr(self, "center_estimation_mode", "poisson_shrink")))
+
+    @staticmethod
     def _json_ready(value: Any) -> Any:
         if isinstance(value, np.ndarray):
             return value.tolist()
@@ -1237,6 +1295,10 @@ class LMSBall3DWidget:
     def _export_additional_bundle_fields(self, *, traj_cache: dict[str, np.ndarray]) -> dict[str, Any]:
         return {}
 
+    def _export_additional_media_bundle_fields(self, *, traj_cache: dict[str, np.ndarray]) -> dict[str, Any]:
+        _ = traj_cache
+        return {}
+
     def _export_bundle_from_state(
         self,
         *,
@@ -1271,6 +1333,316 @@ class LMSBall3DWidget:
             bundle.update(self._json_ready(extra))
         return bundle
 
+    def _export_media_bundle_from_state(
+        self,
+        *,
+        traj_cache: dict[str, np.ndarray],
+        base_points: np.ndarray,
+        display_idx: np.ndarray | None,
+    ) -> dict[str, Any]:
+        base = np.asarray(base_points, dtype=np.float64)
+        if display_idx is None:
+            disp = np.arange(base.shape[0], dtype=np.int64)
+        else:
+            disp = np.asarray(display_idx, dtype=np.int64)
+        if disp.size <= 0:
+            disp = np.arange(base.shape[0], dtype=np.int64)
+
+        bundle: dict[str, Any] = {
+            "w": np.asarray(traj_cache["w"], dtype=np.float64),
+            "zeta": np.asarray(traj_cache["zeta"], dtype=np.float64),
+            "z_lab": np.asarray(traj_cache["z_lab"], dtype=np.float64),
+            "z_body": np.asarray(traj_cache["z_body"], dtype=np.float64),
+            "Z_lab": np.asarray(traj_cache["Z_lab"], dtype=np.float64),
+            "Z_body": np.asarray(traj_cache["Z_body"], dtype=np.float64),
+            "base_points": base,
+            "base_points_display": np.asarray(base[disp], dtype=np.float64),
+            "display_indices": disp,
+        }
+        if "x_lab" in traj_cache:
+            bundle["x_lab"] = np.asarray(traj_cache["x_lab"], dtype=np.float64)
+        if "x_body" in traj_cache:
+            bundle["x_body"] = np.asarray(traj_cache["x_body"], dtype=np.float64)
+        extra = self._export_additional_media_bundle_fields(traj_cache=traj_cache)
+        if extra:
+            bundle.update(extra)
+        return bundle
+
+    @staticmethod
+    def _coerce_frame_name(frame_name: str | None) -> Literal["lab", "body"]:
+        return "body" if str(frame_name) == "body" else "lab"
+
+    @staticmethod
+    def _points_from_series_or_reduced_state(
+        *,
+        t: int,
+        frame_name: Literal["lab", "body"],
+        traj_cache: dict[str, np.ndarray],
+        base_points_display: np.ndarray,
+        display_idx: np.ndarray | None = None,
+    ) -> np.ndarray:
+        x_key = "x_body" if frame_name == "body" else "x_lab"
+        x_series = traj_cache.get(x_key)
+        if x_series is not None:
+            x_frame = np.asarray(x_series[t], dtype=np.float64)
+            if display_idx is not None and display_idx.size > 0 and display_idx.size < x_frame.shape[0]:
+                return np.asarray(x_frame[display_idx], dtype=np.float64)
+            return x_frame
+
+        w_t = np.asarray(traj_cache["w"][t], dtype=np.float64)
+        zeta_t = np.asarray(traj_cache["zeta"][t], dtype=np.float64)
+        diff = base_points_display - w_t[None, :]
+        den = np.einsum("ij,ij->i", diff, diff)[:, None]
+        w2 = float(np.dot(w_t, w_t))
+        x_body = ((1.0 - w2) / np.maximum(den, 1e-12)) * diff - w_t[None, :]
+        x_body = x_body / np.maximum(np.linalg.norm(x_body, axis=1, keepdims=True), 1e-12)
+        if frame_name == "body":
+            return x_body
+        return x_body @ zeta_t.T
+
+    def _corotating_boundary_point_from_traj_cache(
+        self,
+        traj_cache: dict[str, np.ndarray],
+        *,
+        frame_name: Literal["lab", "body"],
+    ) -> np.ndarray:
+        z_key = "z_body" if frame_name == "body" else "z_lab"
+        z_series = traj_cache.get(z_key)
+        if z_series is not None and len(z_series) > 0:
+            z_last = np.asarray(z_series[-1], dtype=np.float64)
+            z_n = float(np.linalg.norm(z_last))
+            if z_n > 1e-12:
+                return z_last / z_n
+
+        w_series = traj_cache.get("w")
+        if w_series is not None and len(w_series) > 0:
+            w_last = np.asarray(w_series[-1], dtype=np.float64)
+            w_n = float(np.linalg.norm(w_last))
+            if w_n > 1e-12:
+                return -w_last / w_n
+        return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+    def _inversion_context_from_traj_cache(
+        self,
+        traj_cache: dict[str, np.ndarray],
+        *,
+        frame_name: Literal["lab", "body"],
+    ) -> tuple[np.ndarray, float]:
+        corot = self._corotating_boundary_point_from_traj_cache(traj_cache, frame_name=frame_name)
+        x0 = -corot
+        cap = float(self._scene_radius_inversion())
+        return x0, cap
+
+    def _compute_base_scene_state(
+        self,
+        *,
+        t: int,
+        params: dict[str, float | int],
+        frame_name: Literal["lab", "body"],
+        show_paths: bool,
+        show_vectors: bool,
+        traj_cache: dict[str, np.ndarray],
+        base_points: np.ndarray,
+        display_idx: np.ndarray | None,
+        inversion_enabled: bool,
+    ) -> dict[str, Any]:
+        frame_max = max(0, len(traj_cache["w"]) - 1)
+        t_clamped = max(0, min(int(t), frame_max))
+        base_arr = np.asarray(base_points, dtype=np.float64)
+        disp = None if display_idx is None else np.asarray(display_idx, dtype=np.int64)
+        if disp is not None and disp.size > 0 and disp.size < base_arr.shape[0]:
+            base_display = np.asarray(base_arr[disp], dtype=np.float64)
+        else:
+            base_display = base_arr
+            disp = None
+
+        z_series = np.asarray(traj_cache["z_body" if frame_name == "body" else "z_lab"], dtype=np.float64)
+        Z_series = np.asarray(traj_cache["Z_body" if frame_name == "body" else "Z_lab"], dtype=np.float64)
+        x_plot = self._points_from_series_or_reduced_state(
+            t=t_clamped,
+            frame_name=frame_name,
+            traj_cache=traj_cache,
+            base_points_display=base_display,
+            display_idx=disp,
+        )
+        w = np.asarray(traj_cache["w"][t_clamped], dtype=np.float64)
+        z = np.asarray(z_series[t_clamped], dtype=np.float64)
+        Z = np.asarray(Z_series[t_clamped], dtype=np.float64)
+        K = max(float(params["K"]), 1e-9)
+        Z_hat = Z / K
+        inv_ctx = (
+            self._inversion_context_from_traj_cache(traj_cache, frame_name=frame_name)
+            if bool(inversion_enabled)
+            else None
+        )
+
+        state: dict[str, Any] = {
+            "frame": t_clamped,
+            "frame_name": frame_name,
+            "show_paths": bool(show_paths),
+            "show_vectors": bool(show_vectors),
+            "points": self._maybe_invert_rows(x_plot, frame_name=frame_name, inv_ctx=inv_ctx),
+            "w": self._maybe_invert_rows(w, frame_name=frame_name, inv_ctx=inv_ctx),
+            "z": self._maybe_invert_rows(z, frame_name=frame_name, inv_ctx=inv_ctx),
+            "Z": self._maybe_invert_rows(Z_hat, frame_name=frame_name, inv_ctx=inv_ctx),
+            "w_raw": w,
+            "z_raw": z,
+            "Z_raw": Z,
+        }
+        if show_paths:
+            wp = np.asarray(traj_cache["w"][: t_clamped + 1], dtype=np.float64)
+            zp = np.asarray(z_series[: t_clamped + 1], dtype=np.float64)
+            Zp = np.asarray(Z_series[: t_clamped + 1], dtype=np.float64) / K
+            state["w_path"] = self._maybe_invert_rows(wp, frame_name=frame_name, inv_ctx=inv_ctx)
+            state["z_path"] = self._maybe_invert_rows(zp, frame_name=frame_name, inv_ctx=inv_ctx)
+            state["Z_path"] = self._maybe_invert_rows(Zp, frame_name=frame_name, inv_ctx=inv_ctx)
+        else:
+            state["w_path"] = None
+            state["z_path"] = None
+            state["Z_path"] = None
+
+        if show_vectors:
+            state["w_vector"] = np.vstack([np.zeros((1, 3), dtype=np.float64), np.asarray(state["w"], dtype=np.float64).reshape(1, 3)])
+            state["z_vector"] = np.vstack([np.zeros((1, 3), dtype=np.float64), np.asarray(state["z"], dtype=np.float64).reshape(1, 3)])
+            state["Z_vector"] = np.vstack([np.zeros((1, 3), dtype=np.float64), np.asarray(state["Z"], dtype=np.float64).reshape(1, 3)])
+        else:
+            state["w_vector"] = None
+            state["z_vector"] = None
+            state["Z_vector"] = None
+        return state
+
+    def _apply_base_scene_state_to_widget(self, state: dict[str, Any]) -> None:
+        idx = self._wire_count
+        show_paths = bool(state.get("show_paths", True))
+        show_vectors = bool(state.get("show_vectors", True))
+        points = np.asarray(state["points"], dtype=np.float64)
+        w = np.asarray(state["w"], dtype=np.float64).reshape(3)
+        z = np.asarray(state["z"], dtype=np.float64).reshape(3)
+        Z = np.asarray(state["Z"], dtype=np.float64).reshape(3)
+        self._in_frame_update = True
+        try:
+            with self.sphere_fig.batch_update():
+                self.sphere_fig.data[idx + 0].x = points[:, 0].tolist()
+                self.sphere_fig.data[idx + 0].y = points[:, 1].tolist()
+                self.sphere_fig.data[idx + 0].z = points[:, 2].tolist()
+
+                self.sphere_fig.data[idx + 1].x = [float(w[0])]
+                self.sphere_fig.data[idx + 1].y = [float(w[1])]
+                self.sphere_fig.data[idx + 1].z = [float(w[2])]
+
+                self.sphere_fig.data[idx + 2].x = [float(z[0])]
+                self.sphere_fig.data[idx + 2].y = [float(z[1])]
+                self.sphere_fig.data[idx + 2].z = [float(z[2])]
+
+                self.sphere_fig.data[idx + 3].x = [float(Z[0])]
+                self.sphere_fig.data[idx + 3].y = [float(Z[1])]
+                self.sphere_fig.data[idx + 3].z = [float(Z[2])]
+
+                if show_paths and state.get("w_path") is not None:
+                    wp = np.asarray(state["w_path"], dtype=np.float64)
+                    zp = np.asarray(state["z_path"], dtype=np.float64)
+                    Zp = np.asarray(state["Z_path"], dtype=np.float64)
+                    self.sphere_fig.data[idx + 4].x = wp[:, 0].tolist()
+                    self.sphere_fig.data[idx + 4].y = wp[:, 1].tolist()
+                    self.sphere_fig.data[idx + 4].z = wp[:, 2].tolist()
+
+                    self.sphere_fig.data[idx + 5].x = zp[:, 0].tolist()
+                    self.sphere_fig.data[idx + 5].y = zp[:, 1].tolist()
+                    self.sphere_fig.data[idx + 5].z = zp[:, 2].tolist()
+
+                    self.sphere_fig.data[idx + 6].x = Zp[:, 0].tolist()
+                    self.sphere_fig.data[idx + 6].y = Zp[:, 1].tolist()
+                    self.sphere_fig.data[idx + 6].z = Zp[:, 2].tolist()
+
+                self.sphere_fig.data[idx + 7].x = [0.0, float(w[0])]
+                self.sphere_fig.data[idx + 7].y = [0.0, float(w[1])]
+                self.sphere_fig.data[idx + 7].z = [0.0, float(w[2])]
+
+                self.sphere_fig.data[idx + 8].x = [0.0, float(z[0])]
+                self.sphere_fig.data[idx + 8].y = [0.0, float(z[1])]
+                self.sphere_fig.data[idx + 8].z = [0.0, float(z[2])]
+
+                self.sphere_fig.data[idx + 9].x = [0.0, float(Z[0])]
+                self.sphere_fig.data[idx + 9].y = [0.0, float(Z[1])]
+                self.sphere_fig.data[idx + 9].z = [0.0, float(Z[2])]
+
+                self.sphere_fig.data[idx + 4].visible = show_paths
+                self.sphere_fig.data[idx + 5].visible = show_paths
+                self.sphere_fig.data[idx + 6].visible = show_paths
+                self.sphere_fig.data[idx + 7].visible = show_vectors
+                self.sphere_fig.data[idx + 8].visible = show_vectors
+                self.sphere_fig.data[idx + 9].visible = show_vectors
+        finally:
+            self._in_frame_update = False
+
+    def _export_media_scene_state(
+        self,
+        *,
+        bundle: dict[str, Any],
+        t: int,
+        params: dict[str, float | int],
+        frame_name: Literal["lab", "body"],
+        show_paths: bool,
+        show_vectors: bool,
+        inversion_enabled: bool,
+    ) -> dict[str, Any]:
+        traj_cache = {
+            "w": np.asarray(bundle["w"], dtype=np.float64),
+            "zeta": np.asarray(bundle["zeta"], dtype=np.float64),
+            "z_lab": np.asarray(bundle["z_lab"], dtype=np.float64),
+            "z_body": np.asarray(bundle["z_body"], dtype=np.float64),
+            "Z_lab": np.asarray(bundle["Z_lab"], dtype=np.float64),
+            "Z_body": np.asarray(bundle["Z_body"], dtype=np.float64),
+        }
+        if "x_lab" in bundle:
+            traj_cache["x_lab"] = np.asarray(bundle["x_lab"], dtype=np.float64)
+        if "x_body" in bundle:
+            traj_cache["x_body"] = np.asarray(bundle["x_body"], dtype=np.float64)
+        display_idx = np.asarray(bundle.get("display_indices", []), dtype=np.int64)
+        return self._compute_base_scene_state(
+            t=t,
+            params=params,
+            frame_name=frame_name,
+            show_paths=show_paths,
+            show_vectors=show_vectors,
+            traj_cache=traj_cache,
+            base_points=np.asarray(bundle["base_points"], dtype=np.float64),
+            display_idx=display_idx if display_idx.size > 0 else None,
+            inversion_enabled=inversion_enabled,
+        )
+
+    def _export_media_payload(self) -> dict[str, Any]:
+        if not self._traj_cache or self._base_points_np is None:
+            raise RuntimeError("No computed trajectory is available to export.")
+        params = dict(self._params_cache if self._params_cache else self._params())
+        ui_state = dict(self._export_capture_ui_state())
+        frame_name = self._coerce_frame_name(ui_state.get("frame_name"))
+        payload = {
+            "schema_version": "lmsspp_widget_media_v1",
+            "widget_kind": self._export_widget_kind(),
+            "title": str(self.title),
+            "params": dict(params),
+            "init_info": dict(self._export_init_info(params)),
+            "ui_state": {
+                "frame": int(ui_state.get("frame", 0)),
+                "frame_name": frame_name,
+                "show_paths": bool(ui_state.get("show_paths", True)),
+                "show_vectors": bool(ui_state.get("show_vectors", True)),
+                "display_mode": ui_state.get("display_mode"),
+                "play_step": int(getattr(self.play, "step", 1)),
+                "inversion_enabled": bool(getattr(self, "_inversion_enabled", False)),
+            },
+            "scene_trace_roles": self._json_ready(self._export_scene_trace_roles()),
+            "scene_figure_template": self._json_ready(self.sphere_fig.to_plotly_json()),
+            "metrics_figure_template": self._json_ready(self.metrics_fig.to_plotly_json()),
+            "bundle": self._export_media_bundle_from_state(
+                traj_cache=self._traj_cache,
+                base_points=self._base_points_np,
+                display_idx=self._display_indices,
+            ),
+        }
+        return payload
+
     def _export_init_info(self, params: dict[str, float | int]) -> dict[str, Any]:
         mode_value = str(getattr(self, "_display_mode", getattr(self, "_init_state_mode", "poisson")))
         try:
@@ -1283,6 +1655,7 @@ class LMSBall3DWidget:
             "entropy_direction": "increase" if bool(self.toggle_entropy.value) else "dissipate",
             "time_direction": "backward" if bool(self.toggle_time_direction.value) else "forward",
             "backend": str(self.mode_dropdown.value),
+            "center_estimation_mode": str(self._current_center_estimation_mode()),
             "viewing_frame": "body" if self.view_frame_dropdown.value == "body" else "lab",
             "trajectory_mode": str(getattr(self, "_resolved_trajectory_mode", "memory")),
             "steps": int(self._steps),
@@ -1671,7 +2044,7 @@ class LMSBall3DWidget:
             from .export.widget_media_export import write_lms_widget_webm_bundle
         except Exception:
             from export.widget_media_export import write_lms_widget_webm_bundle  # type: ignore
-        return write_lms_widget_webm_bundle(self, target_dir)
+        return write_lms_widget_webm_bundle(self, target_dir, status_callback=self._set_export_status)
 
     def _on_export_iframe_clicked(self, _btn: widgets.Button) -> None:
         try:
@@ -2476,8 +2849,9 @@ class LMSBall3DWidget:
         self._init_state_mode = init_mode
         if init_mode == "poisson":
             # Finite-N Poisson-manifold initialization:
-            # choose uniform base points and requested reduced center w0 directly.
-            base_points = random_points_on_sphere(
+            # choose uniform reference points, then optionally recover the
+            # finite-N Busemann center from the resulting boundary cloud.
+            base_seed_points = random_points_on_sphere(
                 n,
                 d=d,
                 generator=self._torch_gen,
@@ -2486,7 +2860,14 @@ class LMSBall3DWidget:
             r0_clip = float(np.clip(r0, 0.0, 0.999999))
             # Keep sign convention consistent with optimized initializers:
             # requested axis controls the physical dipole direction z=-w at t=0.
-            w0 = -center_dir * r0_clip
+            target_w = -center_dir * r0_clip
+            w0, base_points, _ = self._reduced_state_from_poisson_cloud(
+                base_points=base_seed_points,
+                target_w=target_w,
+                weights=weights,
+                d=d,
+                fallback_dir=center_dir,
+            )
         else:
             x0_points = self._make_initial_boundary_points(
                 n=n,
@@ -2496,15 +2877,16 @@ class LMSBall3DWidget:
                 target_r=float(r0),
                 init_state=init_mode,
             )
-            w0 = self._estimate_w_from_boundary_points(
+            target_w = self._target_w_from_radius(
+                target_r=float(r0),
+                target_dir=center_dir,
+            )
+            w0, base_points = self._reduced_state_from_boundary_points(
                 points=x0_points,
                 weights=weights,
                 d=d,
                 fallback_dir=center_dir,
-            )
-            base_points = self._recover_base_points_from_state(
-                x_points=x0_points,
-                w0=w0,
+                target_w=target_w,
             )
 
         zeta0 = torch.eye(d, dtype=torch.float64)
@@ -2929,7 +3311,43 @@ class LMSBall3DWidget:
             best, best_err, center = _scan(center - span, center + span, steps, best_err)
         return best
 
-    def _estimate_w_from_boundary_points(
+    @staticmethod
+    def _ball_to_rapidity(v: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+        return ball_to_rapidity(v, eps=eps)
+
+    @staticmethod
+    def _rapidity_to_ball(y: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+        return rapidity_to_ball(y, eps=eps)
+
+    @staticmethod
+    def _busemann_cloud_potential_v(
+        *,
+        v: torch.Tensor,
+        points: torch.Tensor,
+        weights: torch.Tensor,
+        eps: float = 1e-12,
+    ) -> torch.Tensor:
+        return busemann_cloud_potential(v, points, weights, eps=eps)
+
+    @staticmethod
+    def _cloud_residual_v(
+        *,
+        v: torch.Tensor,
+        points: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return canonical_residual(v, points, weights)
+
+    @staticmethod
+    def _local_busemann_initializer_v(
+        *,
+        points: torch.Tensor,
+        weights: torch.Tensor,
+        lam: float = 1e-6,
+    ) -> torch.Tensor:
+        return local_busemann_initializer(points, weights, lam=lam)
+
+    def _estimate_w_from_boundary_points_poisson(
         self,
         *,
         points: torch.Tensor,
@@ -2937,11 +3355,7 @@ class LMSBall3DWidget:
         d: int,
         fallback_dir: torch.Tensor,
     ) -> torch.Tensor:
-        """Estimate reduced w directly from boundary points via first moment.
-
-        Uses direction of weighted centroid and radial inversion of
-        q(r) = f_d(r) * r in [0, 1), where q = ||sum_i a_i x_i||.
-        """
+        """Moment-matched shrink inversion q(r)=f_d(r)r used in legacy widgets."""
         m = (weights[:, None] * points).sum(dim=0)
         q = float(torch.linalg.norm(m))
         q = float(np.clip(q, 0.0, 0.999999))
@@ -2969,6 +3383,133 @@ class LMSBall3DWidget:
                     hi = mid
             r = 0.5 * (lo + hi)
         return direction * float(r)
+
+    def _estimate_w_from_boundary_points_busemann(
+        self,
+        *,
+        points: torch.Tensor,
+        weights: torch.Tensor,
+        fallback_dir: torch.Tensor,
+        max_iters: int = 120,
+        tol: float = 1e-10,
+    ) -> torch.Tensor:
+        """Exact finite-N inversion from the LMS/Busemann cloud potential."""
+        try:
+            z_star = canonical_center(
+                points,
+                weights,
+                fallback_dir=fallback_dir,
+                max_iters=max_iters,
+                tol=tol,
+            )
+            if torch.isfinite(z_star).all():
+                return -z_star
+        except Exception:
+            pass
+        return self._estimate_w_from_boundary_points_poisson(
+            points=points,
+            weights=weights,
+            d=int(points.shape[1]),
+            fallback_dir=fallback_dir,
+        )
+
+    def _estimate_w_from_boundary_points(
+        self,
+        *,
+        points: torch.Tensor,
+        weights: torch.Tensor,
+        d: int,
+        fallback_dir: torch.Tensor,
+    ) -> torch.Tensor:
+        """Estimate reduced w from a boundary cloud using the selected inversion."""
+        method = self._current_center_estimation_mode()
+        if method == "busemann_exact":
+            return self._estimate_w_from_boundary_points_busemann(
+                points=points,
+                weights=weights,
+                fallback_dir=fallback_dir,
+            )
+        return self._estimate_w_from_boundary_points_poisson(
+            points=points,
+            weights=weights,
+            d=d,
+            fallback_dir=fallback_dir,
+        )
+
+    @staticmethod
+    def _target_w_from_radius(
+        *,
+        target_r: float,
+        target_dir: torch.Tensor,
+    ) -> torch.Tensor:
+        r_clip = float(np.clip(target_r, 0.0, 0.999999))
+        axis = normalize(target_dir.unsqueeze(0))[0]
+        return -axis * r_clip
+
+    def _reduced_state_from_boundary_points(
+        self,
+        *,
+        points: torch.Tensor,
+        weights: torch.Tensor,
+        d: int,
+        fallback_dir: torch.Tensor,
+        target_w: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build (w0, base_points) from a boundary cloud under the active inversion mode.
+
+        In exact Busemann mode, if `target_w` is provided we keep the exact
+        deboosted base cloud and place it back on the same Möbius orbit at the
+        requested reduced center. This preserves the exact inversion structure
+        while making the chosen radius/direction exact by construction.
+        """
+        method = self._current_center_estimation_mode()
+        if method == "busemann_exact":
+            w_exact = self._estimate_w_from_boundary_points_busemann(
+                points=points,
+                weights=weights,
+                fallback_dir=fallback_dir,
+            )
+            base_points = self._recover_base_points_from_state(
+                x_points=points,
+                w0=w_exact,
+            )
+            if target_w is not None:
+                return target_w.to(dtype=base_points.dtype, device=base_points.device), base_points
+            return w_exact, base_points
+
+        w0 = self._estimate_w_from_boundary_points_poisson(
+            points=points,
+            weights=weights,
+            d=d,
+            fallback_dir=fallback_dir,
+        )
+        base_points = self._recover_base_points_from_state(
+            x_points=points,
+            w0=w0,
+        )
+        return w0, base_points
+
+    def _reduced_state_from_poisson_cloud(
+        self,
+        *,
+        base_points: torch.Tensor,
+        target_w: torch.Tensor,
+        weights: torch.Tensor,
+        d: int,
+        fallback_dir: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build a Poisson initialization, optionally re-centering finite-N by Busemann inversion."""
+        x_points = normalize(mobius_sphere(base_points, target_w))
+        if self._current_center_estimation_mode() != "busemann_exact":
+            return target_w, base_points, x_points
+        w0, recovered_base = self._reduced_state_from_boundary_points(
+            points=x_points,
+            weights=weights,
+            d=d,
+            fallback_dir=fallback_dir,
+        )
+        x_reconstructed = normalize(mobius_sphere(recovered_base, w0))
+        return w0, recovered_base, x_reconstructed
 
     @staticmethod
     def _recover_base_points_from_state(
@@ -3048,96 +3589,28 @@ class LMSBall3DWidget:
             return
         params = self._params_cache if self._params_cache else self._params()
         t = max(0, min(t, self._steps))
-
-        frame_name: Literal["lab", "body"] = "body" if self.view_frame_dropdown.value == "body" else "lab"
-        x_series, z_series, Z_series = self._frame_arrays()
-        x = self._points_at_frame(t, x_series, frame_name=frame_name)
-        if self._display_indices is not None and len(self._display_indices) < x.shape[0]:
-            x_plot = x[self._display_indices]
-        else:
-            x_plot = x
-        w = self._traj_cache["w"][t]
-        z = z_series[t]
-        Z = Z_series[t]
-        K = max(float(params["K"]), 1e-9)
-        Z_hat = Z / K
-        inv_ctx = self._inversion_context(frame_name=frame_name) if bool(self._inversion_enabled) else None
-        x_plot_disp = self._maybe_invert_rows(x_plot, frame_name=frame_name, inv_ctx=inv_ctx)
-        w_disp = self._maybe_invert_rows(w, frame_name=frame_name, inv_ctx=inv_ctx)
-        z_disp = self._maybe_invert_rows(z, frame_name=frame_name, inv_ctx=inv_ctx)
-        Z_hat_disp = self._maybe_invert_rows(Z_hat, frame_name=frame_name, inv_ctx=inv_ctx)
-
+        frame_name: Literal["lab", "body"] = self._coerce_frame_name(self.view_frame_dropdown.value)
         show_paths = bool(self.show_paths.value)
         show_vectors = bool(self.show_vectors.value)
         force_update = (t == 0) or (t == self._steps)
-
-        idx = self._wire_count
-        self._in_frame_update = True
-        try:
-            with self.sphere_fig.batch_update():
-                self.sphere_fig.data[idx + 0].x = x_plot_disp[:, 0].tolist()
-                self.sphere_fig.data[idx + 0].y = x_plot_disp[:, 1].tolist()
-                self.sphere_fig.data[idx + 0].z = x_plot_disp[:, 2].tolist()
-
-                self.sphere_fig.data[idx + 1].x = [float(w_disp[0])]
-                self.sphere_fig.data[idx + 1].y = [float(w_disp[1])]
-                self.sphere_fig.data[idx + 1].z = [float(w_disp[2])]
-
-                self.sphere_fig.data[idx + 2].x = [float(z_disp[0])]
-                self.sphere_fig.data[idx + 2].y = [float(z_disp[1])]
-                self.sphere_fig.data[idx + 2].z = [float(z_disp[2])]
-
-                self.sphere_fig.data[idx + 3].x = [float(Z_hat_disp[0])]
-                self.sphere_fig.data[idx + 3].y = [float(Z_hat_disp[1])]
-                self.sphere_fig.data[idx + 3].z = [float(Z_hat_disp[2])]
-
-                if show_paths:
-                    wp = self._traj_cache["w"][: t + 1]
-                    zp = z_series[: t + 1]
-                    Zp = Z_series[: t + 1] / K
-
-                    wp_disp = self._maybe_invert_rows(wp, frame_name=frame_name, inv_ctx=inv_ctx)
-                    zp_disp = self._maybe_invert_rows(zp, frame_name=frame_name, inv_ctx=inv_ctx)
-                    Zp_disp = self._maybe_invert_rows(Zp, frame_name=frame_name, inv_ctx=inv_ctx)
-
-                    self.sphere_fig.data[idx + 4].x = wp_disp[:, 0].tolist()
-                    self.sphere_fig.data[idx + 4].y = wp_disp[:, 1].tolist()
-                    self.sphere_fig.data[idx + 4].z = wp_disp[:, 2].tolist()
-
-                    self.sphere_fig.data[idx + 5].x = zp_disp[:, 0].tolist()
-                    self.sphere_fig.data[idx + 5].y = zp_disp[:, 1].tolist()
-                    self.sphere_fig.data[idx + 5].z = zp_disp[:, 2].tolist()
-
-                    self.sphere_fig.data[idx + 6].x = Zp_disp[:, 0].tolist()
-                    self.sphere_fig.data[idx + 6].y = Zp_disp[:, 1].tolist()
-                    self.sphere_fig.data[idx + 6].z = Zp_disp[:, 2].tolist()
-
-                self.sphere_fig.data[idx + 7].x = [0.0, float(w_disp[0])]
-                self.sphere_fig.data[idx + 7].y = [0.0, float(w_disp[1])]
-                self.sphere_fig.data[idx + 7].z = [0.0, float(w_disp[2])]
-
-                self.sphere_fig.data[idx + 8].x = [0.0, float(z_disp[0])]
-                self.sphere_fig.data[idx + 8].y = [0.0, float(z_disp[1])]
-                self.sphere_fig.data[idx + 8].z = [0.0, float(z_disp[2])]
-
-                self.sphere_fig.data[idx + 9].x = [0.0, float(Z_hat_disp[0])]
-                self.sphere_fig.data[idx + 9].y = [0.0, float(Z_hat_disp[1])]
-                self.sphere_fig.data[idx + 9].z = [0.0, float(Z_hat_disp[2])]
-
-                self.sphere_fig.data[idx + 4].visible = show_paths
-                self.sphere_fig.data[idx + 5].visible = show_paths
-                self.sphere_fig.data[idx + 6].visible = show_paths
-                self.sphere_fig.data[idx + 7].visible = show_vectors
-                self.sphere_fig.data[idx + 8].visible = show_vectors
-                self.sphere_fig.data[idx + 9].visible = show_vectors
-        finally:
-            self._in_frame_update = False
+        scene_state = self._compute_base_scene_state(
+            t=t,
+            params=params,
+            frame_name=frame_name,
+            show_paths=show_paths,
+            show_vectors=show_vectors,
+            traj_cache=self._traj_cache,
+            base_points=self._base_points_np if self._base_points_np is not None else np.zeros((0, 3), dtype=np.float64),
+            display_idx=self._display_indices,
+            inversion_enabled=bool(self._inversion_enabled),
+        )
+        self._apply_base_scene_state_to_widget(scene_state)
 
         self._last_path_frame = t
         self._last_overlay_frame = t
 
-        z_norm = float(np.linalg.norm(Z) / K)
-        w_norm = float(np.linalg.norm(w))
+        z_norm = float(np.linalg.norm(np.asarray(scene_state["Z_raw"], dtype=np.float64)) / max(float(params["K"]), 1e-9))
+        w_norm = float(np.linalg.norm(np.asarray(scene_state["w_raw"], dtype=np.float64)))
         def _metric_at(key: str) -> float:
             arr = self._metric_cache.get(key) if self._metric_cache else None
             if arr is None or len(arr) <= t:
@@ -3167,6 +3640,7 @@ class LMSBall3DWidget:
             f"<tr><td style='padding-right:14px'>Alignment force sign</td><td>{conformal_sign:+.0f}</td></tr>"
             f"<tr><td style='padding-right:14px'>Trajectory mode</td><td>{self._resolved_trajectory_mode}</td></tr>"
             f"<tr><td style='padding-right:14px'>Thermo mode</td><td>{self.thermo_mode}</td></tr>"
+            f"<tr><td style='padding-right:14px'>Center inversion</td><td>{self._current_center_estimation_mode()}</td></tr>"
             f"<tr><td style='padding-right:14px'>Initial state</td>"
             f"<td>{self._init_mode_label(self._init_state_mode)}</td></tr>"
             f"<tr><td style='padding-right:14px'>{self._primary_metric_title()}</td><td>{entropy_t:.5f}</td></tr>"
@@ -3200,6 +3674,12 @@ class LMSBall3DWidget:
         if self._updating or change.get("name") != "value":
             return
         self.layout_top_view.value = bool(change.get("new") == "top")
+
+    def _on_center_estimation_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self.center_estimation_mode = self._canonical_center_estimation_mode(str(change.get("new", "poisson_shrink")))
+        self._recompute(reset_frame=False)
 
     def _on_toggle_frame_clicked(self, _btn: widgets.Button) -> None:
         self.view_frame_dropdown.value = "body" if self.view_frame_dropdown.value == "lab" else "lab"
@@ -3358,12 +3838,14 @@ class LMSBall3DBackwardTwoSheetWidget(LMSBall3DWidget):
         *,
         outer_radius_display: float = 3.0,
         outer_radius_cap: float = 6.0,
+        outer_radius_log_transform: bool = True,
         display_points_cap: int | None = 1200,
         force_backward_time: bool = True,
         **kwargs: Any,
     ) -> None:
         self.outer_radius_display = float(max(1.2, outer_radius_display))
         self.outer_radius_cap = float(max(self.outer_radius_display, outer_radius_cap))
+        self.outer_radius_log_transform = bool(outer_radius_log_transform)
         self.force_backward_time = bool(force_backward_time)
         self._bar_start_idx = -1
         self._last_bar_path_frame = -10**9
@@ -3600,6 +4082,58 @@ class LMSBall3DBackwardTwoSheetWidget(LMSBall3DWidget):
         out = arr * s
         return out[0] if single else out
 
+    @staticmethod
+    def _radial_log_transform(
+        x: np.ndarray,
+        *,
+        target_radius: float,
+        reference_radius: float,
+        eps: float = 1e-12,
+    ) -> np.ndarray:
+        arr = np.asarray(x, dtype=np.float64)
+        single = arr.ndim == 1
+        if single:
+            arr = arr[None, :]
+        target = float(max(1.0, target_radius))
+        reference = float(max(1.0 + eps, reference_radius))
+        denom = math.log(reference)
+        if target <= 1.0 + eps or denom <= eps:
+            return arr[0] if single else arr
+
+        r = np.linalg.norm(arr, axis=1, keepdims=True)
+        r_safe = np.maximum(r, eps)
+        log_r = np.log(np.maximum(r_safe, 1.0))
+        mapped_r = 1.0 + (target - 1.0) * (log_r / denom)
+        scale = np.where(r > 1.0, mapped_r / r_safe, 1.0)
+        out = arr * scale
+        return out[0] if single else out
+
+    def _transform_outer_sheet_cache(self, raw_cache: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        if not self.outer_radius_log_transform:
+            return {
+                key: self._radial_cap(value, self.outer_radius_cap)
+                for key, value in raw_cache.items()
+            }
+
+        reference_radius = self.outer_radius_cap
+        for value in raw_cache.values():
+            arr = np.asarray(value, dtype=np.float64)
+            if arr.size <= 0:
+                continue
+            radii = np.linalg.norm(arr.reshape(-1, 3), axis=1)
+            finite = radii[np.isfinite(radii)]
+            if finite.size > 0:
+                reference_radius = max(reference_radius, float(np.max(finite)))
+
+        return {
+            key: self._radial_log_transform(
+                value,
+                target_radius=self.outer_radius_cap,
+                reference_radius=reference_radius,
+            )
+            for key, value in raw_cache.items()
+        }
+
     def _simulate(self, params: dict[str, float | int]):
         # Time-direction sign is controlled globally by the dedicated toggle button.
         return super()._simulate(params)
@@ -3620,28 +4154,14 @@ class LMSBall3DBackwardTwoSheetWidget(LMSBall3DWidget):
         Zhat_lab_series = np.asarray(self._traj_cache["Z_lab"], dtype=np.float64) / K
         Zhat_body_series = np.asarray(self._traj_cache["Z_body"], dtype=np.float64) / K
 
-        self._bar_cache = {
-            "w": self._radial_cap(
-                self._bar_sheet_map_rows(w_series, fallback_rows=w_series),
-                self.outer_radius_cap,
-            ),
-            "z_lab": self._radial_cap(
-                self._bar_sheet_map_rows(z_lab_series, fallback_rows=z_lab_series),
-                self.outer_radius_cap,
-            ),
-            "z_body": self._radial_cap(
-                self._bar_sheet_map_rows(z_body_series, fallback_rows=z_body_series),
-                self.outer_radius_cap,
-            ),
-            "Zhat_lab": self._radial_cap(
-                self._bar_sheet_map_rows(Zhat_lab_series, fallback_rows=Zhat_lab_series),
-                self.outer_radius_cap,
-            ),
-            "Zhat_body": self._radial_cap(
-                self._bar_sheet_map_rows(Zhat_body_series, fallback_rows=Zhat_body_series),
-                self.outer_radius_cap,
-            ),
+        raw_bar_cache = {
+            "w": self._bar_sheet_map_rows(w_series, fallback_rows=w_series),
+            "z_lab": self._bar_sheet_map_rows(z_lab_series, fallback_rows=z_lab_series),
+            "z_body": self._bar_sheet_map_rows(z_body_series, fallback_rows=z_body_series),
+            "Zhat_lab": self._bar_sheet_map_rows(Zhat_lab_series, fallback_rows=Zhat_lab_series),
+            "Zhat_body": self._bar_sheet_map_rows(Zhat_body_series, fallback_rows=Zhat_body_series),
         }
+        self._bar_cache = self._transform_outer_sheet_cache(raw_bar_cache)
         self._bar_paths_initialized = False
         self._bar_paths_frame_name = None
         self._bar_paths_inversion_on = None
@@ -3659,6 +4179,22 @@ class LMSBall3DBackwardTwoSheetWidget(LMSBall3DWidget):
                 "z_body": np.asarray(self._bar_cache["z_body"], dtype=np.float64).tolist(),
                 "Z_lab": np.asarray(self._bar_cache["Zhat_lab"], dtype=np.float64).tolist(),
                 "Z_body": np.asarray(self._bar_cache["Zhat_body"], dtype=np.float64).tolist(),
+            }
+        }
+
+    def _export_additional_media_bundle_fields(self, *, traj_cache: dict[str, np.ndarray]) -> dict[str, Any]:
+        _ = traj_cache
+        if self._bar_cache is None:
+            self._build_outer_sheet_cache()
+        if self._bar_cache is None:
+            return {}
+        return {
+            "bar_sheet": {
+                "w": np.asarray(self._bar_cache["w"], dtype=np.float64),
+                "z_lab": np.asarray(self._bar_cache["z_lab"], dtype=np.float64),
+                "z_body": np.asarray(self._bar_cache["z_body"], dtype=np.float64),
+                "Z_lab": np.asarray(self._bar_cache["Zhat_lab"], dtype=np.float64),
+                "Z_body": np.asarray(self._bar_cache["Zhat_body"], dtype=np.float64),
             }
         }
 
@@ -3683,6 +4219,72 @@ class LMSBall3DBackwardTwoSheetWidget(LMSBall3DWidget):
                 }
             )
         return roles
+
+    def _export_media_scene_state(
+        self,
+        *,
+        bundle: dict[str, Any],
+        t: int,
+        params: dict[str, float | int],
+        frame_name: Literal["lab", "body"],
+        show_paths: bool,
+        show_vectors: bool,
+        inversion_enabled: bool,
+    ) -> dict[str, Any]:
+        state = super()._export_media_scene_state(
+            bundle=bundle,
+            t=t,
+            params=params,
+            frame_name=frame_name,
+            show_paths=show_paths,
+            show_vectors=show_vectors,
+            inversion_enabled=inversion_enabled,
+        )
+        bar_sheet = bundle.get("bar_sheet")
+        if not isinstance(bar_sheet, dict):
+            return state
+
+        wbar_series = np.asarray(bar_sheet["w"], dtype=np.float64)
+        zbar_series = np.asarray(bar_sheet["z_body" if frame_name == "body" else "z_lab"], dtype=np.float64)
+        Zbar_series = np.asarray(bar_sheet["Z_body" if frame_name == "body" else "Z_lab"], dtype=np.float64)
+        frame_max = max(0, len(wbar_series) - 1)
+        t_clamped = max(0, min(int(t), frame_max))
+        inv_ctx = (
+            self._inversion_context_from_traj_cache(
+                {
+                    "w": np.asarray(bundle["w"], dtype=np.float64),
+                    "z_lab": np.asarray(bundle["z_lab"], dtype=np.float64),
+                    "z_body": np.asarray(bundle["z_body"], dtype=np.float64),
+                },
+                frame_name=frame_name,
+            )
+            if bool(inversion_enabled)
+            else None
+        )
+
+        wb = np.asarray(wbar_series[t_clamped], dtype=np.float64)
+        zb = np.asarray(zbar_series[t_clamped], dtype=np.float64)
+        Zb = np.asarray(Zbar_series[t_clamped], dtype=np.float64)
+        state["bar_w"] = self._maybe_invert_rows(wb, frame_name=frame_name, inv_ctx=inv_ctx)
+        state["bar_z"] = self._maybe_invert_rows(zb, frame_name=frame_name, inv_ctx=inv_ctx)
+        state["bar_Z"] = self._maybe_invert_rows(Zb, frame_name=frame_name, inv_ctx=inv_ctx)
+        if show_paths:
+            state["bar_w_path"] = self._maybe_invert_rows(wbar_series, frame_name=frame_name, inv_ctx=inv_ctx)
+            state["bar_z_path"] = self._maybe_invert_rows(zbar_series, frame_name=frame_name, inv_ctx=inv_ctx)
+            state["bar_Z_path"] = self._maybe_invert_rows(Zbar_series, frame_name=frame_name, inv_ctx=inv_ctx)
+        else:
+            state["bar_w_path"] = None
+            state["bar_z_path"] = None
+            state["bar_Z_path"] = None
+        if show_vectors:
+            state["bar_w_vector"] = np.vstack([np.zeros((1, 3), dtype=np.float64), np.asarray(state["bar_w"], dtype=np.float64).reshape(1, 3)])
+            state["bar_z_vector"] = np.vstack([np.zeros((1, 3), dtype=np.float64), np.asarray(state["bar_z"], dtype=np.float64).reshape(1, 3)])
+            state["bar_Z_vector"] = np.vstack([np.zeros((1, 3), dtype=np.float64), np.asarray(state["bar_Z"], dtype=np.float64).reshape(1, 3)])
+        else:
+            state["bar_w_vector"] = None
+            state["bar_z_vector"] = None
+            state["bar_Z_vector"] = None
+        return state
 
     def _recompute(self, *, reset_frame: bool) -> None:
         self._last_bar_path_frame = -10**9
@@ -4240,6 +4842,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
             "entropy_increase": bool(self.toggle_entropy.value),
             "time_backward": bool(self.toggle_time_direction.value),
             "w_mode": str(self.mode_dropdown.value),
+            "center_estimation_mode": str(self._current_center_estimation_mode()),
         }
 
     def _is_async_cancelled(self, seq: int) -> bool:
@@ -4323,6 +4926,12 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         self._sync_entropy_button_label()
         self._queue_async_recompute(reset_frame=False)
 
+    def _on_center_estimation_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self.center_estimation_mode = self._canonical_center_estimation_mode(str(change.get("new", "poisson_shrink")))
+        self._queue_async_recompute(reset_frame=False)
+
     def _on_recompute_clicked(self, _btn: widgets.Button) -> None:
         self._queue_async_recompute(reset_frame=False)
 
@@ -4396,7 +5005,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         weights = torch.ones(n, dtype=torch.float64) / float(n)
         center_dir = torch.tensor(_angles_to_unit(w_az, w_el), dtype=torch.float64)
         if mode == "poisson":
-            base_points = random_points_on_sphere(
+            base_seed_points = random_points_on_sphere(
                 n,
                 d=d,
                 generator=self._torch_gen,
@@ -4404,7 +5013,14 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
             )
             r0_clip = float(np.clip(r0, 0.0, 0.999999))
             # Keep sign convention consistent with optimized initializers.
-            w0 = -center_dir * r0_clip
+            target_w = -center_dir * r0_clip
+            w0, base_points, _ = self._reduced_state_from_poisson_cloud(
+                base_points=base_seed_points,
+                target_w=target_w,
+                weights=weights,
+                d=d,
+                fallback_dir=center_dir,
+            )
         else:
             x0_points = self._make_fast_initial_boundary_points(
                 n=n,
@@ -4414,15 +5030,16 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 target_r=float(r0),
                 init_state=mode,
             )
-            w0 = self._estimate_w_from_boundary_points(
+            target_w = self._target_w_from_radius(
+                target_r=float(r0),
+                target_dir=center_dir,
+            )
+            w0, base_points = self._reduced_state_from_boundary_points(
                 points=x0_points,
                 weights=weights,
                 d=d,
                 fallback_dir=center_dir,
-            )
-            base_points = self._recover_base_points_from_state(
-                x_points=x0_points,
-                w0=w0,
+                target_w=target_w,
             )
 
         zeta0 = torch.eye(d, dtype=torch.float64)
@@ -4584,6 +5201,10 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         }
 
     def _compute_hydro_job_result(self, *, job: dict[str, Any], seq: int) -> dict[str, Any]:
+        prev_center_mode = self._job_center_estimation_mode
+        self._job_center_estimation_mode = self._canonical_center_estimation_mode(
+            str(job.get("center_estimation_mode", "poisson_shrink"))
+        )
         params = dict(job["params"])
         entropy_increase = bool(job["entropy_increase"])
         time_backward = bool(job["time_backward"])
@@ -4597,81 +5218,84 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         def _cancel_check() -> bool:
             return self._is_async_cancelled(seq)
 
-        for mode in self._ensemble_modes:
-            if _cancel_check():
-                raise _HydroRecomputeCancelled("Hydro recompute cancelled before simulation.")
-            t0 = time.perf_counter()
-            traj = self._simulate_mode(
-                mode,
-                params,
-                entropy_increase=entropy_increase,
-                time_backward=time_backward,
-                w_mode=w_mode,
-                cancel_check=_cancel_check,
-            )
-            elapsed = float(time.perf_counter() - t0)
-            ensemble_runtime[mode] = elapsed
-            if _cancel_check():
-                raise _HydroRecomputeCancelled("Hydro recompute cancelled after simulation.")
+        try:
+            for mode in self._ensemble_modes:
+                if _cancel_check():
+                    raise _HydroRecomputeCancelled("Hydro recompute cancelled before simulation.")
+                t0 = time.perf_counter()
+                traj = self._simulate_mode(
+                    mode,
+                    params,
+                    entropy_increase=entropy_increase,
+                    time_backward=time_backward,
+                    w_mode=w_mode,
+                    cancel_check=_cancel_check,
+                )
+                elapsed = float(time.perf_counter() - t0)
+                ensemble_runtime[mode] = elapsed
+                if _cancel_check():
+                    raise _HydroRecomputeCancelled("Hydro recompute cancelled after simulation.")
 
-            base_points_np = np.ascontiguousarray(
-                np.asarray(traj.base_points.detach().cpu().numpy(), dtype=np.float32)
-            )
-            traj_cache = {
-                "w": np.ascontiguousarray(np.asarray(traj.w.detach().cpu().numpy(), dtype=np.float32)),
-                "zeta": np.ascontiguousarray(np.asarray(traj.zeta.detach().cpu().numpy(), dtype=np.float32)),
-                "z_lab": np.ascontiguousarray(np.asarray(traj.z.detach().cpu().numpy(), dtype=np.float32)),
-                "z_body": np.ascontiguousarray(np.asarray((-traj.w).detach().cpu().numpy(), dtype=np.float32)),
-                "Z_lab": np.ascontiguousarray(np.asarray(traj.Z.detach().cpu().numpy(), dtype=np.float32)),
-                "Z_body": np.ascontiguousarray(np.asarray(traj.Z_body.detach().cpu().numpy(), dtype=np.float32)),
+                base_points_np = np.ascontiguousarray(
+                    np.asarray(traj.base_points.detach().cpu().numpy(), dtype=np.float32)
+                )
+                traj_cache = {
+                    "w": np.ascontiguousarray(np.asarray(traj.w.detach().cpu().numpy(), dtype=np.float32)),
+                    "zeta": np.ascontiguousarray(np.asarray(traj.zeta.detach().cpu().numpy(), dtype=np.float32)),
+                    "z_lab": np.ascontiguousarray(np.asarray(traj.z.detach().cpu().numpy(), dtype=np.float32)),
+                    "z_body": np.ascontiguousarray(np.asarray((-traj.w).detach().cpu().numpy(), dtype=np.float32)),
+                    "Z_lab": np.ascontiguousarray(np.asarray(traj.Z.detach().cpu().numpy(), dtype=np.float32)),
+                    "Z_body": np.ascontiguousarray(np.asarray(traj.Z_body.detach().cpu().numpy(), dtype=np.float32)),
+                }
+                if traj.x_lab is not None:
+                    traj_cache["x_lab"] = np.ascontiguousarray(np.asarray(traj.x_lab.detach().cpu().numpy(), dtype=np.float32))
+                if traj.x_body is not None:
+                    traj_cache["x_body"] = np.ascontiguousarray(np.asarray(traj.x_body.detach().cpu().numpy(), dtype=np.float32))
+
+                n_points = int(base_points_np.shape[0])
+                if n_points <= self.display_points_cap:
+                    display_idx = np.arange(n_points, dtype=np.int32)
+                else:
+                    stride = max(1, int(math.ceil(n_points / float(self.display_points_cap))))
+                    display_idx = np.arange(0, n_points, stride, dtype=np.int32)[: self.display_points_cap]
+
+                metric_cap = min(n_points, max(2400, self.display_points_cap * 2))
+                metric_idx: np.ndarray | None
+                if n_points <= metric_cap:
+                    metric_idx = None
+                else:
+                    stride_m = max(1, int(math.ceil(n_points / float(metric_cap))))
+                    metric_idx = np.arange(0, n_points, stride_m, dtype=np.int32)[:metric_cap]
+
+                # Metrics are rotation-invariant scalars in this panel; compute once.
+                metrics_body = self._compute_mode_metrics(
+                    traj_cache=traj_cache,
+                    base_points=base_points_np,
+                    params=params,
+                    frame_name="body",
+                    sample_idx=metric_idx,
+                    time_backward=time_backward,
+                    cancel_check=_cancel_check,
+                )
+                metrics_lab = {k: np.asarray(v, dtype=np.float64).copy() for k, v in metrics_body.items()}
+
+                ensemble_state[mode] = {
+                    "traj": traj_cache,
+                    "base_points": base_points_np,
+                    "display_idx": display_idx,
+                }
+                ensemble_metrics[mode] = {"lab": metrics_lab, "body": metrics_body}
+                del traj
+
+            return {
+                "params": params,
+                "steps": steps,
+                "ensemble_state": ensemble_state,
+                "ensemble_metrics": ensemble_metrics,
+                "ensemble_runtime": ensemble_runtime,
             }
-            if traj.x_lab is not None:
-                traj_cache["x_lab"] = np.ascontiguousarray(np.asarray(traj.x_lab.detach().cpu().numpy(), dtype=np.float32))
-            if traj.x_body is not None:
-                traj_cache["x_body"] = np.ascontiguousarray(np.asarray(traj.x_body.detach().cpu().numpy(), dtype=np.float32))
-
-            n_points = int(base_points_np.shape[0])
-            if n_points <= self.display_points_cap:
-                display_idx = np.arange(n_points, dtype=np.int32)
-            else:
-                stride = max(1, int(math.ceil(n_points / float(self.display_points_cap))))
-                display_idx = np.arange(0, n_points, stride, dtype=np.int32)[: self.display_points_cap]
-
-            metric_cap = min(n_points, max(2400, self.display_points_cap * 2))
-            metric_idx: np.ndarray | None
-            if n_points <= metric_cap:
-                metric_idx = None
-            else:
-                stride_m = max(1, int(math.ceil(n_points / float(metric_cap))))
-                metric_idx = np.arange(0, n_points, stride_m, dtype=np.int32)[:metric_cap]
-
-            # Metrics are rotation-invariant scalars in this panel; compute once.
-            metrics_body = self._compute_mode_metrics(
-                traj_cache=traj_cache,
-                base_points=base_points_np,
-                params=params,
-                frame_name="body",
-                sample_idx=metric_idx,
-                time_backward=time_backward,
-                cancel_check=_cancel_check,
-            )
-            metrics_lab = {k: np.asarray(v, dtype=np.float64).copy() for k, v in metrics_body.items()}
-
-            ensemble_state[mode] = {
-                "traj": traj_cache,
-                "base_points": base_points_np,
-                "display_idx": display_idx,
-            }
-            ensemble_metrics[mode] = {"lab": metrics_lab, "body": metrics_body}
-            del traj
-
-        return {
-            "params": params,
-            "steps": steps,
-            "ensemble_state": ensemble_state,
-            "ensemble_metrics": ensemble_metrics,
-            "ensemble_runtime": ensemble_runtime,
-        }
+        finally:
+            self._job_center_estimation_mode = prev_center_mode
 
     def _apply_hydro_job_result(self, *, job: dict[str, Any], result: dict[str, Any], seq: int) -> None:
         if self._is_async_cancelled(seq):
@@ -4832,91 +5456,22 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
             return
         params = self._params_cache if self._params_cache else self._params()
         t = max(0, min(t, self._steps))
-
-        frame_name: Literal["lab", "body"] = "body" if self.view_frame_dropdown.value == "body" else "lab"
-        x_series, z_series, Z_series = self._frame_arrays()
-        x = self._points_at_frame(t, x_series, frame_name=frame_name)
-        if self._display_indices is not None and len(self._display_indices) < x.shape[0]:
-            x_plot = x[self._display_indices]
-        else:
-            x_plot = x
-
-        w = self._traj_cache["w"][t]
-        z = z_series[t]
-        Z = Z_series[t]
-        K = max(float(params["K"]), 1e-9)
-        Z_hat = Z / K
-        inv_ctx = self._inversion_context(frame_name=frame_name) if bool(self._inversion_enabled) else None
-        x_plot_disp = self._maybe_invert_rows(x_plot, frame_name=frame_name, inv_ctx=inv_ctx)
-        w_disp = self._maybe_invert_rows(w, frame_name=frame_name, inv_ctx=inv_ctx)
-        z_disp = self._maybe_invert_rows(z, frame_name=frame_name, inv_ctx=inv_ctx)
-        Z_hat_disp = self._maybe_invert_rows(Z_hat, frame_name=frame_name, inv_ctx=inv_ctx)
-
+        frame_name: Literal["lab", "body"] = self._coerce_frame_name(self.view_frame_dropdown.value)
         show_paths = bool(self.show_paths.value)
         show_vectors = bool(self.show_vectors.value)
         force_update = (t == 0) or (t == self._steps)
-
-        idx = self._wire_count
-        self._in_frame_update = True
-        try:
-            with self.sphere_fig.batch_update():
-                self.sphere_fig.data[idx + 0].x = x_plot_disp[:, 0].tolist()
-                self.sphere_fig.data[idx + 0].y = x_plot_disp[:, 1].tolist()
-                self.sphere_fig.data[idx + 0].z = x_plot_disp[:, 2].tolist()
-
-                self.sphere_fig.data[idx + 1].x = [float(w_disp[0])]
-                self.sphere_fig.data[idx + 1].y = [float(w_disp[1])]
-                self.sphere_fig.data[idx + 1].z = [float(w_disp[2])]
-
-                self.sphere_fig.data[idx + 2].x = [float(z_disp[0])]
-                self.sphere_fig.data[idx + 2].y = [float(z_disp[1])]
-                self.sphere_fig.data[idx + 2].z = [float(z_disp[2])]
-
-                self.sphere_fig.data[idx + 3].x = [float(Z_hat_disp[0])]
-                self.sphere_fig.data[idx + 3].y = [float(Z_hat_disp[1])]
-                self.sphere_fig.data[idx + 3].z = [float(Z_hat_disp[2])]
-
-                if show_paths:
-                    wp = self._traj_cache["w"][: t + 1]
-                    zp = z_series[: t + 1]
-                    Zp = Z_series[: t + 1] / K
-
-                    wp_disp = self._maybe_invert_rows(wp, frame_name=frame_name, inv_ctx=inv_ctx)
-                    zp_disp = self._maybe_invert_rows(zp, frame_name=frame_name, inv_ctx=inv_ctx)
-                    Zp_disp = self._maybe_invert_rows(Zp, frame_name=frame_name, inv_ctx=inv_ctx)
-
-                    self.sphere_fig.data[idx + 4].x = wp_disp[:, 0].tolist()
-                    self.sphere_fig.data[idx + 4].y = wp_disp[:, 1].tolist()
-                    self.sphere_fig.data[idx + 4].z = wp_disp[:, 2].tolist()
-
-                    self.sphere_fig.data[idx + 5].x = zp_disp[:, 0].tolist()
-                    self.sphere_fig.data[idx + 5].y = zp_disp[:, 1].tolist()
-                    self.sphere_fig.data[idx + 5].z = zp_disp[:, 2].tolist()
-
-                    self.sphere_fig.data[idx + 6].x = Zp_disp[:, 0].tolist()
-                    self.sphere_fig.data[idx + 6].y = Zp_disp[:, 1].tolist()
-                    self.sphere_fig.data[idx + 6].z = Zp_disp[:, 2].tolist()
-
-                self.sphere_fig.data[idx + 7].x = [0.0, float(w_disp[0])]
-                self.sphere_fig.data[idx + 7].y = [0.0, float(w_disp[1])]
-                self.sphere_fig.data[idx + 7].z = [0.0, float(w_disp[2])]
-
-                self.sphere_fig.data[idx + 8].x = [0.0, float(z_disp[0])]
-                self.sphere_fig.data[idx + 8].y = [0.0, float(z_disp[1])]
-                self.sphere_fig.data[idx + 8].z = [0.0, float(z_disp[2])]
-
-                self.sphere_fig.data[idx + 9].x = [0.0, float(Z_hat_disp[0])]
-                self.sphere_fig.data[idx + 9].y = [0.0, float(Z_hat_disp[1])]
-                self.sphere_fig.data[idx + 9].z = [0.0, float(Z_hat_disp[2])]
-
-                self.sphere_fig.data[idx + 4].visible = show_paths
-                self.sphere_fig.data[idx + 5].visible = show_paths
-                self.sphere_fig.data[idx + 6].visible = show_paths
-                self.sphere_fig.data[idx + 7].visible = show_vectors
-                self.sphere_fig.data[idx + 8].visible = show_vectors
-                self.sphere_fig.data[idx + 9].visible = show_vectors
-        finally:
-            self._in_frame_update = False
+        scene_state = self._compute_base_scene_state(
+            t=t,
+            params=params,
+            frame_name=frame_name,
+            show_paths=show_paths,
+            show_vectors=show_vectors,
+            traj_cache=self._traj_cache,
+            base_points=self._base_points_np if self._base_points_np is not None else np.zeros((0, 3), dtype=np.float64),
+            display_idx=self._display_indices,
+            inversion_enabled=bool(self._inversion_enabled),
+        )
+        self._apply_base_scene_state_to_widget(scene_state)
 
         self._last_path_frame = t
         self._last_overlay_frame = t
@@ -4928,8 +5483,8 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 return 0.0
             return float(arr[t])
 
-        z_norm = float(np.linalg.norm(Z) / K)
-        w_norm = float(np.linalg.norm(w))
+        z_norm = float(np.linalg.norm(np.asarray(scene_state["Z_raw"], dtype=np.float64)) / max(float(params["K"]), 1e-9))
+        w_norm = float(np.linalg.norm(np.asarray(scene_state["w_raw"], dtype=np.float64)))
         entropy_t = _metric_at("entropy")
         entropy_rate_t = _metric_at("entropy_rate")
         var_total_t = _metric_at("var_total")
@@ -5318,6 +5873,7 @@ class _LMSEntropyShellMixin:
         )
 
         self.mode_dropdown.layout = widgets.Layout(width="220px")
+        self.center_estimation_dropdown.layout = widgets.Layout(width="260px")
         self.layout_dropdown.layout = widgets.Layout(width="360px")
         self.btn_recompute.description = "Recompute all energy states" if hasattr(self, "_ensemble_modes") else "Recompute state"
         self._sync_entropy_button_label()
@@ -5364,7 +5920,13 @@ class _LMSEntropyShellMixin:
         ]
         children.append(
             widgets.HBox(
-                [self.mode_dropdown, self.entropy_coordinate_dropdown, self.layout_dropdown],
+                [self.mode_dropdown, self.center_estimation_dropdown],
+                layout=widgets.Layout(width=self._control_width, justify_content="space-between"),
+            )
+        )
+        children.append(
+            widgets.HBox(
+                [self.entropy_coordinate_dropdown, self.layout_dropdown],
                 layout=widgets.Layout(width=self._control_width, justify_content="space-between"),
             )
         )
@@ -5579,8 +6141,15 @@ class _LMSEntropyShellMixin:
                 target_entropy=float(target_entropy),
             )
         w_poisson = -axis * float(np.clip(r_refined, 0.0, 0.9995))
-        x_poisson = normalize(mobius_sphere(base_points, w_poisson))
-        return base_points, w_poisson, x_poisson
+        weights = torch.ones(n, dtype=torch.float64) / float(n)
+        w0, reduced_base, x_poisson = self._reduced_state_from_poisson_cloud(
+            base_points=base_points,
+            target_w=w_poisson,
+            weights=weights,
+            d=3,
+            fallback_dir=axis,
+        )
+        return reduced_base, w0, x_poisson
 
     def _refine_poisson_radius_for_sample(
         self,
@@ -5959,6 +6528,7 @@ class _LMSEntropyShellMixin:
         return "".join(
             [
                 f"<tr><td style='padding-right:14px'>Initialization constraint</td><td>{constraint_label}</td></tr>",
+                f"<tr><td style='padding-right:14px'>Center inversion</td><td>{self._current_center_estimation_mode()}</td></tr>",
                 target_row,
                 f"<tr><td style='padding-right:14px'>Poisson radius</td><td>{float(target['r_poisson']):.5f}</td></tr>",
                 f"<tr><td style='padding-right:14px'>Current energy</td><td>{energy_now:.5f}</td></tr>",
@@ -6117,6 +6687,7 @@ class LMSBall3DEntropyShellTwoSheetWidget(_LMSEntropyShellMixin, LMSBall3DBackwa
         entropy_coordinate_mode: EntropyCoordinateMode = "kernel",
         title: str = "LMS entropy-shell two-sheet dynamics on S² / B³",
         force_backward_time: bool = False,
+        outer_radius_log_transform: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -6124,6 +6695,7 @@ class LMSBall3DEntropyShellTwoSheetWidget(_LMSEntropyShellMixin, LMSBall3DBackwa
             entropy_coordinate_mode=entropy_coordinate_mode,
             title=title,
             force_backward_time=False,
+            outer_radius_log_transform=outer_radius_log_transform,
             **kwargs,
         )
         # Base/backward stats panel writes generic content; entropy-shell subclass

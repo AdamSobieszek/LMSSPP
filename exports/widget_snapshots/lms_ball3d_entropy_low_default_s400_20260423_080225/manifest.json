@@ -1,0 +1,66 @@
+{
+  "items": [
+    {
+      "src": "20260423_080225_scene.webm",
+      "label": "Scene 20260423_080225",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_ball3d",
+        "params": {
+          "r0": 0.9715,
+          "N": 450,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 400
+        },
+        "init_state_mode": "entropy_low",
+        "init_state_label": "Low Entropy"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260423_080225_metrics.png",
+          "kind": "image"
+        }
+      ]
+    },
+    {
+      "src": "20260423_081906_scene.webm",
+      "label": "Scene 20260423_081906",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_ball3d",
+        "params": {
+          "r0": 0.9715,
+          "N": 450,
+          "K": 1.0,
+          "omega": 3.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 400
+        },
+        "init_state_mode": "entropy_low",
+        "init_state_label": "Low Entropy"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260423_081906_metrics.png",
+          "kind": "image"
+        }
+      ]
+    }
+  ],
+  "title": "Reduced LMS dynamics on S² (points) / B³ (order parameters)",
+  "description": "LMS widget trajectory media exports"
+}

@@ -106,7 +106,7 @@ def _angles_to_unit_nd(az: float, el: float, fourth: float, d: int) -> np.ndarra
 class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
     """Entropy-shell LMS widget in B^d (d>=4) with dipole inversion charts."""
 
-    _DIPOLE_CENTER_SHIFT = 2.0
+    _DIPOLE_CAMERA_EYE = {"x": 0.0, "y": 4.2, "z": 0.2}
 
     def __init__(
         self,
@@ -127,6 +127,17 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
             entropy_coordinate_mode=entropy_coordinate_mode,
             **kwargs,
         )
+        self._default_camera_eye = dict(self._DIPOLE_CAMERA_EYE)
+        camera = {
+            "eye": dict(self._default_camera_eye),
+            "up": {"x": 0.0, "y": 0.0, "z": 1.0},
+            "center": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "projection": {"type": "orthographic"},
+        }
+        self._ignore_camera_pause_until = time.monotonic() + 0.20
+        self.sphere_fig.layout.scene.camera = camera
+        self.sphere_fig.layout.scene2.camera = camera
+        self._camera_cache = self._camera_to_json()
         self._inversion_enabled = True
         self._apply_projection_visual_mode()
         self._render_frame(int(self.frame_slider.value))
@@ -321,6 +332,16 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
         self.metrics_fig.data[5].name = "proj-y"
         self.metrics_fig.data[6].name = "proj-z"
         self.sphere_fig.layout.title = f"{self.title} (dual inversion charts)"
+        self.sphere_fig.update_layout(
+            scene=dict(
+                aspectmode="cube",
+                domain=dict(x=[0.0, 0.48], y=[0.0, 1.0]),
+            ),
+            scene2=dict(
+                aspectmode="cube",
+                domain=dict(x=[0.52, 1.0], y=[0.0, 1.0]),
+            )
+        )
         self._secondary_trace_start_idx = len(self.sphere_fig.data)
         self._center_trace_start_idx = self._secondary_trace_start_idx + 10
 
@@ -334,6 +355,7 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 marker=dict(size=secondary_point, color="darkorange"),
                 name="xᵢ(t) antipode",
                 showlegend=True,
+                scene="scene2",
             ),
             go.Scatter3d(
                 x=[],
@@ -343,6 +365,7 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 marker=dict(size=secondary_point + 2, color="purple", symbol="x"),
                 name="w(t) antipode",
                 showlegend=True,
+                scene="scene2",
             ),
             go.Scatter3d(
                 x=[],
@@ -352,6 +375,7 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 marker=dict(size=secondary_point + 1, color="lightyellow", line=dict(color="purple", width=2)),
                 name="z(t) antipode",
                 showlegend=True,
+                scene="scene2",
             ),
             go.Scatter3d(
                 x=[],
@@ -361,6 +385,7 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 marker=dict(size=secondary_point + 1, color="crimson"),
                 name="Z/K antipode",
                 showlegend=True,
+                scene="scene2",
             ),
             go.Scatter3d(
                 x=[],
@@ -370,6 +395,7 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 line=dict(color="purple", width=2, dash="dot"),
                 name="w path antipode",
                 showlegend=False,
+                scene="scene2",
             ),
             go.Scatter3d(
                 x=[],
@@ -379,6 +405,7 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 line=dict(color="darkgoldenrod", width=2, dash="dot"),
                 name="z path antipode",
                 showlegend=False,
+                scene="scene2",
             ),
             go.Scatter3d(
                 x=[],
@@ -388,6 +415,7 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 line=dict(color="crimson", width=2, dash="dot"),
                 name="Z/K path antipode",
                 showlegend=False,
+                scene="scene2",
             ),
             go.Scatter3d(
                 x=[],
@@ -397,6 +425,7 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 line=dict(color="purple", width=3),
                 name="w vector antipode",
                 showlegend=False,
+                scene="scene2",
             ),
             go.Scatter3d(
                 x=[],
@@ -406,6 +435,7 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 line=dict(color="darkgoldenrod", width=3),
                 name="z vector antipode",
                 showlegend=False,
+                scene="scene2",
             ),
             go.Scatter3d(
                 x=[],
@@ -415,30 +445,28 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 line=dict(color="crimson", width=3),
                 name="Z/K vector antipode",
                 showlegend=False,
+                scene="scene2",
             ),
             go.Scatter3d(
-                x=[-self._DIPOLE_CENTER_SHIFT],
+                x=[0.0],
                 y=[0.0],
                 z=[0.0],
-                mode="markers+text",
-                marker=dict(size=7, color="black", symbol="diamond"),
-                text=["primary center"],
-                textposition="top center",
+                mode="markers",
+                marker=dict(size=10, color="black", symbol="diamond"),
                 name="primary center",
                 showlegend=False,
                 hoverinfo="skip",
             ),
             go.Scatter3d(
-                x=[self._DIPOLE_CENTER_SHIFT],
+                x=[0.0],
                 y=[0.0],
                 z=[0.0],
-                mode="markers+text",
-                marker=dict(size=7, color="purple", symbol="diamond"),
-                text=["antipode center"],
-                textposition="top center",
+                mode="markers",
+                marker=dict(size=10, color="purple", symbol="diamond"),
                 name="antipode center",
                 showlegend=False,
                 hoverinfo="skip",
+                scene="scene2",
             ),
         )
         for tr in secondary_specs:
@@ -471,8 +499,8 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
         stats_w = 230
         panel_w = max(980, metrics_w + stats_w + 20)
         if bool(self.layout_top_view.value):
-            self.sphere_fig.update_layout(width=1320, height=640)
-            layout_w = max(1340, panel_w)
+            self.sphere_fig.update_layout(width=1520, height=660)
+            layout_w = max(1540, panel_w)
             self.bottom_panel.layout.width = f"{layout_w}px"
             self.layout.children = (self.sphere_fig, self.bottom_panel)
             self.layout.layout = widgets.Layout(
@@ -482,7 +510,7 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 width=f"{layout_w}px",
             )
         else:
-            self.sphere_fig.update_layout(width=980, height=760)
+            self.sphere_fig.update_layout(width=1240, height=760)
             self.bottom_panel.layout.width = f"{panel_w}px"
             self.layout.children = (self.sphere_fig, self.bottom_panel)
             self.layout.layout = widgets.Layout(
@@ -497,6 +525,7 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
             scaled_cam = self._scale_camera_eye(cam, new_plot_height / old_plot_height)
             self._ignore_camera_pause_until = time.monotonic() + 0.20
             self.sphere_fig.layout.scene.camera = scaled_cam
+            self.sphere_fig.layout.scene2.camera = scaled_cam
             self._camera_cache = scaled_cam
         self._sync_mode_button_labels()
 
@@ -569,6 +598,29 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
         out[0] = 1.0
         return out
 
+    def _majority_cluster_direction_from_traj_cache(
+        self,
+        traj_cache: dict[str, np.ndarray],
+        *,
+        frame_name: Literal["lab", "body"],
+    ) -> np.ndarray:
+        d = int(self.ambient_dim)
+        z_key = "z_body" if frame_name == "body" else "z_lab"
+        z_series = traj_cache.get(z_key)
+        if z_series is not None and len(z_series) > 0:
+            z_last = np.asarray(z_series[-1], dtype=np.float64).reshape(-1)
+            if z_last.shape[0] == d and float(np.linalg.norm(z_last)) > 1e-12:
+                return self._safe_unit(z_last, d=d)
+
+        w_series = traj_cache.get("w")
+        if w_series is not None and len(w_series) > 0:
+            w_last = np.asarray(w_series[-1], dtype=np.float64).reshape(-1)
+            if w_last.shape[0] == d and float(np.linalg.norm(w_last)) > 1e-12:
+                return self._safe_unit(-w_last, d=d)
+        out = np.zeros((d,), dtype=np.float64)
+        out[0] = 1.0
+        return out
+
     def _inversion_context_pair(
         self,
         *,
@@ -582,8 +634,31 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
         ctx_secondary = (pole_secondary, self._orthonormal_tangent_basis(pole_secondary), cap)
         return ctx_primary, ctx_secondary
 
+    def _inversion_context_pair_from_traj_cache(
+        self,
+        traj_cache: dict[str, np.ndarray],
+        *,
+        frame_name: Literal["lab", "body"],
+    ) -> tuple[tuple[np.ndarray, np.ndarray, float], tuple[np.ndarray, np.ndarray, float]]:
+        cluster = self._majority_cluster_direction_from_traj_cache(traj_cache, frame_name=frame_name)
+        cap = float(self._scene_radius_inversion())
+        pole_primary = -cluster
+        pole_secondary = cluster
+        ctx_primary = (pole_primary, self._orthonormal_tangent_basis(pole_primary), cap)
+        ctx_secondary = (pole_secondary, self._orthonormal_tangent_basis(pole_secondary), cap)
+        return ctx_primary, ctx_secondary
+
     def _inversion_context(self, *, frame_name: Literal["lab", "body"]) -> tuple[np.ndarray, np.ndarray, float]:
         primary, _ = self._inversion_context_pair(frame_name=frame_name)
+        return primary
+
+    def _inversion_context_from_traj_cache(
+        self,
+        traj_cache: dict[str, np.ndarray],
+        *,
+        frame_name: Literal["lab", "body"],
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        primary, _ = self._inversion_context_pair_from_traj_cache(traj_cache, frame_name=frame_name)
         return primary
 
     def _secondary_inversion_context(
@@ -649,21 +724,22 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
     def _scene_radius_inversion(self) -> float:
         return 8.0
 
-    def _dipole_center_offsets(self) -> tuple[np.ndarray, np.ndarray]:
-        shift = float(self._DIPOLE_CENTER_SHIFT)
-        return (
-            np.array([-shift, 0.0, 0.0], dtype=np.float64),
-            np.array([shift, 0.0, 0.0], dtype=np.float64),
-        )
-
     def _apply_scene_range(self) -> None:
         r = float(self._scene_radius_inversion())
-        shift = float(self._DIPOLE_CENTER_SHIFT)
         self.sphere_fig.update_layout(
             scene=dict(
-                xaxis=dict(visible=False, autorange=False, range=[-r - shift - 0.5, r + shift + 0.5]),
+                aspectmode="cube",
+                xaxis=dict(visible=False, autorange=False, range=[-r, r]),
                 yaxis=dict(visible=False, autorange=False, range=[-r, r]),
                 zaxis=dict(visible=False, autorange=False, range=[-r, r]),
+                domain=dict(x=[0.0, 0.48], y=[0.0, 1.0]),
+            ),
+            scene2=dict(
+                aspectmode="cube",
+                xaxis=dict(visible=False, autorange=False, range=[-r, r]),
+                yaxis=dict(visible=False, autorange=False, range=[-r, r]),
+                zaxis=dict(visible=False, autorange=False, range=[-r, r]),
+                domain=dict(x=[0.52, 1.0], y=[0.0, 1.0]),
             )
         )
 
@@ -868,19 +944,15 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
 
         inv_ctx_primary = self._inversion_context(frame_name=frame_name)
         inv_ctx_secondary = self._secondary_inversion_context(frame_name=frame_name)
-        center_primary, center_secondary = self._dipole_center_offsets()
+        x_plot_primary = self._maybe_invert_rows(x_plot, frame_name=frame_name, inv_ctx=inv_ctx_primary)
+        w_primary = self._maybe_invert_rows(w, frame_name=frame_name, inv_ctx=inv_ctx_primary)
+        z_primary = self._maybe_invert_rows(z, frame_name=frame_name, inv_ctx=inv_ctx_primary)
+        Z_hat_primary = self._maybe_invert_rows(Z_hat, frame_name=frame_name, inv_ctx=inv_ctx_primary)
 
-        x_plot_primary = self._maybe_invert_rows(x_plot, frame_name=frame_name, inv_ctx=inv_ctx_primary) + center_primary
-        w_primary = self._maybe_invert_rows(w, frame_name=frame_name, inv_ctx=inv_ctx_primary) + center_primary
-        z_primary = self._maybe_invert_rows(z, frame_name=frame_name, inv_ctx=inv_ctx_primary) + center_primary
-        Z_hat_primary = self._maybe_invert_rows(Z_hat, frame_name=frame_name, inv_ctx=inv_ctx_primary) + center_primary
-
-        x_plot_secondary = self._maybe_invert_rows(x_plot, frame_name=frame_name, inv_ctx=inv_ctx_secondary) + center_secondary
-        w_secondary = self._maybe_invert_rows(w, frame_name=frame_name, inv_ctx=inv_ctx_secondary) + center_secondary
-        z_secondary = self._maybe_invert_rows(z, frame_name=frame_name, inv_ctx=inv_ctx_secondary) + center_secondary
-        Z_hat_secondary = (
-            self._maybe_invert_rows(Z_hat, frame_name=frame_name, inv_ctx=inv_ctx_secondary) + center_secondary
-        )
+        x_plot_secondary = self._maybe_invert_rows(x_plot, frame_name=frame_name, inv_ctx=inv_ctx_secondary)
+        w_secondary = self._maybe_invert_rows(w, frame_name=frame_name, inv_ctx=inv_ctx_secondary)
+        z_secondary = self._maybe_invert_rows(z, frame_name=frame_name, inv_ctx=inv_ctx_secondary)
+        Z_hat_secondary = self._maybe_invert_rows(Z_hat, frame_name=frame_name, inv_ctx=inv_ctx_secondary)
 
         show_paths = bool(self.show_paths.value)
         show_vectors = bool(self.show_vectors.value)
@@ -936,19 +1008,13 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                     zp = z_series[: t + 1]
                     Zp = Z_series[: t + 1] / K
 
-                wp_primary = self._maybe_invert_rows(wp, frame_name=frame_name, inv_ctx=inv_ctx_primary) + center_primary
-                zp_primary = self._maybe_invert_rows(zp, frame_name=frame_name, inv_ctx=inv_ctx_primary) + center_primary
-                Zp_primary = self._maybe_invert_rows(Zp, frame_name=frame_name, inv_ctx=inv_ctx_primary) + center_primary
+                wp_primary = self._maybe_invert_rows(wp, frame_name=frame_name, inv_ctx=inv_ctx_primary)
+                zp_primary = self._maybe_invert_rows(zp, frame_name=frame_name, inv_ctx=inv_ctx_primary)
+                Zp_primary = self._maybe_invert_rows(Zp, frame_name=frame_name, inv_ctx=inv_ctx_primary)
 
-                wp_secondary = (
-                    self._maybe_invert_rows(wp, frame_name=frame_name, inv_ctx=inv_ctx_secondary) + center_secondary
-                )
-                zp_secondary = (
-                    self._maybe_invert_rows(zp, frame_name=frame_name, inv_ctx=inv_ctx_secondary) + center_secondary
-                )
-                Zp_secondary = (
-                    self._maybe_invert_rows(Zp, frame_name=frame_name, inv_ctx=inv_ctx_secondary) + center_secondary
-                )
+                wp_secondary = self._maybe_invert_rows(wp, frame_name=frame_name, inv_ctx=inv_ctx_secondary)
+                zp_secondary = self._maybe_invert_rows(zp, frame_name=frame_name, inv_ctx=inv_ctx_secondary)
+                Zp_secondary = self._maybe_invert_rows(Zp, frame_name=frame_name, inv_ctx=inv_ctx_secondary)
 
                 self.sphere_fig.data[idx0 + 4].x = wp_primary[:, 0].tolist()
                 self.sphere_fig.data[idx0 + 4].y = wp_primary[:, 1].tolist()
@@ -974,29 +1040,29 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 self.sphere_fig.data[idx1 + 6].y = Zp_secondary[:, 1].tolist()
                 self.sphere_fig.data[idx1 + 6].z = Zp_secondary[:, 2].tolist()
 
-            self.sphere_fig.data[idx0 + 7].x = [float(center_primary[0]), float(w_primary[0])]
-            self.sphere_fig.data[idx0 + 7].y = [float(center_primary[1]), float(w_primary[1])]
-            self.sphere_fig.data[idx0 + 7].z = [float(center_primary[2]), float(w_primary[2])]
+            self.sphere_fig.data[idx0 + 7].x = [0.0, float(w_primary[0])]
+            self.sphere_fig.data[idx0 + 7].y = [0.0, float(w_primary[1])]
+            self.sphere_fig.data[idx0 + 7].z = [0.0, float(w_primary[2])]
 
-            self.sphere_fig.data[idx0 + 8].x = [float(center_primary[0]), float(z_primary[0])]
-            self.sphere_fig.data[idx0 + 8].y = [float(center_primary[1]), float(z_primary[1])]
-            self.sphere_fig.data[idx0 + 8].z = [float(center_primary[2]), float(z_primary[2])]
+            self.sphere_fig.data[idx0 + 8].x = [0.0, float(z_primary[0])]
+            self.sphere_fig.data[idx0 + 8].y = [0.0, float(z_primary[1])]
+            self.sphere_fig.data[idx0 + 8].z = [0.0, float(z_primary[2])]
 
-            self.sphere_fig.data[idx0 + 9].x = [float(center_primary[0]), float(Z_hat_primary[0])]
-            self.sphere_fig.data[idx0 + 9].y = [float(center_primary[1]), float(Z_hat_primary[1])]
-            self.sphere_fig.data[idx0 + 9].z = [float(center_primary[2]), float(Z_hat_primary[2])]
+            self.sphere_fig.data[idx0 + 9].x = [0.0, float(Z_hat_primary[0])]
+            self.sphere_fig.data[idx0 + 9].y = [0.0, float(Z_hat_primary[1])]
+            self.sphere_fig.data[idx0 + 9].z = [0.0, float(Z_hat_primary[2])]
 
-            self.sphere_fig.data[idx1 + 7].x = [float(center_secondary[0]), float(w_secondary[0])]
-            self.sphere_fig.data[idx1 + 7].y = [float(center_secondary[1]), float(w_secondary[1])]
-            self.sphere_fig.data[idx1 + 7].z = [float(center_secondary[2]), float(w_secondary[2])]
+            self.sphere_fig.data[idx1 + 7].x = [0.0, float(w_secondary[0])]
+            self.sphere_fig.data[idx1 + 7].y = [0.0, float(w_secondary[1])]
+            self.sphere_fig.data[idx1 + 7].z = [0.0, float(w_secondary[2])]
 
-            self.sphere_fig.data[idx1 + 8].x = [float(center_secondary[0]), float(z_secondary[0])]
-            self.sphere_fig.data[idx1 + 8].y = [float(center_secondary[1]), float(z_secondary[1])]
-            self.sphere_fig.data[idx1 + 8].z = [float(center_secondary[2]), float(z_secondary[2])]
+            self.sphere_fig.data[idx1 + 8].x = [0.0, float(z_secondary[0])]
+            self.sphere_fig.data[idx1 + 8].y = [0.0, float(z_secondary[1])]
+            self.sphere_fig.data[idx1 + 8].z = [0.0, float(z_secondary[2])]
 
-            self.sphere_fig.data[idx1 + 9].x = [float(center_secondary[0]), float(Z_hat_secondary[0])]
-            self.sphere_fig.data[idx1 + 9].y = [float(center_secondary[1]), float(Z_hat_secondary[1])]
-            self.sphere_fig.data[idx1 + 9].z = [float(center_secondary[2]), float(Z_hat_secondary[2])]
+            self.sphere_fig.data[idx1 + 9].x = [0.0, float(Z_hat_secondary[0])]
+            self.sphere_fig.data[idx1 + 9].y = [0.0, float(Z_hat_secondary[1])]
+            self.sphere_fig.data[idx1 + 9].z = [0.0, float(Z_hat_secondary[2])]
 
             for base in (idx0, idx1):
                 self.sphere_fig.data[base + 4].visible = show_paths
@@ -1008,6 +1074,21 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
 
         if path_update:
             self._dual_last_path_frame = t
+
+    def _apply_base_scene_state_to_widget(self, state: dict[str, Any]) -> None:
+        # LMSBall4DWidget renders its shared dual-chart scene in
+        # `_update_dipole_projection_frame`; suppress the base single-scene draw
+        # to avoid origin-to-offset flicker during playback.
+        _ = state
+        return None
+
+    def _on_camera_changed(self, _obj: Any, camera: Any) -> None:
+        super()._on_camera_changed(_obj, camera)
+        cam_json = self._camera_to_json()
+        if cam_json is None:
+            return
+        self._ignore_camera_pause_until = time.monotonic() + 0.20
+        self.sphere_fig.layout.scene2.camera = cam_json
 
     def _render_frame(self, t: int) -> None:
         super()._render_frame(t)
@@ -1150,8 +1231,15 @@ class LMSBall4DWidget(_LMSEntropyShellMixin, LMSBall3DWidget):
                 target_entropy=float(target_entropy),
             )
         w_poisson = -axis * float(np.clip(r_refined, 0.0, 0.9995))
-        x_poisson = normalize(mobius_sphere(base_points, w_poisson))
-        return base_points, w_poisson, x_poisson
+        weights = torch.ones(n, dtype=torch.float64) / float(n)
+        w0, reduced_base, x_poisson = self._reduced_state_from_poisson_cloud(
+            base_points=base_points,
+            target_w=w_poisson,
+            weights=weights,
+            d=int(self.ambient_dim),
+            fallback_dir=axis,
+        )
+        return reduced_base, w0, x_poisson
 
     def _optimize_constant_energy_entropy_extreme(
         self,

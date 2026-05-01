@@ -1,0 +1,68 @@
+{
+  "items": [
+    {
+      "src": "20260501_220426_scene.webm",
+      "label": "Scene 20260501_220426",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_ball3d_two_sheet",
+        "params": {
+          "N": 150,
+          "K": 0.9600000000000002,
+          "omega": 3.0,
+          "dt": 0.046700000000000005,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 1008,
+          "entropy0": 0.84,
+          "energy0": 0.9540000000000001
+        },
+        "init_state_mode": "min_energy",
+        "init_state_label": "Min Entropy"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260501_220426_metrics.png",
+          "kind": "image"
+        }
+      ]
+    },
+    {
+      "src": "20260501_220522_scene.webm",
+      "label": "Scene 20260501_220522",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_ball3d_two_sheet",
+        "params": {
+          "N": 150,
+          "K": 0.9600000000000002,
+          "omega": 3.0,
+          "dt": 0.046700000000000005,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "steps": 1008,
+          "entropy0": 0.84,
+          "energy0": 0.9540000000000001
+        },
+        "init_state_mode": "min_energy",
+        "init_state_label": "Min Entropy"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260501_220522_metrics.png",
+          "kind": "image"
+        }
+      ]
+    }
+  ],
+  "title": "LMS entropy-shell two-sheet dynamics on S² / B³",
+  "description": "LMS widget trajectory media exports"
+}

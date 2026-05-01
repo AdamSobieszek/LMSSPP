@@ -1,0 +1,105 @@
+{
+  "items": [
+    {
+      "src": "20260327_211837_scene.webm",
+      "label": "Scene 20260327_211837",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_ball3d",
+        "params": {
+          "N": 299,
+          "K": 0.6,
+          "omega": 4.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "w_4": -0.45999999999999996,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "ax_4": 0.0,
+          "steps": 899,
+          "entropy0": 0.9780000000000001,
+          "energy0": 0.79
+        },
+        "init_state_mode": "min_energy",
+        "init_state_label": "Min Entropy"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260327_211837_metrics.png",
+          "kind": "image"
+        }
+      ]
+    },
+    {
+      "src": "20260327_211856_scene.webm",
+      "label": "Scene 20260327_211856",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_ball3d",
+        "params": {
+          "N": 299,
+          "K": 0.6,
+          "omega": 4.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "w_4": -0.45999999999999996,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "ax_4": 0.0,
+          "steps": 899,
+          "entropy0": 0.9780000000000001,
+          "energy0": 0.79
+        },
+        "init_state_mode": "poisson",
+        "init_state_label": "Poisson"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260327_211856_metrics.png",
+          "kind": "image"
+        }
+      ]
+    },
+    {
+      "src": "20260327_212420_scene.webm",
+      "label": "Scene 20260327_212420",
+      "kind": "video",
+      "meta": {
+        "widget_kind": "lms_ball3d",
+        "params": {
+          "N": 299,
+          "K": 0.6,
+          "omega": 4.0,
+          "dt": 0.05,
+          "w_az": 0.2,
+          "w_el": 0.25,
+          "w_4": -0.45999999999999996,
+          "ax_az": 0.0,
+          "ax_el": 1.5707963267948966,
+          "ax_4": 0.0,
+          "steps": 313,
+          "entropy0": 0.9780000000000001,
+          "energy0": 0.79
+        },
+        "init_state_mode": "poisson",
+        "init_state_label": "Poisson"
+      },
+      "tabs": [
+        {
+          "id": "metrics",
+          "label": "Metrics",
+          "src": "20260327_212420_metrics.png",
+          "kind": "image"
+        }
+      ]
+    }
+  ],
+  "title": "LMS entropy-shell dynamics on S^{d-1} (dipole charts / covariance)",
+  "description": "LMS widget trajectory media exports"
+}
