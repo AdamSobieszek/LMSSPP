@@ -17,6 +17,7 @@ ray coherence, and its covariance records angular dispersion.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
 from typing import Any, Literal
 
@@ -645,6 +646,34 @@ def _mobius_sphere_series_np(w_series: np.ndarray, points_series: np.ndarray, *,
     return (1.0 - w2) * diff / denom - W[:, None, :]
 
 
+def _spherical_inversion_chart_np(x: np.ndarray, center: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+    """Pointwise spherical inversion chart y=(x-center)/|x-center|^2."""
+    X = np.asarray(x, dtype=np.float64)
+    original_shape = X.shape
+    X2 = X.reshape(-1, 2)
+    c = np.asarray(center, dtype=np.float64).reshape(2)
+    diff = X2 - c[None, :]
+    den = np.sum(diff * diff, axis=1)
+    out = diff / np.maximum(den, float(eps))[:, None]
+    out[den < float(eps)] = np.nan
+    return out.reshape(original_shape)
+
+
+def _one_sided_unit_distance_chart_np(x: np.ndarray, center: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+    """Keep points at least unit distance from center, preserving direction."""
+    X = np.asarray(x, dtype=np.float64)
+    original_shape = X.shape
+    X2 = X.reshape(-1, 2)
+    c = np.asarray(center, dtype=np.float64).reshape(2)
+    diff = X2 - c[None, :]
+    dist = np.linalg.norm(diff, axis=1)
+    out = X2.copy()
+    mask = (dist < 1.0) & (dist >= float(eps))
+    out[mask] = c[None, :] + diff[mask] / dist[mask, None]
+    out[dist < float(eps)] = c
+    return out.reshape(original_shape)
+
+
 def _phase_grids_for_reflected_series_np(
     reflected_series: np.ndarray,
     weights: np.ndarray,
@@ -1047,6 +1076,9 @@ class LMSOpticalDiskBaseWidget:
     dw/dt=0.5*(1-|w|^2)*sum_i a_i r_i(w), not by the gradient of S_{r(w)} at w.
     """
 
+    _ES_BOUNDARY_TARGET_RADIUS = 0.9995
+    _ES_BOUNDARY_FIT_TOLERANCE = 5e-4
+
     def __init__(
         self,
         *,
@@ -1074,6 +1106,8 @@ class LMSOpticalDiskBaseWidget:
         self._frame_index = 0
         self._cache_valid = False
         self._frame_payloads: list[dict[str, Any]] = []
+        self._es_step_fit_cache: dict[tuple[str, int, float], dict[str, float | bool]] = {}
+        self._es_step_fit_last: dict[str, Any] | None = None
         if points is None:
             self.raw_points = _initialized_observed_cloud_np(
                 int(N),
@@ -1154,6 +1188,12 @@ class LMSOpticalDiskBaseWidget:
             layout=widgets.Layout(width="250px"),
         )
         self.exact_center_html = _html(value="", layout=widgets.Layout(width="460px"))
+        self.time_mode_toggle = widgets.ToggleButton(
+            value=False,
+            description="Time: physical",
+            tooltip="Switch orbit precompute between physical time and Euler-Sundman time.",
+            layout=widgets.Layout(width="150px"),
+        )
         self.selected = widgets.IntSlider(value=0, min=0, max=max(0, int(self.points.shape[0]) - 1), step=1, description="selected i", continuous_update=False, layout=widgets.Layout(width="260px"))
         self.anchor_theta = widgets.FloatSlider(value=0.0, min=-math.pi, max=math.pi, step=0.01, description="edit x_i^0", readout_format=".2f", continuous_update=False, layout=widgets.Layout(width="330px"))
         self.step_size = widgets.FloatSlider(value=0.16, min=0.005, max=0.5, step=0.005, description="flow step", readout_format=".3f", continuous_update=False, layout=widgets.Layout(width="280px"))
@@ -1184,7 +1224,7 @@ class LMSOpticalDiskBaseWidget:
         self.controls = widgets.VBox(
             [
                 widgets.HBox([self.preset_dropdown, self.n_slider, self.init_radius_slider, self.btn_resample]),
-                widgets.HBox([self.exact_center_html, self.step_size, self.max_frames]),
+                widgets.HBox([self.exact_center_html, self.time_mode_toggle, self.step_size, self.max_frames]),
                 widgets.HBox([self.btn_step, self.play, self.btn_precompute, self.cache_status_html]),
                 widgets.HBox([self.frame_slider, self.frame_counter]),
                 widgets.HBox([self.selected, self.anchor_theta, self.show_contours]),
@@ -1354,10 +1394,23 @@ class LMSOpticalDiskBaseWidget:
             self.show_contours,
         ]:
             ctl.observe(self._on_control_change, names="value")
+        self.time_mode_toggle.observe(self._on_time_mode_toggle, names="value")
         self.btn_resample.on_click(self._on_resample)
         self.btn_precompute.on_click(self._on_rebuild_orbit_clicked)
         self.btn_step.on_click(self._on_step)
         self.play.observe(self._on_play_tick, names="value")
+
+    def _time_mode(self) -> Literal["physical", "euler_sundman"]:
+        return "euler_sundman" if bool(self.time_mode_toggle.value) else "physical"
+
+    def _sync_time_mode_label(self) -> None:
+        self.time_mode_toggle.description = "Time: ES" if self._time_mode() == "euler_sundman" else "Time: physical"
+
+    def _on_time_mode_toggle(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self._sync_time_mode_label()
+        self._rebuild_orbit()
 
     def _sync_anchor_controls(self) -> None:
         idx = int(np.clip(int(self.selected.value), 0, self.points.shape[0] - 1))
@@ -1405,28 +1458,279 @@ class LMSOpticalDiskBaseWidget:
 
     def _integrate_orbit_from_controls(self) -> np.ndarray:
         frames = max(2, int(self.max_frames.value))
+        if self._time_mode() == "euler_sundman":
+            return self._integrate_euler_sundman_orbit_from_controls(frames)
         pts = [self._initial_w()]
         w = pts[0].copy()
+        step = float(self.step_size.value)
+        parameter_times = [0.0]
+        physical_times = [0.0]
         for _ in range(frames - 1):
             nxt = optical_flow_step(
                 w,
                 self.points,
                 self.weights,
-                step_size=float(self.step_size.value),
+                step_size=step,
                 radius=0.985,
             ).detach().cpu().numpy()
             if not np.isfinite(nxt).all():
                 break
             pts.append(nxt.copy())
+            parameter_times.append(parameter_times[-1] + step)
+            physical_times.append(physical_times[-1] + step)
             w = nxt
             if float(np.linalg.norm(w)) >= 0.984:
                 break
+        self._orbit_parameter_time = np.asarray(parameter_times, dtype=np.float64)
+        self._orbit_physical_time = np.asarray(physical_times, dtype=np.float64)
         return np.asarray(pts, dtype=np.float64)
+
+    def _es_step_state_signature(self) -> str:
+        h = hashlib.blake2b(digest_size=16)
+        for values in (self.points, self.weights, self._initial_w()):
+            arr = np.ascontiguousarray(values, dtype=np.float64)
+            h.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+            h.update(arr.tobytes())
+        return h.hexdigest()
+
+    def _es_step_fit_cache_key(self, frames: int, radius_stop: float) -> tuple[str, int, float]:
+        return (self._es_step_state_signature(), int(frames), round(float(radius_stop), 12))
+
+    def _remember_es_step_fit(
+        self,
+        key: tuple[str, int, float],
+        *,
+        tau_step: float,
+        final_radius: float,
+        boundary_fit: bool,
+    ) -> None:
+        self._es_step_fit_cache[key] = {
+            "tau_step": float(tau_step),
+            "final_radius": float(final_radius),
+            "boundary_fit": bool(boundary_fit),
+        }
+        while len(self._es_step_fit_cache) > 64:
+            self._es_step_fit_cache.pop(next(iter(self._es_step_fit_cache)))
+        self._es_step_fit_last = {
+            "state_signature": key[0],
+            "frames": int(key[1]),
+            "radius_stop": float(key[2]),
+            "tau_step": float(tau_step),
+        }
+
+    def _estimate_es_boundary_tau_step(
+        self,
+        *,
+        frames: int,
+        radius_stop: float,
+        points: np.ndarray,
+        weights: np.ndarray,
+    ) -> float:
+        """Return a cold-start ES step prior on the observed useful scale."""
+        frame_intervals = max(1, int(frames) - 1)
+        horizon_scale = 19.0 / float(frame_intervals)
+        fallback = 0.02 * horizon_scale
+        w0 = self._initial_w()
+        r0 = float(np.linalg.norm(w0))
+        if not (np.isfinite(r0) and r0 < float(radius_stop)):
+            return fallback
+        q0 = _reflected_series_np(w0.reshape(1, 2), points)[0]
+        R0 = np.einsum("n,nj->j", weights, q0, optimize=True)
+        radial = float(np.dot(R0, w0 / max(r0, 1e-12)))
+        if radial <= 1e-12:
+            return 0.05 * horizon_scale
+        numerator = (float(radius_stop) - float(radius_stop) ** 3 / 3.0) - (r0 - r0**3 / 3.0)
+        estimate = 0.42 * numerator / (2.0 * radial * float(frame_intervals))
+        lo = 0.01 * horizon_scale
+        hi = 0.05 * horizon_scale
+        return float(np.clip(estimate, lo, hi))
+
+    def _integrate_euler_sundman_orbit_from_controls(self, frames: int) -> np.ndarray:
+        """Integrate dw/dtau with one cached frame per selected ES time step.
+
+        The user-facing step slider is treated as the nominal ES step.  When
+        that step would cross the display boundary before the requested frame
+        count, bracket the crossing step and bisect to make the final requested
+        frame land on the boundary threshold instead of collapsing the cache to
+        the first few pre-boundary frames.
+        """
+        P = np.asarray(self.points, dtype=np.float64)
+        a = np.asarray(self.weights, dtype=np.float64)
+        requested_step = float(self.step_size.value)
+        radius_stop = float(self._ES_BOUNDARY_TARGET_RADIUS)
+        fit_tolerance = float(self._ES_BOUNDARY_FIT_TOLERANCE)
+        cache_key = self._es_step_fit_cache_key(frames, radius_stop)
+        state_signature = cache_key[0]
+        fit_calls = 0
+        fit_point_steps = 0
+
+        def integrate_for_step(tau_step: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, float]:
+            nonlocal fit_calls, fit_point_steps
+            fit_calls += 1
+            pts = [self._initial_w()]
+            parameter_times = [0.0]
+            physical_times = [0.0]
+            w = pts[0].copy()
+            for _ in range(frames - 1):
+                fit_point_steps += 1
+                w2_now = float(np.dot(w, w))
+                denom = max(1.0 - w2_now, 1e-8)
+                q = _reflected_series_np(w.reshape(1, 2), P)[0]
+                R = np.einsum("n,nj->j", a, q, optimize=True)
+                nxt = w + tau_step * (2.0 * R / denom)
+                nrm = float(np.linalg.norm(nxt))
+                if (not np.isfinite(nxt).all()) or nrm >= radius_stop:
+                    return (
+                        np.asarray(pts, dtype=np.float64),
+                        np.asarray(parameter_times, dtype=np.float64),
+                        np.asarray(physical_times, dtype=np.float64),
+                        True,
+                        nrm,
+                    )
+                pts.append(nxt.copy())
+                parameter_times.append(parameter_times[-1] + tau_step)
+                physical_times.append(physical_times[-1] + tau_step * 4.0 / (denom * denom))
+                w = nxt
+            orbit = np.asarray(pts, dtype=np.float64)
+            tau = np.asarray(parameter_times, dtype=np.float64)
+            physical = np.asarray(physical_times, dtype=np.float64)
+            final_radius = float(np.linalg.norm(orbit[-1])) if len(orbit) else float("nan")
+            return orbit, tau, physical, False, final_radius
+
+        cached_fit = self._es_step_fit_cache.get(cache_key)
+        if cached_fit is not None:
+            cached_step = float(cached_fit["tau_step"])
+            orbit, tau, physical, crossed, final_radius = integrate_for_step(cached_step)
+            if (not crossed) and len(orbit) == frames and abs(final_radius - radius_stop) <= fit_tolerance:
+                self._orbit_parameter_time = tau
+                self._orbit_physical_time = physical
+                self._orbit_es_tau_step = cached_step
+                self._orbit_es_boundary_fit = True
+                self._orbit_es_fit_calls = fit_calls
+                self._orbit_es_fit_point_steps = fit_point_steps
+                self._orbit_es_fit_cache_hit = True
+                return orbit
+
+        initial_step = self._estimate_es_boundary_tau_step(
+            frames=frames,
+            radius_stop=radius_stop,
+            points=P,
+            weights=a,
+        )
+        warm_started = False
+        if (
+            cached_fit is None
+            and self._es_step_fit_last is not None
+            and self._es_step_fit_last.get("state_signature") == state_signature
+            and np.isfinite(float(self._es_step_fit_last.get("tau_step", requested_step)))
+        ):
+            last_step = float(self._es_step_fit_last["tau_step"])
+            last_frames = int(self._es_step_fit_last.get("frames", frames))
+            if frames > 1 and last_frames > 1:
+                initial_step = last_step * float(last_frames - 1) / float(frames - 1)
+            else:
+                initial_step = last_step
+            warm_started = True
+        elif cached_fit is not None:
+            initial_step = float(cached_fit["tau_step"])
+            warm_started = True
+
+        orbit, tau, physical, crossed, final_radius = integrate_for_step(initial_step)
+        if (not crossed) and len(orbit) == frames:
+            lower_step = initial_step
+            lower = (orbit, tau, physical)
+            if final_radius < radius_stop - fit_tolerance:
+                upper_step = initial_step
+                upper_found = False
+                for _ in range(16):
+                    upper_step *= 1.15 if warm_started else 2.0
+                    _, _, _, upper_crossed, upper_radius = integrate_for_step(upper_step)
+                    if upper_crossed or upper_radius >= radius_stop:
+                        upper_found = True
+                        break
+                if not upper_found:
+                    best = lower
+                    self._orbit_es_boundary_fit = False
+                    self._orbit_es_tau_step = lower_step
+                    self._orbit_parameter_time = best[1]
+                    self._orbit_physical_time = best[2]
+                    self._remember_es_step_fit(cache_key, tau_step=lower_step, final_radius=final_radius, boundary_fit=False)
+                    self._orbit_es_fit_calls = fit_calls
+                    self._orbit_es_fit_point_steps = fit_point_steps
+                    self._orbit_es_fit_cache_hit = False
+                    return best[0]
+            else:
+                best = lower
+                self._orbit_es_boundary_fit = True
+                self._orbit_es_tau_step = lower_step
+                self._orbit_parameter_time = best[1]
+                self._orbit_physical_time = best[2]
+                self._remember_es_step_fit(cache_key, tau_step=lower_step, final_radius=final_radius, boundary_fit=True)
+                self._orbit_es_fit_calls = fit_calls
+                self._orbit_es_fit_point_steps = fit_point_steps
+                self._orbit_es_fit_cache_hit = False
+                return best[0]
+        else:
+            upper_step = initial_step
+            lower_step = initial_step
+            lower: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+            for _ in range(24):
+                lower_step *= (1.0 / 1.15) if warm_started else 0.5
+                lo_orbit, lo_tau, lo_physical, lo_crossed, _ = integrate_for_step(lower_step)
+                if (not lo_crossed) and len(lo_orbit) == frames:
+                    lower = (lo_orbit, lo_tau, lo_physical)
+                    break
+            if lower is None:
+                self._orbit_es_boundary_fit = False
+                self._orbit_es_tau_step = float(tau[1] - tau[0]) if tau.shape[0] > 1 else requested_step
+                self._orbit_parameter_time = tau
+                self._orbit_physical_time = physical
+                self._remember_es_step_fit(
+                    cache_key,
+                    tau_step=float(tau[1] - tau[0]) if tau.shape[0] > 1 else requested_step,
+                    final_radius=final_radius,
+                    boundary_fit=False,
+                )
+                self._orbit_es_fit_calls = fit_calls
+                self._orbit_es_fit_point_steps = fit_point_steps
+                self._orbit_es_fit_cache_hit = False
+                return orbit
+
+        assert lower is not None
+        best = lower
+        for _ in range(32):
+            mid_step = 0.5 * (lower_step + upper_step)
+            mid_orbit, mid_tau, mid_physical, mid_crossed, _ = integrate_for_step(mid_step)
+            if mid_crossed or len(mid_orbit) < frames:
+                upper_step = mid_step
+            else:
+                lower_step = mid_step
+                best = (mid_orbit, mid_tau, mid_physical)
+                final_radius = float(np.linalg.norm(mid_orbit[-1]))
+                if abs(final_radius - radius_stop) <= fit_tolerance:
+                    break
+        self._orbit_parameter_time = best[1]
+        self._orbit_physical_time = best[2]
+        self._orbit_es_tau_step = float(best[1][1] - best[1][0]) if best[1].shape[0] > 1 else requested_step
+        self._orbit_es_boundary_fit = True
+        final_radius = float(np.linalg.norm(best[0][-1])) if len(best[0]) else float("nan")
+        self._remember_es_step_fit(
+            cache_key,
+            tau_step=self._orbit_es_tau_step,
+            final_radius=final_radius,
+            boundary_fit=True,
+        )
+        self._orbit_es_fit_calls = fit_calls
+        self._orbit_es_fit_point_steps = fit_point_steps
+        self._orbit_es_fit_cache_hit = False
+        return best[0]
 
     def _build_preview_frame(self, message: str) -> None:
         w0 = self._initial_w()
         self._orbit = np.asarray([w0], dtype=np.float64)
         self._orbit_r = np.linalg.norm(self._orbit, axis=1)
+        self._orbit_parameter_time = np.zeros(1, dtype=np.float64)
+        self._orbit_physical_time = np.zeros(1, dtype=np.float64)
         # Preview updates must be cheap.  Level sets are part of the cached
         # animation payload and are populated only by Precompute flow.
         self._frame_payloads = self._build_frame_payloads(self._orbit, include_contours=False)
@@ -1487,6 +1791,13 @@ class LMSOpticalDiskBaseWidget:
         W = np.asarray(orbit, dtype=np.float64).reshape(-1, 2)
         if W.size == 0:
             return []
+        time_mode = self._time_mode()
+        parameter_time = np.asarray(getattr(self, "_orbit_parameter_time", np.arange(W.shape[0])), dtype=np.float64)
+        physical_time = np.asarray(getattr(self, "_orbit_physical_time", np.arange(W.shape[0])), dtype=np.float64)
+        if parameter_time.shape[0] != W.shape[0]:
+            parameter_time = np.arange(W.shape[0], dtype=np.float64)
+        if physical_time.shape[0] != W.shape[0]:
+            physical_time = parameter_time.copy()
         P = np.asarray(self.points, dtype=np.float64)
         a = np.asarray(self.weights, dtype=np.float64)
         Q = _reflected_series_np(W, P)
@@ -1579,6 +1890,8 @@ class LMSOpticalDiskBaseWidget:
                 "coherence": coh,
                 "ray_variance": var,
                 "speed": float(np.linalg.norm(velocity[i])),
+                "parameter_time": float(parameter_time[i]),
+                "physical_time": float(physical_time[i]),
                 "stats": (
                     "<b>Optical diagnostics</b> "
                     f"$\\|\\sum_i a_i p_i^0\\|={self._center_error:.2e}$; "
@@ -1588,6 +1901,9 @@ class LMSOpticalDiskBaseWidget:
                     f"$\\Phi_{{p^0}}(w)={float(phi_p0[i]):.6f}$; "
                     f"$S_{{r(w)}}(w)={float(reflected_phase[i]):.6f}$; "
                     f"$|\\dot w|={float(np.linalg.norm(velocity[i])):.6f}$; "
+                    f"$\\mathrm{{time}}={'ES' if time_mode == 'euler_sundman' else 'physical'}$; "
+                    f"$\\tau={float(parameter_time[i]):.6g}$; "
+                    f"$t={float(physical_time[i]):.6g}$; "
                     f"$\\lambda(C)=({float(evals[i, 0]):.5f},{float(evals[i, 1]):.5f})$"
                 ),
             }
@@ -1811,6 +2127,352 @@ class LMSOpticalDiskWidget(LMSOpticalDiskBaseWidget):
     and override the visualization hooks rather than duplicating the common
     frame cache and optical helper logic.
     """
+
+
+class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
+    """2D optical explorer with dynamic w-relative charts.
+
+    The top row is the standard optical disk view.  The bottom row replaces the
+    base diagnostic panels with two moving charts of the first subplot's data:
+    the left chart pushes points to at least unit distance from w_t, and the
+    right chart maps x -> (x+w_t)/|x+w_t|^2.
+    """
+
+    _DYNAMIC_CHART_CIRCLE_SAMPLES = 4096
+
+    def __init__(
+        self,
+        *,
+        width: int = 1260,
+        height: int = 860,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(width=width, height=height, **kwargs)
+
+    def _layout_header_html(self) -> str:
+        return (
+            "<b>LMS optical reflected-ray explorer + dynamic w-relative charts</b><br>"
+            "Bottom left: one-sided unit-distance normalization around $w_t$. "
+            "Bottom right: pointwise spherical inversion $(x+w_t)/|x+w_t|^2$."
+        )
+
+    def _make_subplot_figure(self) -> Any:
+        return make_subplots(
+            rows=2,
+            cols=2,
+            subplot_titles=(
+                r"$p_i^0=M_{-w_\ast}(x_i^0),\quad w(t)$",
+                r"$r_i(w)=H_{p_i^0-w}(p_i^0),\quad S_{r(w)}(u)=\mathrm{const}$",
+                r"$N_{w_t}(x):\ |N_{w_t}(x)-w_t|\ge 1$",
+                r"$I_{-w_t}(x)=(x+w_t)/|x+w_t|^2$",
+            ),
+            horizontal_spacing=0.08,
+            vertical_spacing=0.12,
+        )
+
+    def _build_figure(self) -> None:
+        fig = go.FigureWidget(self._make_subplot_figure())
+        self.fig = fig
+        self.tr: dict[str, int] = {}
+        self._reset_subplot_legend_state()
+
+        def add(trace: Any, key: str, row: int, col: int) -> None:
+            self._add_trace_to_subplot(fig, trace, key, row, col)
+
+        cx, cy = _circle_xy()
+        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name=r"$\partial\mathbb{B}^2$", hoverinfo="skip"), "disk", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(20,20,20,0.35)", width=2), name=r"$w(t)$", hoverinfo="skip"), "orbit_path", 1, 1)
+        add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=11, color="white", line=dict(color="black", width=2)), name=r"$\sum_i a_i p_i^0=0$"), "core_balance", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#244C9A", opacity=0.72), name=r"$p_i^0$"), "anchors", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name=r"$\mathrm{selected}\ p_i^0$"), "selected_anchor", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black"), name=r"$w$"), "w", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 9], color="#D72638"), name=r"$R_{p^0}(w)=\sum_i a_i r_i(w)$"), "R_arrow", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#188038", width=3, dash="dash"), marker=dict(size=[0, 7], color="#188038"), name=r"$\dot w$"), "vel_arrow", 1, 1)
+
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name=r"$S_{r(w)}(u)=\mathrm{const}$", hoverinfo="skip"), "ref_phase", 1, 2)
+        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name=r"$\partial\mathbb{B}^2$", hoverinfo="skip", showlegend=False), "ref_circle", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name=r"$r_i(w)$"), "reflected", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name=r"$w:\sum_i a_iM_w(r_i(w))=0$"), "ref_w", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name=r"$R_{p^0}(w)$"), "R_circle", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name=r"$\mathrm{Cov}(r_i(w))$", hoverinfo="skip"), "ellipse", 1, 2)
+
+        self._add_dynamic_inversion_chart_traces("inv_w", 2, 1, transform_name="N")
+        self._add_dynamic_inversion_chart_traces("inv_neg_w", 2, 2, center_name=r"$c=-w_t$")
+
+        fig.update_layout(
+            width=self.width,
+            height=self.height,
+            template="plotly_white",
+            margin=dict(l=35, r=20, t=58, b=30),
+            showlegend=True,
+        )
+        for axis in ("xaxis", "xaxis2"):
+            fig.layout[axis].update(range=[-1.15, 1.15], zeroline=False, showgrid=False)
+        for axis, anchor in (("yaxis", "x"), ("yaxis2", "x2")):
+            fig.layout[axis].update(range=[-1.15, 1.15], zeroline=False, showgrid=False, scaleanchor=anchor, scaleratio=1)
+        for axis in ("xaxis3", "xaxis4"):
+            fig.layout[axis].update(zeroline=True, showgrid=True)
+        for axis, anchor in (("yaxis3", "x3"), ("yaxis4", "x4")):
+            fig.layout[axis].update(zeroline=True, showgrid=True, scaleanchor=anchor, scaleratio=1)
+        for row, col in ((1, 1), (1, 2)):
+            fig.update_xaxes(title_text=r"$e_1$", row=row, col=col)
+            fig.update_yaxes(title_text=r"$e_2$", row=row, col=col)
+        fig.update_xaxes(title_text=r"$N_{w_t}(e_1)$", row=2, col=1)
+        fig.update_yaxes(title_text=r"$N_{w_t}(e_2)$", row=2, col=1)
+        fig.update_xaxes(title_text=r"$I_{-w_t}(e_1)$", row=2, col=2)
+        fig.update_yaxes(title_text=r"$I_{-w_t}(e_2)$", row=2, col=2)
+        _sanitize_figure_text(fig)
+        self._configure_subplot_legends()
+
+    def _add_dynamic_inversion_chart_traces(
+        self,
+        prefix: str,
+        row: int,
+        col: int,
+        *,
+        center_name: str = "",
+        transform_name: str = "I",
+    ) -> None:
+        def add(trace: Any, suffix: str) -> None:
+            self._add_trace_to_subplot(self.fig, trace, f"{prefix}_{suffix}", row, col)
+
+        prefix_label = "N_c" if transform_name == "N" else "I_c"
+
+        add(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="lines",
+                line=dict(color="rgba(20,20,20,0.75)", width=2),
+                name=rf"${prefix_label}(\partial\mathbb{{B}}^2)$",
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            "disk",
+        )
+        add(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="lines",
+                line=dict(color="rgba(20,20,20,0.35)", width=2),
+                name=rf"${prefix_label}(w(t))$",
+                hoverinfo="skip",
+            ),
+            "orbit_path",
+        )
+        add(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="markers",
+                marker=dict(size=11, color="white", line=dict(color="black", width=2)),
+                name=rf"${prefix_label}(0)$",
+            ),
+            "core_balance",
+        )
+        add(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="markers",
+                marker=dict(size=8, color="#244C9A", opacity=0.72),
+                name=rf"${prefix_label}(p_i^0)$",
+            ),
+            "anchors",
+        )
+        add(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="markers",
+                marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)),
+                name=rf"${prefix_label}(\mathrm{{selected}}\ p_i^0)$",
+            ),
+            "selected_anchor",
+        )
+        _ = center_name
+        add(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="markers",
+                marker=dict(size=13, color="black"),
+                name=rf"${prefix_label}(w_t)$",
+            ),
+            "w",
+        )
+        add(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="lines+markers",
+                line=dict(color="#D72638", width=4),
+                marker=dict(size=[0, 9], color="#D72638"),
+                name=rf"${prefix_label}(w_t+R_{{p^0}}(w))$",
+            ),
+            "R_arrow",
+        )
+        add(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="lines+markers",
+                line=dict(color="#188038", width=3, dash="dash"),
+                marker=dict(size=[0, 7], color="#188038"),
+                name=rf"${prefix_label}(w_t+\dot w)$",
+            ),
+            "vel_arrow",
+        )
+
+    def _dynamic_inversion_payload(
+        self,
+        *,
+        prefix: str,
+        center: np.ndarray,
+        payload: dict[str, Any],
+        frame_arrays: dict[str, np.ndarray],
+    ) -> dict[str, Any]:
+        W = np.asarray(frame_arrays["W"], dtype=np.float64).reshape(-1, 2)
+        P = np.asarray(frame_arrays["P"], dtype=np.float64).reshape(-1, 2)
+        w_np = np.asarray(payload["w"], dtype=np.float64).reshape(2)
+        R = np.asarray(payload["R"], dtype=np.float64).reshape(2)
+        velocity = np.asarray(payload["velocity"], dtype=np.float64).reshape(2)
+        c = np.asarray(center, dtype=np.float64).reshape(2)
+        cx, cy = _circle_xy(samples=self._DYNAMIC_CHART_CIRCLE_SAMPLES)
+        circle = np.column_stack([cx, cy])
+        line_t = np.linspace(0.0, 1.0, 36, dtype=np.float64)[:, None]
+        r_curve = w_np[None, :] + line_t * (0.48 * R)[None, :]
+        v_curve = w_np[None, :] + line_t * (1.6 * velocity)[None, :]
+        transform = _one_sided_unit_distance_chart_np if prefix == "inv_w" else _spherical_inversion_chart_np
+        r_line = transform(r_curve, c)
+        v_line = transform(v_curve, c)
+        chart_disk = transform(circle, c)
+        chart_orbit = transform(W, c)
+        chart_anchors = transform(P, c)
+        chart_core = transform(np.array([[0.0, 0.0]], dtype=np.float64), c)[0]
+        chart_w = transform(w_np.reshape(1, 2), c)[0]
+        finite = np.concatenate(
+            [
+                chart_disk[np.isfinite(chart_disk).all(axis=1)],
+                chart_orbit[np.isfinite(chart_orbit).all(axis=1)],
+                chart_anchors[np.isfinite(chart_anchors).all(axis=1)],
+                r_line[np.isfinite(r_line).all(axis=1)],
+                v_line[np.isfinite(v_line).all(axis=1)],
+                chart_core.reshape(1, 2),
+            ],
+            axis=0,
+        )
+        finite = finite[np.isfinite(finite).all(axis=1)]
+        if finite.size:
+            lo = np.nanquantile(finite, 0.03, axis=0)
+            hi = np.nanquantile(finite, 0.97, axis=0)
+            span = np.maximum(hi - lo, 1.0)
+            x_range = [float(lo[0] - 0.12 * span[0]), float(hi[0] + 0.12 * span[0])]
+            y_range = [float(lo[1] - 0.12 * span[1]), float(hi[1] + 0.12 * span[1])]
+        else:
+            x_range = y_range = [-1.0, 1.0]
+        return {
+            f"{prefix}_center_source": c,
+            f"{prefix}_disk_x": chart_disk[:, 0],
+            f"{prefix}_disk_y": chart_disk[:, 1],
+            f"{prefix}_orbit_path_x": chart_orbit[:, 0],
+            f"{prefix}_orbit_path_y": chart_orbit[:, 1],
+            f"{prefix}_core_balance_x": [float(chart_core[0])],
+            f"{prefix}_core_balance_y": [float(chart_core[1])],
+            f"{prefix}_anchors_x": chart_anchors[:, 0],
+            f"{prefix}_anchors_y": chart_anchors[:, 1],
+            f"{prefix}_w_x": [float(chart_w[0])],
+            f"{prefix}_w_y": [float(chart_w[1])],
+            f"{prefix}_R_arrow_x": r_line[:, 0],
+            f"{prefix}_R_arrow_y": r_line[:, 1],
+            f"{prefix}_vel_arrow_x": v_line[:, 0],
+            f"{prefix}_vel_arrow_y": v_line[:, 1],
+            f"{prefix}_x_range": x_range,
+            f"{prefix}_y_range": y_range,
+        }
+
+    def _augment_frame_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        frame_index: int,
+        frame_arrays: dict[str, np.ndarray],
+    ) -> dict[str, Any]:
+        payload = super()._augment_frame_payload(payload, frame_index=frame_index, frame_arrays=frame_arrays)
+        w_np = np.asarray(payload["w"], dtype=np.float64).reshape(2)
+        payload.update(
+            self._dynamic_inversion_payload(
+                prefix="inv_w",
+                center=w_np,
+                payload=payload,
+                frame_arrays=frame_arrays,
+            )
+        )
+        payload.update(
+            self._dynamic_inversion_payload(
+                prefix="inv_neg_w",
+                center=-w_np,
+                payload=payload,
+                frame_arrays=frame_arrays,
+            )
+        )
+        payload["stats"] += f"; dynamic inversion centers $|w|={float(np.linalg.norm(w_np)):.6f}$"
+        return payload
+
+    def _apply_payload_to_figure(self, payload: dict[str, Any], selected: dict[str, Any]) -> None:
+        p = np.asarray(selected["p"], dtype=np.float64)
+        w_np = np.asarray(selected["w"], dtype=np.float64)
+        selected_anchor = np.asarray(selected["p"], dtype=np.float64).reshape(2)
+        with self.fig.batch_update():
+            self.fig.data[self.tr["orbit_path"]].x = self._orbit[:, 0].tolist()
+            self.fig.data[self.tr["orbit_path"]].y = self._orbit[:, 1].tolist()
+            self.fig.data[self.tr["anchors"]].x = _plotly_values(payload["anchors_x"])
+            self.fig.data[self.tr["anchors"]].y = _plotly_values(payload["anchors_y"])
+            self.fig.data[self.tr["selected_anchor"]].x = [float(p[0])]
+            self.fig.data[self.tr["selected_anchor"]].y = [float(p[1])]
+            self.fig.data[self.tr["w"]].x = [float(w_np[0])]
+            self.fig.data[self.tr["w"]].y = [float(w_np[1])]
+            self.fig.data[self.tr["R_arrow"]].x = _plotly_values(payload["R_arrow_x"])
+            self.fig.data[self.tr["R_arrow"]].y = _plotly_values(payload["R_arrow_y"])
+            self.fig.data[self.tr["vel_arrow"]].x = _plotly_values(payload["vel_arrow_x"])
+            self.fig.data[self.tr["vel_arrow"]].y = _plotly_values(payload["vel_arrow_y"])
+            self.fig.data[self.tr["ref_phase"]].x = _plotly_values(payload["ref_phase_x"])
+            self.fig.data[self.tr["ref_phase"]].y = _plotly_values(payload["ref_phase_y"])
+            self.fig.data[self.tr["ref_phase"]].visible = bool(self.show_contours.value)
+            self.fig.data[self.tr["ref_phase"]].opacity = 0.82 if bool(self.show_contours.value) else 0.0
+            self.fig.data[self.tr["reflected"]].x = _plotly_values(payload["reflected_x"])
+            self.fig.data[self.tr["reflected"]].y = _plotly_values(payload["reflected_y"])
+            self.fig.data[self.tr["ref_w"]].x = _plotly_values(payload["ref_w_x"])
+            self.fig.data[self.tr["ref_w"]].y = _plotly_values(payload["ref_w_y"])
+            self.fig.data[self.tr["R_circle"]].x = _plotly_values(payload["R_circle_x"])
+            self.fig.data[self.tr["R_circle"]].y = _plotly_values(payload["R_circle_y"])
+            self.fig.data[self.tr["ellipse"]].x = _plotly_values(payload["ellipse_x"])
+            self.fig.data[self.tr["ellipse"]].y = _plotly_values(payload["ellipse_y"])
+
+            for prefix in ("inv_w", "inv_neg_w"):
+                c = np.asarray(payload[f"{prefix}_center_source"], dtype=np.float64).reshape(2)
+                transform = _one_sided_unit_distance_chart_np if prefix == "inv_w" else _spherical_inversion_chart_np
+                selected_chart = transform(selected_anchor.reshape(1, 2), c)[0]
+                self.fig.data[self.tr[f"{prefix}_disk"]].x = _plotly_values(payload[f"{prefix}_disk_x"])
+                self.fig.data[self.tr[f"{prefix}_disk"]].y = _plotly_values(payload[f"{prefix}_disk_y"])
+                self.fig.data[self.tr[f"{prefix}_orbit_path"]].x = _plotly_values(payload[f"{prefix}_orbit_path_x"])
+                self.fig.data[self.tr[f"{prefix}_orbit_path"]].y = _plotly_values(payload[f"{prefix}_orbit_path_y"])
+                self.fig.data[self.tr[f"{prefix}_core_balance"]].x = _plotly_values(payload[f"{prefix}_core_balance_x"])
+                self.fig.data[self.tr[f"{prefix}_core_balance"]].y = _plotly_values(payload[f"{prefix}_core_balance_y"])
+                self.fig.data[self.tr[f"{prefix}_anchors"]].x = _plotly_values(payload[f"{prefix}_anchors_x"])
+                self.fig.data[self.tr[f"{prefix}_anchors"]].y = _plotly_values(payload[f"{prefix}_anchors_y"])
+                self.fig.data[self.tr[f"{prefix}_selected_anchor"]].x = [float(selected_chart[0])]
+                self.fig.data[self.tr[f"{prefix}_selected_anchor"]].y = [float(selected_chart[1])]
+                self.fig.data[self.tr[f"{prefix}_w"]].x = _plotly_values(payload[f"{prefix}_w_x"])
+                self.fig.data[self.tr[f"{prefix}_w"]].y = _plotly_values(payload[f"{prefix}_w_y"])
+                self.fig.data[self.tr[f"{prefix}_R_arrow"]].x = _plotly_values(payload[f"{prefix}_R_arrow_x"])
+                self.fig.data[self.tr[f"{prefix}_R_arrow"]].y = _plotly_values(payload[f"{prefix}_R_arrow_y"])
+                self.fig.data[self.tr[f"{prefix}_vel_arrow"]].x = _plotly_values(payload[f"{prefix}_vel_arrow_x"])
+                self.fig.data[self.tr[f"{prefix}_vel_arrow"]].y = _plotly_values(payload[f"{prefix}_vel_arrow_y"])
+                row, col = (2, 1) if prefix == "inv_w" else (2, 2)
+                self.fig.update_xaxes(range=payload[f"{prefix}_x_range"], row=row, col=col)
+                self.fig.update_yaxes(range=payload[f"{prefix}_y_range"], row=row, col=col)
 
 
 class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
@@ -2118,57 +2780,6 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
             "ray fields $u_i$, and the transverse spread coefficient $\\Theta_\\perp$."
         )
 
-    def _build_controls(self, *, preset: OpticalPreset) -> None:
-        super()._build_controls(preset=preset)
-        self.time_mode_toggle = widgets.ToggleButton(
-            value=False,
-            description="Time: physical",
-            tooltip="Switch orbit precompute between physical time and Euler-Sundman time.",
-            layout=widgets.Layout(width="150px"),
-        )
-        children = list(self.controls.children)
-        parameter_row = list(children[1].children)
-        parameter_row.insert(1, self.time_mode_toggle)
-        children[1] = widgets.HBox(parameter_row)
-        self.controls.children = tuple(children)
-
-    def _bind_callbacks(self) -> None:
-        super()._bind_callbacks()
-        self.time_mode_toggle.observe(self._on_time_mode_toggle, names="value")
-
-    def _sync_time_mode_label(self) -> None:
-        self.time_mode_toggle.description = "Time: ES" if bool(self.time_mode_toggle.value) else "Time: physical"
-
-    def _on_time_mode_toggle(self, change: dict[str, Any]) -> None:
-        if self._updating or change.get("name") != "value":
-            return
-        self._sync_time_mode_label()
-        self._rebuild_orbit()
-
-    def _integrate_orbit_from_controls(self) -> np.ndarray:
-        if not bool(getattr(self, "time_mode_toggle", None) and self.time_mode_toggle.value):
-            return super()._integrate_orbit_from_controls()
-        frames = max(2, int(self.max_frames.value))
-        pts = [self._initial_w()]
-        w = pts[0].copy()
-        P = np.asarray(self.points, dtype=np.float64)
-        a = np.asarray(self.weights, dtype=np.float64)
-        for _ in range(frames - 1):
-            q = _reflected_series_np(w.reshape(1, 2), P)[0]
-            R = np.einsum("n,nj->j", a, q, optimize=True)
-            denom = max(1.0 - float(np.dot(w, w)), 1e-8)
-            nxt = w + float(self.step_size.value) * (2.0 * R / denom)
-            nrm = float(np.linalg.norm(nxt))
-            if nrm > 0.985:
-                nxt = nxt * (0.985 / max(nrm, 1e-12))
-            if not np.isfinite(nxt).all():
-                break
-            pts.append(nxt.copy())
-            w = nxt
-            if float(np.linalg.norm(w)) >= 0.984:
-                break
-        return np.asarray(pts, dtype=np.float64)
-
     def _make_subplot_figure(self) -> Any:
         return make_subplots(
             rows=2,
@@ -2391,10 +3002,8 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
                     "diag_phi_point_y": [float(phi[i])],
                 }
             )
-            mode_tex = r"\mathrm{ES}" if bool(self.time_mode_toggle.value) else r"\mathrm{physical}"
             payload["stats"] += (
-                f"; $\\mathrm{{time}}={mode_tex}$; "
-                f"$A_\\perp={float(A_perp[i]):.6f}$; "
+                f"; $A_\\perp={float(A_perp[i]):.6f}$; "
                 f"$\\Theta_\\perp={float(theta_perp[i]):.6f}$"
             )
         return payloads
@@ -2508,6 +3117,7 @@ __all__ = [
     "optical_flow_step",
     "LMSOpticalDiskBaseWidget",
     "LMSOpticalDiskWidget",
+    "LMSOpticalDynamicInversionCayleyDiskWidget",
     "LMSOpticalWeightedCayleyDiskWidget",
     "LMSOpticalHyperboloidScreenWidget",
 ]

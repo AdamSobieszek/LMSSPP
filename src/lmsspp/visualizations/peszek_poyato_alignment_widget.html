@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Peszek-Poyato Alignment Field Widget</title>
+<style>
+  body {
+    font-family: Arial, Helvetica, sans-serif;
+    margin: 0;
+    padding: 0;
+    background: #f5f7fb;
+    color: #1f2937;
+  }
+  .wrap {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px;
+  }
+  h1 {
+    font-size: 24px;
+    margin: 0 0 8px 0;
+  }
+  p.topnote {
+    margin: 0 0 16px 0;
+    color: #4b5563;
+    line-height: 1.4;
+  }
+  .controls {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr 1fr 1fr;
+    gap: 12px;
+    align-items: end;
+    margin-bottom: 16px;
+  }
+  .card {
+    background: white;
+    border: 1px solid #d1d5db;
+    border-radius: 12px;
+    padding: 12px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  }
+  label {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 8px;
+    font-size: 14px;
+  }
+  .small {
+    color: #6b7280;
+    font-size: 12px;
+  }
+  input[type="range"] {
+    width: 100%;
+  }
+  button {
+    background: #2563eb;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 14px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  button:hover { background: #1d4ed8; }
+  .main {
+    display: grid;
+    grid-template-columns: 2.1fr 1fr;
+    gap: 16px;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: white;
+    border: 1px solid #d1d5db;
+    border-radius: 12px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  }
+  .stats {
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .stats code {
+    background: #f3f4f6;
+    padding: 1px 4px;
+    border-radius: 4px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 6px 0;
+  }
+  .swatch {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 1px solid rgba(0,0,0,0.25);
+  }
+  .mono { font-family: Menlo, Consolas, monospace; font-size: 12px; }
+  .equation {
+    overflow-wrap: anywhere;
+    font-family: Menlo, Consolas, monospace;
+    background: #f9fafb;
+    padding: 8px;
+    border-radius: 8px;
+    border: 1px solid #e5e7eb;
+    margin: 8px 0;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Peszek-Poyato Alignment Field Explorer</h1>
+  <p class="topnote">
+    Click anywhere in the plot to place a probe point <code>x</code>. The widget shows the ordinary barycenter <code>m</code>, the <code>α</code>-weighted barycenter <code>b<sub>α</sub>(x)</code>, the Gaussian / barycentric case <code>α = 0</code>, and the singular subquadratic alignment field for any <code>0 ≤ α &lt; 1</code>.
+  </p>
+
+  <div class="controls">
+    <div class="card">
+      <label for="alphaSlider">Alpha slider: <span id="alphaValue">0.35</span></label>
+      <input id="alphaSlider" type="range" min="0" max="0.99" step="0.01" value="0.35" />
+      <div class="small">Kernel: <code>W^α(r) = r^(2-α)/((2-α)(1-α))</code>, force field <code>A_α(x) = ∇W^α * ρ</code>.</div>
+    </div>
+    <div class="card">
+      <label for="sampleCount">Support sample size</label>
+      <input id="sampleCount" type="range" min="400" max="2500" step="100" value="1200" />
+      <div><span id="sampleCountValue">1200</span> points</div>
+    </div>
+    <div class="card">
+      <label>Distribution</label>
+      <div id="distName" class="small">Random mixture</div>
+      <div class="small">Wide family of Gaussian / ring / crescent / line / heavy-tail-like mixtures.</div>
+    </div>
+    <div class="card">
+      <button id="randomBtn">Randomize distribution</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <div>
+      <canvas id="plot" width="980" height="760"></canvas>
+    </div>
+    <div class="card stats">
+      <h3 style="margin-top:0">What is displayed</h3>
+      <div class="legend-item"><span class="swatch" style="background:#111827"></span> Sampled support points of <code>ρ</code></div>
+      <div class="legend-item"><span class="swatch" style="background:#2563eb"></span> Ordinary barycenter <code>m</code></div>
+      <div class="legend-item"><span class="swatch" style="background:#dc2626"></span> Probe point <code>x</code></div>
+      <div class="legend-item"><span class="swatch" style="background:#f59e0b"></span> <code>α</code>-weighted barycenter <code>b<sub>α</sub>(x)</code></div>
+      <div class="legend-item"><span class="swatch" style="background:#2563eb"></span> Blue arrow: attractive Gaussian drift <code>-A₀(x) = m - x</code></div>
+      <div class="legend-item"><span class="swatch" style="background:#f59e0b"></span> Orange arrow: attractive <code>α</code>-drift <code>-A<sub>α</sub>(x)</code> toward <code>b<sub>α</sub>(x)</code></div>
+
+      <h3>Current formulas</h3>
+      <div class="equation">A<sub>α</sub>(x) = (1/(1-α)) · E<sub>Z∼ρ</sub>[ |x-Z|<sup>-α</sup> (x-Z) ]</div>
+      <div class="equation">b<sub>α</sub>(x) = E[ |x-Z|<sup>-α</sup> Z ] / E[ |x-Z|<sup>-α</sup> ]</div>
+      <div class="equation">A<sub>α</sub>(x) = (M<sub>α</sub>(x)/(1-α)) · (x - b<sub>α</sub>(x)), with M<sub>α</sub>(x)=E[|x-Z|<sup>-α</sup>]</div>
+      <div class="equation">H<sub>α</sub>(x) = D²W<sup>α</sup>*ρ(x) = (1/(1-α))E[|x-Z|<sup>-α</sup>(I - α e⊗e)]</div>
+
+      <h3>Numerical values</h3>
+      <div id="metrics" class="mono"></div>
+
+      <h3>Interpretation</h3>
+      <p>
+        For <code>α = 0</code>, the entire distribution collapses to the barycenter: <code>A₀(x)=x-m</code>.
+        For <code>0 &lt; α &lt; 1</code>, the force is no longer determined only by the barycenter. It points toward the <em>probe-dependent weighted barycenter</em> <code>b<sub>α</sub>(x)</code>, and its local precision / anisotropy is encoded by <code>H<sub>α</sub>(x)</code>.
+      </p>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  const canvas = document.getElementById('plot');
+  const ctx = canvas.getContext('2d');
+  const alphaSlider = document.getElementById('alphaSlider');
+  const alphaValue = document.getElementById('alphaValue');
+  const sampleCount = document.getElementById('sampleCount');
+  const sampleCountValue = document.getElementById('sampleCountValue');
+  const randomBtn = document.getElementById('randomBtn');
+  const metrics = document.getElementById('metrics');
+  const distNameEl = document.getElementById('distName');
+
+  let points = [];
+  let distName = 'Random mixture';
+  let probe = {x: 0, y: 0};
+  let bbox = {xmin: -5, xmax: 5, ymin: -5, ymax: 5};
+  let barycenter = {x: 0, y: 0};
+  let computed = null;
+
+  function randn() {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+  }
+
+  function randUniform(a, b) {
+    return a + (b - a) * Math.random();
+  }
+
+  function rotate(pt, theta) {
+    const c = Math.cos(theta), s = Math.sin(theta);
+    return {x: c * pt.x - s * pt.y, y: s * pt.x + c * pt.y};
+  }
+
+  function sampleGaussian(center, sx, sy, theta) {
+    const p = rotate({x: sx * randn(), y: sy * randn()}, theta);
+    return {x: center.x + p.x, y: center.y + p.y};
+  }
+
+  function sampleRing(center, radius, thickness) {
+    const t = randUniform(0, 2 * Math.PI);
+    const r = radius + thickness * randn();
+    return {x: center.x + r * Math.cos(t), y: center.y + r * Math.sin(t)};
+  }
+
+  function sampleLine(center, len, width, theta) {
+    const u = randUniform(-len, len);
+    const v = width * randn();
+    const p = rotate({x: u, y: v}, theta);
+    return {x: center.x + p.x, y: center.y + p.y};
+  }
+
+  function sampleCrescent(center, radius, thickness, theta) {
+    const t = randUniform(-0.2 * Math.PI, 1.2 * Math.PI);
+    const base = {x: radius * Math.cos(t), y: 0.6 * radius * Math.sin(t)};
+    const offset = {x: -0.45 * radius, y: 0};
+    const noise = {x: thickness * randn(), y: thickness * randn()};
+    const p = rotate({x: base.x + offset.x + noise.x, y: base.y + offset.y + noise.y}, theta);
+    return {x: center.x + p.x, y: center.y + p.y};
+  }
+
+  function sampleStudentish(center, scale, theta) {
+    const g = Math.abs(randn()) + 0.2;
+    const p = rotate({x: scale * randn() / g, y: 0.6 * scale * randn() / g}, theta);
+    return {x: center.x + p.x, y: center.y + p.y};
+  }
+
+  function chooseWeighted(items) {
+    const total = items.reduce((acc, it) => acc + it.w, 0);
+    let r = Math.random() * total;
+    for (const it of items) {
+      r -= it.w;
+      if (r <= 0) return it;
+    }
+    return items[items.length - 1];
+  }
+
+  function randomMixture(n) {
+    const families = [
+      'elliptical-gmm',
+      'ring-gmm',
+      'crescent-gmm',
+      'line-gmm',
+      'hybrid',
+      'heavy-tail-hybrid'
+    ];
+    const family = families[Math.floor(Math.random() * families.length)];
+    const components = [];
+    const k = 2 + Math.floor(Math.random() * 4);
+
+    function randomCenter() {
+      return {x: randUniform(-2.8, 2.8), y: randUniform(-2.6, 2.6)};
+    }
+
+    if (family === 'elliptical-gmm') {
+      for (let i = 0; i < k; i++) {
+        components.push({
+          w: randUniform(0.5, 2.0),
+          kind: 'gaussian',
+          center: randomCenter(),
+          sx: randUniform(0.25, 1.3),
+          sy: randUniform(0.15, 0.9),
+          theta: randUniform(0, Math.PI)
+        });
+      }
+    } else if (family === 'ring-gmm') {
+      components.push({
+        w: randUniform(1.0, 2.5),
+        kind: 'ring',
+        center: randomCenter(),
+        radius: randUniform(1.0, 2.0),
+        thickness: randUniform(0.08, 0.25)
+      });
+      for (let i = 1; i < k; i++) {
+        components.push({
+          w: randUniform(0.3, 1.0),
+          kind: 'gaussian',
+          center: randomCenter(),
+          sx: randUniform(0.2, 0.9),
+          sy: randUniform(0.15, 0.7),
+          theta: randUniform(0, Math.PI)
+        });
+      }
+    } else if (family === 'crescent-gmm') {
+      components.push({
+        w: randUniform(1.0, 2.5),
+        kind: 'crescent',
+        center: randomCenter(),
+        radius: randUniform(1.0, 2.2),
+        thickness: randUniform(0.08, 0.2),
+        theta: randUniform(0, Math.PI)
+      });
+      for (let i = 1; i < k; i++) {
+        components.push({
+          w: randUniform(0.4, 1.2),
+          kind: Math.random() < 0.5 ? 'gaussian' : 'line',
+          center: randomCenter(),
+          sx: randUniform(0.18, 0.8),
+          sy: randUniform(0.12, 0.5),
+          len: randUniform(0.8, 1.8),
+          width: randUniform(0.04, 0.15),
+          theta: randUniform(0, Math.PI)
+        });
+      }
+    } else if (family === 'line-gmm') {
+      for (let i = 0; i < k; i++) {
+        components.push({
+          w: randUniform(0.6, 1.6),
+          kind: Math.random() < 0.7 ? 'line' : 'gaussian',
+          center: randomCenter(),
+          len: randUniform(0.8, 2.0),
+          width: randUniform(0.03, 0.18),
+          sx: randUniform(0.2, 0.8),
+          sy: randUniform(0.12, 0.45),
+          theta: randUniform(0, Math.PI)
+        });
+      }
+    } else if (family === 'heavy-tail-hybrid') {
+      for (let i = 0; i < k; i++) {
+        components.push({
+          w: randUniform(0.5, 1.6),
+          kind: Math.random() < 0.5 ? 'studentish' : (Math.random() < 0.5 ? 'gaussian' : 'ring'),
+          center: randomCenter(),
+          scale: randUniform(0.5, 1.2),
+          sx: randUniform(0.25, 1.0),
+          sy: randUniform(0.18, 0.7),
+          radius: randUniform(0.9, 1.8),
+          thickness: randUniform(0.07, 0.22),
+          theta: randUniform(0, Math.PI)
+        });
+      }
+    } else {
+      for (let i = 0; i < k; i++) {
+        const kinds = ['gaussian', 'ring', 'line', 'crescent'];
+        const kind = kinds[Math.floor(Math.random() * kinds.length)];
+        components.push({
+          w: randUniform(0.5, 1.8),
+          kind: kind,
+          center: randomCenter(),
+          sx: randUniform(0.25, 1.0),
+          sy: randUniform(0.15, 0.8),
+          radius: randUniform(0.9, 1.9),
+          thickness: randUniform(0.07, 0.22),
+          len: randUniform(0.8, 1.7),
+          width: randUniform(0.04, 0.15),
+          theta: randUniform(0, Math.PI)
+        });
+      }
+    }
+
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const c = chooseWeighted(components);
+      let p;
+      if (c.kind === 'gaussian') p = sampleGaussian(c.center, c.sx, c.sy, c.theta);
+      else if (c.kind === 'ring') p = sampleRing(c.center, c.radius, c.thickness);
+      else if (c.kind === 'line') p = sampleLine(c.center, c.len, c.width, c.theta);
+      else if (c.kind === 'crescent') p = sampleCrescent(c.center, c.radius, c.thickness, c.theta);
+      else if (c.kind === 'studentish') p = sampleStudentish(c.center, c.scale, c.theta);
+      else p = sampleGaussian(c.center, 1, 0.4, 0);
+      pts.push(p);
+    }
+    return {points: pts, name: family + ' with ' + k + ' components'};
+  }
+
+  function computeBarycenter(pts) {
+    let sx = 0, sy = 0;
+    for (const p of pts) { sx += p.x; sy += p.y; }
+    return {x: sx / pts.length, y: sy / pts.length};
+  }
+
+  function computeBounds(pts, padFrac) {
+    let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
+    for (const p of pts) {
+      if (p.x < xmin) xmin = p.x;
+      if (p.x > xmax) xmax = p.x;
+      if (p.y < ymin) ymin = p.y;
+      if (p.y > ymax) ymax = p.y;
+    }
+    const dx = xmax - xmin || 1;
+    const dy = ymax - ymin || 1;
+    const padX = padFrac * dx + 0.5;
+    const padY = padFrac * dy + 0.5;
+    return {xmin: xmin - padX, xmax: xmax + padX, ymin: ymin - padY, ymax: ymax + padY};
+  }
+
+  function worldToScreen(p) {
+    const margin = 40;
+    const w = canvas.width - 2 * margin;
+    const h = canvas.height - 2 * margin;
+    const sx = margin + (p.x - bbox.xmin) / (bbox.xmax - bbox.xmin) * w;
+    const sy = canvas.height - margin - (p.y - bbox.ymin) / (bbox.ymax - bbox.ymin) * h;
+    return {x: sx, y: sy};
+  }
+
+  function screenToWorld(px, py) {
+    const rect = canvas.getBoundingClientRect();
+    const x = (px - rect.left) * canvas.width / rect.width;
+    const y = (py - rect.top) * canvas.height / rect.height;
+    const margin = 40;
+    const w = canvas.width - 2 * margin;
+    const h = canvas.height - 2 * margin;
+    const wx = bbox.xmin + (x - margin) / w * (bbox.xmax - bbox.xmin);
+    const wy = bbox.ymin + (canvas.height - margin - y) / h * (bbox.ymax - bbox.ymin);
+    return {x: wx, y: wy};
+  }
+
+  function vecLen(v) {
+    return Math.sqrt(v.x * v.x + v.y * v.y);
+  }
+
+  function computeField(alpha) {
+    const eps = 1e-8;
+    let sumW = 0, sumZX = 0, sumZY = 0;
+    let sumFx = 0, sumFy = 0;
+    let h11 = 0, h12 = 0, h22 = 0;
+    for (const z of points) {
+      const dx = probe.x - z.x;
+      const dy = probe.y - z.y;
+      const r2 = dx * dx + dy * dy + eps;
+      const r = Math.sqrt(r2);
+      const w = Math.pow(r, -alpha);
+      sumW += w;
+      sumZX += w * z.x;
+      sumZY += w * z.y;
+      sumFx += w * dx;
+      sumFy += w * dy;
+      const ex = dx / r;
+      const ey = dy / r;
+      const fac = w / (1 - alpha);
+      h11 += fac * (1 - alpha * ex * ex);
+      h12 += fac * (-alpha * ex * ey);
+      h22 += fac * (1 - alpha * ey * ey);
+    }
+    const n = points.length;
+    const meanW = sumW / n;
+    const bAlpha = {x: sumZX / sumW, y: sumZY / sumW};
+    const Aalpha = {x: sumFx / n / (1 - alpha), y: sumFy / n / (1 - alpha)};
+    const AalphaViaB = {x: (meanW / (1 - alpha)) * (probe.x - bAlpha.x), y: (meanW / (1 - alpha)) * (probe.y - bAlpha.y)};
+    const A0 = {x: probe.x - barycenter.x, y: probe.y - barycenter.y};
+    const H = {h11: h11 / n, h12: h12 / n, h22: h22 / n};
+
+    const q11 = 1 - (1 - alpha) * H.h11 / meanW;
+    const q12 = - (1 - alpha) * H.h12 / meanW;
+    const q22 = 1 - (1 - alpha) * H.h22 / meanW;
+
+    return {
+      bAlpha,
+      Aalpha,
+      AalphaViaB,
+      A0,
+      H,
+      Q: {q11, q12, q22},
+      meanW,
+      err: vecLen({x: Aalpha.x - AalphaViaB.x, y: Aalpha.y - AalphaViaB.y})
+    };
+  }
+
+  function drawArrow(from, to, color, width, dash) {
+    const a = worldToScreen(from);
+    const b = worldToScreen(to);
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const L = Math.sqrt(dx * dx + dy * dy);
+    if (L < 2) return;
+    const ux = dx / L;
+    const uy = dy / L;
+    const head = 11 + 0.3 * width;
+
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = width;
+    if (dash) ctx.setLineDash(dash);
+
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x - head * ux, b.y - head * uy);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.beginPath();
+    ctx.moveTo(b.x, b.y);
+    ctx.lineTo(b.x - head * ux - 0.55 * head * uy, b.y - head * uy + 0.55 * head * ux);
+    ctx.lineTo(b.x - head * ux + 0.55 * head * uy, b.y - head * uy - 0.55 * head * ux);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawPoint(p, color, radius, label) {
+    const s = worldToScreen(p);
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, radius, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+    ctx.stroke();
+    if (label) {
+      ctx.fillStyle = '#111827';
+      ctx.font = '13px Arial';
+      ctx.fillText(label, s.x + radius + 6, s.y - radius - 4);
+    }
+    ctx.restore();
+  }
+
+  function drawAxes() {
+    const x0 = worldToScreen({x: bbox.xmin, y: 0});
+    const x1 = worldToScreen({x: bbox.xmax, y: 0});
+    const y0 = worldToScreen({x: 0, y: bbox.ymin});
+    const y1 = worldToScreen({x: 0, y: bbox.ymax});
+    ctx.save();
+    ctx.strokeStyle = '#e5e7eb';
+    ctx.lineWidth = 1;
+    if (0 >= bbox.ymin && 0 <= bbox.ymax) {
+      ctx.beginPath(); ctx.moveTo(x0.x, x0.y); ctx.lineTo(x1.x, x1.y); ctx.stroke();
+    }
+    if (0 >= bbox.xmin && 0 <= bbox.xmax) {
+      ctx.beginPath(); ctx.moveTo(y0.x, y0.y); ctx.lineTo(y1.x, y1.y); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawScene() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    drawAxes();
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(17,24,39,0.40)';
+    for (const p of points) {
+      const s = worldToScreen(p);
+      ctx.fillRect(s.x - 1.3, s.y - 1.3, 2.6, 2.6);
+    }
+    ctx.restore();
+
+    drawPoint(barycenter, '#2563eb', 6, 'm');
+    drawPoint(probe, '#dc2626', 6, 'x');
+
+    if (computed) {
+      drawPoint(computed.bAlpha, '#f59e0b', 6, 'bα(x)');
+
+      const diag = Math.sqrt((bbox.xmax - bbox.xmin) ** 2 + (bbox.ymax - bbox.ymin) ** 2);
+      const drift0 = {x: -computed.A0.x, y: -computed.A0.y};
+      const drifta = {x: -computed.Aalpha.x, y: -computed.Aalpha.y};
+      const norm0 = Math.max(vecLen(drift0), 1e-12);
+      const norma = Math.max(vecLen(drifta), 1e-12);
+      const targetLen0 = 0.13 * diag * Math.tanh(norm0 / (0.18 * diag));
+      const targetLena = 0.13 * diag * Math.tanh(norma / (0.18 * diag));
+      const end0 = {x: probe.x + drift0.x / norm0 * targetLen0, y: probe.y + drift0.y / norm0 * targetLen0};
+      const enda = {x: probe.x + drifta.x / norma * targetLena, y: probe.y + drifta.y / norma * targetLena};
+
+      drawArrow(probe, end0, '#2563eb', 3, [6, 5]);
+      drawArrow(probe, enda, '#f59e0b', 4, null);
+      drawArrow(probe, barycenter, 'rgba(37,99,235,0.30)', 1.5, [3, 4]);
+      drawArrow(probe, computed.bAlpha, 'rgba(245,158,11,0.25)', 1.5, [3, 4]);
+    }
+
+    ctx.save();
+    ctx.fillStyle = '#111827';
+    ctx.font = '13px Arial';
+    ctx.fillText('Click to place probe x', 50, 28);
+    ctx.restore();
+  }
+
+  function updateMetrics() {
+    const alpha = parseFloat(alphaSlider.value);
+    const c = computed;
+    metrics.innerHTML = [
+      'distribution: ' + distName,
+      'α = ' + alpha.toFixed(2),
+      '',
+      'probe x = (' + probe.x.toFixed(3) + ', ' + probe.y.toFixed(3) + ')',
+      'ordinary barycenter m = (' + barycenter.x.toFixed(3) + ', ' + barycenter.y.toFixed(3) + ')',
+      'α-weighted barycenter bα(x) = (' + c.bAlpha.x.toFixed(3) + ', ' + c.bAlpha.y.toFixed(3) + ')',
+      '',
+      'A0(x) = x - m = (' + c.A0.x.toFixed(3) + ', ' + c.A0.y.toFixed(3) + ')',
+      '|A0(x)| = ' + vecLen(c.A0).toFixed(4),
+      '',
+      'Aα(x) = (' + c.Aalpha.x.toFixed(3) + ', ' + c.Aalpha.y.toFixed(3) + ')',
+      '|Aα(x)| = ' + vecLen(c.Aalpha).toFixed(4),
+      'Mα(x) = E[|x-Z|^{-α}] = ' + c.meanW.toFixed(4),
+      'decomposition error ||Aα - (Mα/(1-α))(x-bα)|| = ' + c.err.toExponential(2),
+      '',
+      'Hα(x) ≈ [[' + c.H.h11.toFixed(3) + ', ' + c.H.h12.toFixed(3) + '], [' + c.H.h12.toFixed(3) + ', ' + c.H.h22.toFixed(3) + ']]',
+      'Qα(x) ≈ [[' + c.Q.q11.toFixed(3) + ', ' + c.Q.q12.toFixed(3) + '], [' + c.Q.q12.toFixed(3) + ', ' + c.Q.q22.toFixed(3) + ']]'
+    ].join('<br>');
+  }
+
+  function recompute() {
+    alphaValue.textContent = parseFloat(alphaSlider.value).toFixed(2);
+    sampleCountValue.textContent = sampleCount.value;
+    distNameEl.textContent = distName;
+    computed = computeField(parseFloat(alphaSlider.value));
+    updateMetrics();
+    drawScene();
+  }
+
+  function regenerate() {
+    const n = parseInt(sampleCount.value, 10);
+    const out = randomMixture(n);
+    points = out.points;
+    distName = out.name;
+    barycenter = computeBarycenter(points);
+    bbox = computeBounds(points, 0.18);
+    if (!probe || !isFinite(probe.x) || !isFinite(probe.y)) {
+      probe = {x: barycenter.x + 0.8, y: barycenter.y + 0.4};
+    } else {
+      probe = {x: barycenter.x + 0.25 * (bbox.xmax - bbox.xmin), y: barycenter.y + 0.10 * (bbox.ymax - bbox.ymin)};
+    }
+    recompute();
+  }
+
+  alphaSlider.addEventListener('input', recompute);
+  sampleCount.addEventListener('input', () => {
+    sampleCountValue.textContent = sampleCount.value;
+  });
+  sampleCount.addEventListener('change', regenerate);
+  randomBtn.addEventListener('click', regenerate);
+  canvas.addEventListener('click', (evt) => {
+    probe = screenToWorld(evt.clientX, evt.clientY);
+    recompute();
+  });
+
+  regenerate();
+})();
+</script>
+</body>
+</html>

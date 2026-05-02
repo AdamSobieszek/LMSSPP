@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Peszek-Poyato Barycenters on LMS Canonical Orbit</title>
+<style>
+  :root {
+    --paper: #f5f1e8;
+    --panel: #fffaf0;
+    --ink: #18233a;
+    --muted: #60708d;
+    --line: #d7cdb8;
+    --blue: #244c9a;
+    --red: #d72638;
+    --green: #188038;
+    --orange: #f2a900;
+    --purple: #6f4cc3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(circle at 20% 10%, rgba(242,169,0,0.18), transparent 28%),
+      radial-gradient(circle at 85% 18%, rgba(36,76,154,0.14), transparent 34%),
+      linear-gradient(135deg, #fbf7ec 0%, #eef4fb 100%);
+    color: var(--ink);
+    font-family: ui-serif, Georgia, Cambria, "Times New Roman", serif;
+  }
+  .wrap {
+    max-width: 1420px;
+    margin: 0 auto;
+    padding: 18px;
+  }
+  h1 {
+    margin: 0 0 6px;
+    font-size: 25px;
+    letter-spacing: -0.02em;
+  }
+  .topnote {
+    margin: 0 0 14px;
+    color: var(--muted);
+    line-height: 1.42;
+    max-width: 1120px;
+  }
+  .controls {
+    display: grid;
+    grid-template-columns: 1.05fr 1fr 1fr 1fr;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .card {
+    background: rgba(255,250,240,0.92);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: 0 8px 28px rgba(45,38,22,0.08);
+    padding: 11px 12px;
+  }
+  .main {
+    display: grid;
+    grid-template-columns: minmax(640px, 2.15fr) minmax(330px, 0.95fr);
+    gap: 14px;
+    align-items: start;
+  }
+  canvas {
+    width: 100%;
+    height: auto;
+    display: block;
+    background: rgba(255,255,255,0.88);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    box-shadow: 0 12px 34px rgba(24,35,58,0.10);
+  }
+  label {
+    display: block;
+    font-weight: 700;
+    font-size: 13px;
+    margin-bottom: 5px;
+  }
+  input[type="range"] { width: 100%; }
+  select, input[type="number"] {
+    width: 100%;
+    border: 1px solid #c6bca8;
+    border-radius: 8px;
+    padding: 7px 8px;
+    background: white;
+    color: var(--ink);
+  }
+  button {
+    width: 100%;
+    border: 0;
+    border-radius: 9px;
+    background: var(--ink);
+    color: white;
+    font-weight: 700;
+    padding: 9px 10px;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.12); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .small { color: var(--muted); font-size: 12px; line-height: 1.25; }
+  .metrics {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.48;
+    white-space: normal;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 5px 0;
+    font-size: 13px;
+  }
+  .swatch {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 1px solid rgba(0,0,0,0.28);
+    flex: 0 0 auto;
+  }
+  code, .eq {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: rgba(255,255,255,0.76);
+    border: 1px solid #e4dac5;
+    border-radius: 8px;
+    padding: 2px 5px;
+  }
+  .eq {
+    display: block;
+    margin: 8px 0;
+    padding: 8px;
+    overflow-wrap: anywhere;
+    color: #28364f;
+  }
+  .checkline {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    font-size: 13px;
+  }
+  @media (max-width: 1000px) {
+    .controls, .main { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Peszek-Poyato barycenters on a finite-N LMS canonical orbit</h1>
+  <p class="topnote">
+    The radius slider is an initialization hyperparameter: it first generates an observed cloud <code>x_i^0</code> with the requested exact-gauge radius, then the widget solves <code>sum_i a_i M_{-w_*}(x_i^0)=0</code>, freezes <code>p_i^0=M_{-w_*}(x_i^0)</code>, and draws the reduced trajectory <code>w(t)</code>. Click the plot to evaluate the Peszek-Poyato <code>W^alpha</code> kernel barycenter of the selected empirical support at the probe point <code>x</code>.
+  </p>
+
+  <div class="controls">
+    <div class="card">
+      <div class="row">
+        <div>
+          <label for="presetSelect">x<sup>0</sup> preset</label>
+          <select id="presetSelect">
+            <option value="random">Random</option>
+            <option value="balanced">Balanced</option>
+            <option value="clustered">Clustered</option>
+            <option value="dipole">Dipole</option>
+          </select>
+        </div>
+        <div>
+          <label for="seedInput">Shape seed</label>
+          <input id="seedInput" type="number" min="1" max="999999" step="1" value="7" />
+        </div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <div>
+          <label for="supportSelect">PP support</label>
+          <select id="supportSelect">
+            <option value="canonical" selected>p_i^0 canonical</option>
+            <option value="observed">x_i^0 observed</option>
+          </select>
+        </div>
+        <div class="checkline"><input id="showObserved" type="checkbox" checked /> <span>show comparison cloud</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <label for="nSlider">N support points: <span id="nValue">18</span></label>
+      <input id="nSlider" type="range" min="3" max="80" step="1" value="18" />
+      <label for="initRadiusSlider" style="margin-top:8px">init hyperparameter |w|: <span id="initRadiusValue">0.350</span></label>
+      <input id="initRadiusSlider" type="range" min="0" max="0.985" step="0.005" value="0.350" />
+    </div>
+
+    <div class="card">
+      <label for="alphaSlider">Peszek-Poyato alpha: <span id="alphaValue">0.35</span></label>
+      <input id="alphaSlider" type="range" min="0" max="0.99" step="0.01" value="0.35" />
+      <div class="small"><code>b_alpha(x)=E[|x-Z|^{-alpha} Z]/E[|x-Z|^{-alpha}]</code>, with <code>Z</code> chosen by the PP-support selector.</div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <label for="framesSlider">trajectory frames: <span id="framesValue">180</span></label>
+          <input id="framesSlider" type="range" min="10" max="300" step="1" value="180" />
+        </div>
+        <div>
+          <label for="stepSlider">flow step: <span id="stepValue">0.160</span></label>
+          <input id="stepSlider" type="range" min="0.01" max="0.5" step="0.005" value="0.160" />
+        </div>
+      </div>
+      <button id="randomSeedBtn" style="margin-top:8px">New shape seed</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <canvas id="plot" width="980" height="820"></canvas>
+    <div class="card">
+      <h3 style="margin:0 0 8px">Displayed objects</h3>
+      <div class="legend-item"><span class="swatch" style="background:white"></span> unit circle <code>partial B^2</code></div>
+      <div class="legend-item"><span class="swatch" style="background:#244c9a"></span> active Peszek-Poyato support cloud <code>Z_i</code></div>
+      <div class="legend-item"><span class="swatch" style="background:#d8e3f7"></span> comparison cloud: the other one of <code>x_i^0,p_i^0</code></div>
+      <div class="legend-item"><span class="swatch" style="background:#111827"></span> reduced initial point <code>w(0)=w_*</code></div>
+      <div class="legend-item"><span class="swatch" style="background:#188038"></span> end of reduced path <code>w(T)</code></div>
+      <div class="legend-item"><span class="swatch" style="background:#d72638"></span> clicked probe <code>x</code></div>
+      <div class="legend-item"><span class="swatch" style="background:#f2a900"></span> kernel barycenter <code>b_alpha(x)</code></div>
+      <div class="legend-item"><span class="swatch" style="background:#244c9a"></span> ordinary barycenter <code>m=sum a_i Z_i</code></div>
+
+      <h3>Equations</h3>
+      <div class="eq">radius hyperparameter -> x_i^0, then sum_i a_i M_{-w_*}(x_i^0)=0 and p_i^0=M_{-w_*}(x_i^0)</div>
+      <div class="eq">trajectory: dot w = -0.5(1-|w|^2) sum_i a_i M_w(p_i^0)</div>
+      <div class="eq">A_alpha(x) = (1/(1-alpha)) sum_i a_i |x-Z_i|^{-alpha}(x-Z_i)</div>
+      <div class="eq">b_alpha(x) = sum_i a_i |x-Z_i|^{-alpha}Z_i / sum_i a_i |x-Z_i|^{-alpha}</div>
+
+      <h3>Numerical values</h3>
+      <div id="metrics" class="metrics"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  const canvas = document.getElementById('plot');
+  const ctx = canvas.getContext('2d');
+  const presetSelect = document.getElementById('presetSelect');
+  const seedInput = document.getElementById('seedInput');
+  const supportSelect = document.getElementById('supportSelect');
+  const nSlider = document.getElementById('nSlider');
+  const nValue = document.getElementById('nValue');
+  const initRadiusSlider = document.getElementById('initRadiusSlider');
+  const initRadiusValue = document.getElementById('initRadiusValue');
+  const alphaSlider = document.getElementById('alphaSlider');
+  const alphaValue = document.getElementById('alphaValue');
+  const framesSlider = document.getElementById('framesSlider');
+  const framesValue = document.getElementById('framesValue');
+  const stepSlider = document.getElementById('stepSlider');
+  const stepValue = document.getElementById('stepValue');
+  const randomSeedBtn = document.getElementById('randomSeedBtn');
+  const showObserved = document.getElementById('showObserved');
+  const metrics = document.getElementById('metrics');
+
+  const EPS = 1e-12;
+  const TAU = 2 * Math.PI;
+  const worldLimit = 1.36;
+  let state = null;
+  let probe = { x: 0.32, y: 0.18 };
+  let field = null;
+
+  function activeSupportPoints() {
+    if (!state) return [];
+    return supportSelect.value === 'observed' ? state.observed : state.p0;
+  }
+
+  function activeSupportLabel() {
+    return supportSelect.value === 'observed' ? 'x_i^0 observed initialization' : 'p_i^0 canonical constants';
+  }
+
+  function comparisonSupportPoints() {
+    if (!state) return [];
+    return supportSelect.value === 'observed' ? state.p0 : state.observed;
+  }
+
+  function comparisonSupportLabel() {
+    return supportSelect.value === 'observed' ? 'p_i^0 canonical constants' : 'x_i^0 observed initialization';
+  }
+
+  function makeRng(seed) {
+    let t = (Number(seed) || 1) >>> 0;
+    return function() {
+      t += 0x6D2B79F5;
+      let r = Math.imul(t ^ (t >>> 15), 1 | t);
+      r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function randn(rng) {
+    let u = 0, v = 0;
+    while (u <= 0) u = rng();
+    while (v <= 0) v = rng();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(TAU * v);
+  }
+
+  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+  function dot(a, b) { return a.x * b.x + a.y * b.y; }
+  function add(a, b) { return { x: a.x + b.x, y: a.y + b.y }; }
+  function sub(a, b) { return { x: a.x - b.x, y: a.y - b.y }; }
+  function scale(v, s) { return { x: v.x * s, y: v.y * s }; }
+  function neg(v) { return { x: -v.x, y: -v.y }; }
+  function norm2(v) { return dot(v, v); }
+  function norm(v) { return Math.hypot(v.x, v.y); }
+  function unit(v, fallback = {x: 1, y: 0}) {
+    const n = norm(v);
+    return n > EPS ? scale(v, 1 / n) : { x: fallback.x, y: fallback.y };
+  }
+  function angleVec(theta) { return { x: Math.cos(theta), y: Math.sin(theta) }; }
+  function angleOf(v) { return Math.atan2(v.y, v.x); }
+  function fmt(x, d = 4) { return Number.isFinite(x) ? x.toFixed(d) : 'nan'; }
+  function fmtExp(x) { return Number.isFinite(x) ? x.toExponential(2) : 'nan'; }
+
+  function normalizePoints(points) {
+    return points.map((p) => unit(p));
+  }
+
+  function clampToDisk(v, radius = 0.999999) {
+    const n = norm(v);
+    return n > radius ? scale(v, radius / Math.max(n, EPS)) : v;
+  }
+
+  function mobiusBoundaryAction(w, x) {
+    const diff = sub(x, w);
+    const denom = Math.max(norm2(diff), EPS);
+    const factor = (1 - norm2(w)) / denom;
+    return unit(sub(scale(diff, factor), w));
+  }
+
+  function weightsUniform(n) {
+    const a = 1 / Math.max(1, n);
+    return Array.from({ length: n }, () => a);
+  }
+
+  function weightedMean(points, weights) {
+    let sx = 0, sy = 0;
+    for (let i = 0; i < points.length; i++) {
+      sx += weights[i] * points[i].x;
+      sy += weights[i] * points[i].y;
+    }
+    return { x: sx, y: sy };
+  }
+
+  function weightedSecond(points, weights) {
+    let c11 = 0, c12 = 0, c22 = 0;
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      c11 += weights[i] * p.x * p.x;
+      c12 += weights[i] * p.x * p.y;
+      c22 += weights[i] * p.y * p.y;
+    }
+    return { c11, c12, c22 };
+  }
+
+  function solve2x2(a11, a12, a21, a22, b1, b2) {
+    const det = a11 * a22 - a12 * a21;
+    if (Math.abs(det) < 1e-14 || !Number.isFinite(det)) return null;
+    return { x: (b1 * a22 - a12 * b2) / det, y: (a11 * b2 - b1 * a21) / det };
+  }
+
+  function localCanonicalInitializer(points, weights) {
+    const mu = weightedMean(points, weights);
+    const C = weightedSecond(points, weights);
+    const lam = 1e-6;
+    const sol = solve2x2(
+      1 - C.c11 + lam,
+      -C.c12,
+      -C.c12,
+      1 - C.c22 + lam,
+      mu.x,
+      mu.y
+    );
+    return clampToDisk(sol ? scale(sol, 0.5) : scale(mu, 0.1), 0.95);
+  }
+
+  function canonicalResidualZ(z, points, weights) {
+    let sx = 0, sy = 0;
+    for (let i = 0; i < points.length; i++) {
+      const pushed = mobiusBoundaryAction(z, points[i]);
+      sx += weights[i] * pushed.x;
+      sy += weights[i] * pushed.y;
+    }
+    return { x: sx, y: sy };
+  }
+
+  function residualNorm(z, points, weights) {
+    return norm(canonicalResidualZ(z, points, weights));
+  }
+
+  function canonicalCenter(points, weights, initial = null) {
+    let z = clampToDisk(initial ? initial : localCanonicalInitializer(points, weights), 0.985);
+    let best = z;
+    let bestNorm = residualNorm(z, points, weights);
+    let converged = bestNorm < 1e-10;
+    let iterations = 0;
+
+    for (let iter = 0; iter < 80; iter++) {
+      iterations = iter + 1;
+      const r = canonicalResidualZ(z, points, weights);
+      const rn = norm(r);
+      if (rn < bestNorm) { best = z; bestNorm = rn; }
+      if (rn < 1e-10) { converged = true; break; }
+
+      const h = 1e-5 * (1 + norm(z));
+      const rxp = canonicalResidualZ({ x: z.x + h, y: z.y }, points, weights);
+      const rxm = canonicalResidualZ({ x: z.x - h, y: z.y }, points, weights);
+      const ryp = canonicalResidualZ({ x: z.x, y: z.y + h }, points, weights);
+      const rym = canonicalResidualZ({ x: z.x, y: z.y - h }, points, weights);
+      const j11 = (rxp.x - rxm.x) / (2 * h);
+      const j21 = (rxp.y - rxm.y) / (2 * h);
+      const j12 = (ryp.x - rym.x) / (2 * h);
+      const j22 = (ryp.y - rym.y) / (2 * h);
+      const delta = solve2x2(j11, j12, j21, j22, r.x, r.y);
+      let improved = false;
+      if (delta && Number.isFinite(delta.x) && Number.isFinite(delta.y)) {
+        for (let ls = 0; ls < 12; ls++) {
+          const s = Math.pow(0.5, ls);
+          const cand = clampToDisk(sub(z, scale(delta, s)), 0.999999);
+          const cn = residualNorm(cand, points, weights);
+          if (cn < rn) {
+            z = cand;
+            improved = true;
+            break;
+          }
+        }
+      }
+      if (!improved) {
+        const cand = clampToDisk(sub(z, scale(r, 0.08)), 0.999999);
+        const cn = residualNorm(cand, points, weights);
+        if (cn < rn) z = cand;
+        else break;
+      }
+    }
+    const finalNorm = residualNorm(z, points, weights);
+    if (bestNorm < finalNorm) z = best;
+    const residual = canonicalResidualZ(z, points, weights);
+    return { z, residual, residualNorm: norm(residual), converged, iterations };
+  }
+
+  function canonicalCloud(points, weights) {
+    const solve = canonicalCenter(points, weights);
+    const P = points.map((x) => mobiusBoundaryAction(solve.z, x));
+    const center = weightedMean(P, weights);
+    return {
+      z: solve.z,
+      w: neg(solve.z),
+      P,
+      center,
+      centerError: norm(center),
+      residualNorm: solve.residualNorm,
+      converged: solve.converged,
+      iterations: solve.iterations
+    };
+  }
+
+  function randomSpherePoints(n, preset, rng) {
+    const pts = [];
+    if (preset === 'balanced') {
+      for (let i = 0; i < n; i++) pts.push(angleVec(TAU * i / n));
+    } else if (preset === 'clustered') {
+      for (let i = 0; i < n; i++) pts.push(angleVec(0.2 + 0.35 * randn(rng)));
+    } else if (preset === 'dipole') {
+      const half = Math.floor(n / 2);
+      for (let i = 0; i < half; i++) pts.push(angleVec(0.16 * randn(rng)));
+      for (let i = half; i < n; i++) pts.push(angleVec(Math.PI + 0.16 * randn(rng)));
+    } else {
+      for (let i = 0; i < n; i++) pts.push(angleVec(-Math.PI + TAU * rng()));
+    }
+    return normalizePoints(pts);
+  }
+
+  function rotatePoint(p, theta) {
+    const c = Math.cos(theta);
+    const s = Math.sin(theta);
+    return { x: c * p.x - s * p.y, y: s * p.x + c * p.y };
+  }
+
+  function radiusDependentCandidateCloud(n, preset, rng, targetRadius, targetW) {
+    const r = clamp(targetRadius, 0, 0.985);
+    const physicalDir = unit(neg(targetW), { x: -1, y: 0 });
+    const base = randomSpherePoints(n, preset, rng);
+    const tangent = { x: -physicalDir.y, y: physicalDir.x };
+    const pts = [];
+
+    if (preset === 'balanced') {
+      const phase = TAU * rng();
+      const warp3 = 0.16 + 0.54 * r;
+      const warp5 = 0.05 + 0.16 * r;
+      const tilt = 0.10 * r;
+      for (let i = 0; i < n; i++) {
+        const theta = TAU * i / n;
+        const warpedTheta =
+          theta
+          + warp3 * Math.sin(3.0 * theta + phase)
+          + warp5 * Math.sin(5.0 * theta - 0.7 * phase);
+        const radialBias = 1.0 + tilt * Math.cos(2.0 * theta + 0.3 * phase);
+        pts.push(unit(add(scale(physicalDir, radialBias * Math.cos(warpedTheta)), scale(tangent, Math.sin(warpedTheta)))));
+      }
+      return pts;
+    }
+
+    if (preset === 'clustered') {
+      const spread = Math.max(0.08, 0.72 * (1.0 - 0.72 * r));
+      const centerAngle = angleOf(physicalDir);
+      for (let i = 0; i < n; i++) {
+        pts.push(angleVec(centerAngle + spread * randn(rng)));
+      }
+      return pts;
+    }
+
+    if (preset === 'dipole') {
+      const half = Math.floor(n / 2);
+      const spread = Math.max(0.06, 0.20 * (1.0 - 0.45 * r));
+      const minorityWeight = 0.5 * (1.0 - 0.78 * r);
+      const minorityCount = Math.max(1, Math.min(n - 1, Math.round(n * minorityWeight)));
+      const majorityCount = n - minorityCount;
+      const mainAngle = angleOf(physicalDir);
+      for (let i = 0; i < majorityCount; i++) pts.push(angleVec(mainAngle + spread * randn(rng)));
+      for (let i = majorityCount; i < n; i++) pts.push(angleVec(mainAngle + Math.PI + spread * randn(rng)));
+      // For small r, keep the original dipole closer to balanced halves.
+      if (r < 0.08 && half > 0) {
+        pts.length = 0;
+        for (let i = 0; i < half; i++) pts.push(angleVec(mainAngle + 0.16 * randn(rng)));
+        for (let i = half; i < n; i++) pts.push(angleVec(mainAngle + Math.PI + 0.16 * randn(rng)));
+      }
+      return pts;
+    }
+
+    // Random mode: preserve the seed-level random shape, but bias it before
+    // exact inversion.  This is the
+    // finite-N analogue of the non-Poisson widget initializers: the generated
+    // cloud itself depends on the requested radius, and exact orbit projection
+    // only happens after this cloud has been inverted.
+    const mix = clamp(0.10 + 1.22 * r, 0.0, 0.92);
+    const twist = 0.42 * r;
+    for (const p0 of base) {
+      const p = rotatePoint(p0, twist * dot(p0, tangent));
+      const jitter = scale(tangent, 0.08 * r * randn(rng));
+      pts.push(unit(add(add(scale(p, 1.0 - mix), scale(physicalDir, mix)), jitter)));
+    }
+    return pts;
+  }
+
+  function initializeObservedCloud(n, preset, seed, targetRadius) {
+    const rng = makeRng(seed);
+    const weights = weightsUniform(n);
+    const targetW = { x: clamp(targetRadius, 0, 0.985), y: 0 };
+    const generated = radiusDependentCandidateCloud(n, preset, rng, targetRadius, targetW);
+    const invertedGenerated = canonicalCloud(generated, weights);
+    const observed = invertedGenerated.P.map((p) => mobiusBoundaryAction(targetW, p));
+    const exact = canonicalCloud(observed, weights);
+    return {
+      generated,
+      observed,
+      weights,
+      p0: exact.P,
+      wStar: exact.w,
+      targetW,
+      generatedRadius: norm(invertedGenerated.w),
+      generatedCenterError: invertedGenerated.centerError,
+      centerError: exact.centerError,
+      residualNorm: exact.residualNorm,
+      achievedRadius: norm(exact.w),
+      achievedAngle: angleOf(exact.w),
+      converged: exact.converged,
+      iterations: exact.iterations
+    };
+  }
+
+  function reflectedPoint(w, p) {
+    const n = sub(p, w);
+    const denom = Math.max(norm2(n), EPS);
+    const coeff = 2 * dot(p, n) / denom;
+    return unit(sub(p, scale(n, coeff)));
+  }
+
+  function reflectedBarycenter(w, points, weights) {
+    let sx = 0, sy = 0;
+    for (let i = 0; i < points.length; i++) {
+      const r = reflectedPoint(w, points[i]);
+      sx += weights[i] * r.x;
+      sy += weights[i] * r.y;
+    }
+    return { x: sx, y: sy };
+  }
+
+  function opticalVelocity(w, points, weights) {
+    const R = reflectedBarycenter(w, points, weights);
+    return scale(R, 0.5 * Math.max(0, 1 - norm2(w)));
+  }
+
+  function integrateOrbit(w0, points, weights, frames, stepSize) {
+    const out = [w0];
+    let w = { x: w0.x, y: w0.y };
+    for (let k = 1; k < frames; k++) {
+      const v = opticalVelocity(w, points, weights);
+      let nxt = clampToDisk(add(w, scale(v, stepSize)), 0.985);
+      if (!Number.isFinite(nxt.x) || !Number.isFinite(nxt.y)) break;
+      out.push(nxt);
+      w = nxt;
+      if (norm(w) >= 0.984) break;
+    }
+    return out;
+  }
+
+  function computePeszekPoyatoField(x, points, weights, alpha) {
+    const a = clamp(alpha, 0, 0.99);
+    const oneMinus = Math.max(1e-9, 1 - a);
+    let sumK = 0;
+    let bzX = 0, bzY = 0;
+    let Ax = 0, Ay = 0;
+    let h11 = 0, h12 = 0, h22 = 0;
+    const m = weightedMean(points, weights);
+    for (let i = 0; i < points.length; i++) {
+      const z = points[i];
+      const dx = x.x - z.x;
+      const dy = x.y - z.y;
+      const r2 = Math.max(dx * dx + dy * dy, 1e-12);
+      const r = Math.sqrt(r2);
+      const k = Math.pow(r, -a);
+      const wk = weights[i] * k;
+      sumK += wk;
+      bzX += wk * z.x;
+      bzY += wk * z.y;
+      Ax += wk * dx;
+      Ay += wk * dy;
+      const ex = dx / r;
+      const ey = dy / r;
+      const fac = wk / oneMinus;
+      h11 += fac * (1 - a * ex * ex);
+      h12 += fac * (-a * ex * ey);
+      h22 += fac * (1 - a * ey * ey);
+    }
+    const bAlpha = sumK > EPS ? { x: bzX / sumK, y: bzY / sumK } : { x: 0, y: 0 };
+    const Aalpha = { x: Ax / oneMinus, y: Ay / oneMinus };
+    const AalphaViaB = scale(sub(x, bAlpha), sumK / oneMinus);
+    const A0 = sub(x, m);
+    const err = norm(sub(Aalpha, AalphaViaB));
+    const q11 = 1 - oneMinus * h11 / Math.max(sumK, EPS);
+    const q12 = -oneMinus * h12 / Math.max(sumK, EPS);
+    const q22 = 1 - oneMinus * h22 / Math.max(sumK, EPS);
+    return {
+      supportMean: m,
+      bAlpha,
+      Aalpha,
+      AalphaViaB,
+      A0,
+      Malpha: sumK,
+      H: { h11, h12, h22 },
+      Q: { q11, q12, q22 },
+      err
+    };
+  }
+
+  function plotGeometry() {
+    const margin = { left: 60, right: 34, top: 58, bottom: 58 };
+    const w = canvas.width - margin.left - margin.right;
+    const h = canvas.height - margin.top - margin.bottom;
+    const size = Math.min(w, h);
+    const cx = margin.left + w / 2;
+    const cy = margin.top + h / 2;
+    const scalePx = size / (2 * worldLimit);
+    return { cx, cy, scalePx };
+  }
+
+  function worldToScreen(p) {
+    const g = plotGeometry();
+    return { x: g.cx + p.x * g.scalePx, y: g.cy - p.y * g.scalePx };
+  }
+
+  function screenToWorld(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const px = (clientX - rect.left) * canvas.width / rect.width;
+    const py = (clientY - rect.top) * canvas.height / rect.height;
+    const g = plotGeometry();
+    return { x: (px - g.cx) / g.scalePx, y: -(py - g.cy) / g.scalePx };
+  }
+
+  function drawLine(a, b, color, width = 2, dash = null, alpha = 1) {
+    const A = worldToScreen(a);
+    const B = worldToScreen(b);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    if (dash) ctx.setLineDash(dash);
+    ctx.beginPath();
+    ctx.moveTo(A.x, A.y);
+    ctx.lineTo(B.x, B.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawArrow(from, to, color, width = 3, dash = null, alpha = 1) {
+    const A = worldToScreen(from);
+    const B = worldToScreen(to);
+    const dx = B.x - A.x, dy = B.y - A.y;
+    const L = Math.hypot(dx, dy);
+    if (L < 2) return;
+    const ux = dx / L, uy = dy / L;
+    const head = 11 + width;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = width;
+    if (dash) ctx.setLineDash(dash);
+    ctx.beginPath();
+    ctx.moveTo(A.x, A.y);
+    ctx.lineTo(B.x - head * ux, B.y - head * uy);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(B.x, B.y);
+    ctx.lineTo(B.x - head * ux - 0.55 * head * uy, B.y - head * uy + 0.55 * head * ux);
+    ctx.lineTo(B.x - head * ux + 0.55 * head * uy, B.y - head * uy - 0.55 * head * ux);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawPoint(p, fill, radius, label = null, stroke = 'rgba(0,0,0,0.35)', alpha = 1) {
+    const s = worldToScreen(p);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = fill;
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, radius, 0, TAU);
+    ctx.fill();
+    ctx.stroke();
+    if (label) {
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#18233a';
+      ctx.font = '13px Georgia, serif';
+      ctx.fillText(label, s.x + radius + 6, s.y - radius - 3);
+    }
+    ctx.restore();
+  }
+
+  function drawAxesAndBoundary() {
+    const g = plotGeometry();
+    ctx.save();
+    ctx.strokeStyle = '#e2d7c2';
+    ctx.lineWidth = 1;
+    for (let k = -1; k <= 1; k += 0.5) {
+      drawLine({x: -worldLimit, y: k}, {x: worldLimit, y: k}, '#ece3d3', 1, null, k === 0 ? 1 : 0.65);
+      drawLine({x: k, y: -worldLimit}, {x: k, y: worldLimit}, '#ece3d3', 1, null, k === 0 ? 1 : 0.65);
+    }
+    ctx.restore();
+
+    ctx.save();
+    ctx.strokeStyle = 'rgba(24,35,58,0.78)';
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.arc(g.cx, g.cy, g.scalePx, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawPath(points, color, width = 2.5, alpha = 1) {
+    if (!points || points.length < 2) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    const first = worldToScreen(points[0]);
+    ctx.moveTo(first.x, first.y);
+    for (let i = 1; i < points.length; i++) {
+      const s = worldToScreen(points[i]);
+      ctx.lineTo(s.x, s.y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawScene() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    drawAxesAndBoundary();
+    if (!state) return;
+
+    ctx.save();
+    ctx.fillStyle = '#18233a';
+    ctx.font = '18px Georgia, serif';
+    ctx.fillText('x_i^0 -> w_* -> p_i^0,  with reduced trajectory w(t)', 54, 34);
+    ctx.fillStyle = '#60708d';
+    ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillText('Click anywhere in this chart to set probe x for W^alpha barycenter calculations.', 54, 53);
+    ctx.restore();
+
+    if (showObserved.checked) {
+      const comparison = comparisonSupportPoints();
+      const comparisonStroke = supportSelect.value === 'observed' ? '#7f9fd6' : '#d8a2aa';
+      for (const q of comparison) drawPoint(q, '#d8e3f7', 3.9, null, comparisonStroke, 0.58);
+    }
+
+    drawPath(state.orbit, '#565656', 2.6, 0.82);
+    const supportPts = activeSupportPoints();
+    const supportStroke = supportSelect.value === 'observed' ? '#d72638' : '#1a2d62';
+    for (const z of supportPts) drawPoint(z, '#5e7fbd', 5.2, null, supportStroke, 0.98);
+
+    const m = field ? field.supportMean : weightedMean(state.p0, state.weights);
+    drawPoint(m, 'white', 7, 'm', 'black', 1);
+    drawPoint(state.wStar, '#111827', 7, 'w_*', '#000', 1);
+    const endW = state.orbit[state.orbit.length - 1];
+    drawPoint(endW, '#188038', 6, 'w(T)', '#0d5526', 1);
+
+    const R0 = reflectedBarycenter(state.wStar, state.p0, state.weights);
+    const v0 = opticalVelocity(state.wStar, state.p0, state.weights);
+    drawArrow(state.wStar, add(state.wStar, scale(R0, 0.32)), '#d72638', 3.2, null, 0.82);
+    drawArrow(state.wStar, add(state.wStar, scale(v0, 1.25)), '#188038', 2.5, [7, 5], 0.82);
+
+    if (field) {
+      drawPoint(probe, '#d72638', 7, 'x', '#8e1724', 1);
+      drawPoint(field.bAlpha, '#f2a900', 7, 'b_alpha(x)', '#7a5a00', 1);
+      drawArrow(probe, field.supportMean, '#244c9a', 2.2, [6, 5], 0.72);
+      drawArrow(probe, field.bAlpha, '#f2a900', 3.2, null, 0.78);
+
+      const diag = 2 * worldLimit * Math.SQRT2;
+      const drift0 = neg(field.A0);
+      const drifta = neg(field.Aalpha);
+      const n0 = Math.max(norm(drift0), EPS);
+      const na = Math.max(norm(drifta), EPS);
+      const len0 = 0.11 * diag * Math.tanh(n0 / (0.18 * diag));
+      const lena = 0.11 * diag * Math.tanh(na / (0.18 * diag));
+      drawArrow(probe, add(probe, scale(drift0, len0 / n0)), '#244c9a', 2.4, [3, 5], 0.82);
+      drawArrow(probe, add(probe, scale(drifta, lena / na)), '#f2a900', 3.2, null, 0.95);
+    }
+  }
+
+  function updateMetrics() {
+    if (!state || !field) return;
+    const alpha = parseFloat(alphaSlider.value);
+    const Rw = reflectedBarycenter(state.wStar, state.p0, state.weights);
+    const v = opticalVelocity(state.wStar, state.p0, state.weights);
+    metrics.innerHTML = [
+      '<b>LMS initialization</b>',
+      'preset = ' + presetSelect.value + ', N = ' + state.p0.length + ', seed = ' + seedInput.value,
+      'init radius hyperparameter = ' + fmt(parseFloat(initRadiusSlider.value), 4),
+      'generated cloud exact radius before orbit projection = ' + fmt(state.generatedRadius, 6),
+      'generated cloud deboost center error = ' + fmtExp(state.generatedCenterError),
+      'recovered w_* = (' + fmt(state.wStar.x, 5) + ', ' + fmt(state.wStar.y, 5) + ')',
+      'recovered |w_*| = ' + fmt(state.achievedRadius, 6) + ', arg(w_*) = ' + fmt(state.achievedAngle, 4),
+      '| |w_*| - requested | = ' + fmtExp(Math.abs(state.achievedRadius - parseFloat(initRadiusSlider.value))),
+      'center error ||sum_i a_i p_i^0|| = ' + fmtExp(state.centerError),
+      'inverse residual ||sum_i a_i M_{-w_*}(x_i^0)|| = ' + fmtExp(state.residualNorm),
+      'canonical solver = ' + (state.converged ? 'converged' : 'stopped') + ' in ' + state.iterations + ' iterations',
+      'trajectory frames = ' + state.orbit.length,
+      '',
+      '<b>Optical field at w_*</b>',
+      'R_{p0}(w_*) = (' + fmt(Rw.x, 5) + ', ' + fmt(Rw.y, 5) + '), |R| = ' + fmt(norm(Rw), 6),
+      'dot w(0) = (' + fmt(v.x, 5) + ', ' + fmt(v.y, 5) + '), |dot w| = ' + fmt(norm(v), 6),
+      '',
+      '<b>Peszek-Poyato query</b>',
+      'support Z_i = ' + activeSupportLabel(),
+      'comparison cloud = ' + comparisonSupportLabel(),
+      'alpha = ' + fmt(alpha, 2),
+      'probe x = (' + fmt(probe.x, 5) + ', ' + fmt(probe.y, 5) + ')',
+      'm = sum_i a_i Z_i = (' + fmt(field.supportMean.x, 5) + ', ' + fmt(field.supportMean.y, 5) + ')',
+      'b_alpha(x) = (' + fmt(field.bAlpha.x, 5) + ', ' + fmt(field.bAlpha.y, 5) + ')',
+      'A_0(x)=x-m = (' + fmt(field.A0.x, 5) + ', ' + fmt(field.A0.y, 5) + '), |A_0|=' + fmt(norm(field.A0), 6),
+      'A_alpha(x) = (' + fmt(field.Aalpha.x, 5) + ', ' + fmt(field.Aalpha.y, 5) + '), |A_alpha|=' + fmt(norm(field.Aalpha), 6),
+      'M_alpha(x)=sum_i a_i |x-Z_i|^{-alpha} = ' + fmt(field.Malpha, 6),
+      'decomposition error ||A_alpha - M_alpha/(1-alpha)(x-b_alpha)|| = ' + fmtExp(field.err),
+      'H_alpha(x) = [[' + fmt(field.H.h11, 4) + ', ' + fmt(field.H.h12, 4) + '], [' + fmt(field.H.h12, 4) + ', ' + fmt(field.H.h22, 4) + ']]',
+      'Q_alpha(x) = [[' + fmt(field.Q.q11, 4) + ', ' + fmt(field.Q.q12, 4) + '], [' + fmt(field.Q.q12, 4) + ', ' + fmt(field.Q.q22, 4) + ']]'
+    ].join('<br>');
+  }
+
+  function recomputeFieldOnly() {
+    alphaValue.textContent = parseFloat(alphaSlider.value).toFixed(2);
+    field = computePeszekPoyatoField(probe, activeSupportPoints(), state.weights, parseFloat(alphaSlider.value));
+    updateMetrics();
+    drawScene();
+  }
+
+  function recomputeAll() {
+    const n = parseInt(nSlider.value, 10);
+    const seed = parseInt(seedInput.value, 10) || 1;
+    const preset = presetSelect.value;
+    const initRadius = parseFloat(initRadiusSlider.value);
+    const frames = parseInt(framesSlider.value, 10);
+    const step = parseFloat(stepSlider.value);
+    nValue.textContent = String(n);
+    initRadiusValue.textContent = initRadius.toFixed(3);
+    framesValue.textContent = String(frames);
+    stepValue.textContent = step.toFixed(3);
+
+    state = initializeObservedCloud(n, preset, seed, initRadius);
+    state.orbit = integrateOrbit(state.wStar, state.p0, state.weights, frames, step);
+    field = computePeszekPoyatoField(probe, activeSupportPoints(), state.weights, parseFloat(alphaSlider.value));
+    updateMetrics();
+    drawScene();
+  }
+
+  function setRandomSeed() {
+    seedInput.value = String(1 + Math.floor(Math.random() * 999999));
+    recomputeAll();
+  }
+
+  presetSelect.addEventListener('change', recomputeAll);
+  seedInput.addEventListener('change', recomputeAll);
+  supportSelect.addEventListener('change', recomputeFieldOnly);
+  showObserved.addEventListener('change', drawScene);
+  randomSeedBtn.addEventListener('click', setRandomSeed);
+  nSlider.addEventListener('input', () => { nValue.textContent = nSlider.value; });
+  nSlider.addEventListener('change', recomputeAll);
+  initRadiusSlider.addEventListener('input', () => { initRadiusValue.textContent = parseFloat(initRadiusSlider.value).toFixed(3); recomputeAll(); });
+  framesSlider.addEventListener('input', () => { framesValue.textContent = framesSlider.value; });
+  framesSlider.addEventListener('change', recomputeAll);
+  stepSlider.addEventListener('input', () => { stepValue.textContent = parseFloat(stepSlider.value).toFixed(3); });
+  stepSlider.addEventListener('change', recomputeAll);
+  alphaSlider.addEventListener('input', recomputeFieldOnly);
+
+  canvas.addEventListener('click', (evt) => {
+    probe = screenToWorld(evt.clientX, evt.clientY);
+    recomputeFieldOnly();
+  });
+
+  recomputeAll();
+})();
+</script>
+</body>
+</html>
