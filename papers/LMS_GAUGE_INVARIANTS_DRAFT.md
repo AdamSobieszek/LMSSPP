@@ -1,1129 +1,650 @@
-Below is a computational write-up you can adapt directly into implementation notes. I will use a sign convention that avoids ambiguity.
+# LMS Gauge Invariants and Exact Finite-N Reduction
 
-Let
+This note gives a focused mathematical account of the exact finite-$N$ reduction used in the LMSSPP package. The central point is that the reduction does not require a hydrodynamic limit, a Poisson kernel closure, or a moment-matching approximation. It is an exact statement about a finite weighted cloud on the sphere and its orbit under the real Mobius group.
 
-[
-c(x)\in B^d
-]
+The key construction is the exact Busemann centering map. Given a cloud $x=(x_1,\dots,x_N) \in (S^{d-1})^N$, it chooses a canonical boost parameter $z(x) \in B^d$ such that the boosted cloud has zero weighted barycenter. This turns the usual LMS reduced variables into a canonical moving-frame decomposition:
 
-denote the **canonical deboost parameter**, defined by
+$$
+\text{full cloud } x(t)
+\quad \longleftrightarrow \quad
+\text{boost coordinate } w(t),\ \text{rotation } \zeta(t),\ \text{frozen shape constants } p^0.
+$$
 
-[
-p_i^\star=M_{c(x)}(x_i),
+The result is a finite-$N$ Watanabe-Strogatz-style reconstruction theorem: one stores $N$ constants once, evolves only $w(t) \in B^d$ and $\zeta(t) \in SO(d)$, and reconstructs the full $N$-point cloud by one Mobius transformation at each time.
+
+---
+
+## 1. Conventions
+
+The implementation uses row vectors. Points lie on $S^{d-1} \subset \mathbb R^d$, weights satisfy
+
+$$
+a_i \ge 0, \qquad \sum_{i=1}^N a_i=1,
+$$
+
+and $A \in \mathfrak{so}(d)$ acts on row vectors by right multiplication with $A^\top$.
+
+The real Mobius boost $M_w$ is implemented as `mobius_sphere`. On the sphere,
+
+$$
+M_w(x)=\frac{(1-|w|^2)(x-w)}{|x-w|^2}-w,
+\qquad x \in S^{d-1},\quad w \in B^d.
+$$
+
+The skew operator used throughout the code is
+
+$$
+\alpha(u,v)=v u^\top-u v^\top.
+$$
+
+Thus $\alpha(u,v)$ is a $d \times d$ skew-symmetric matrix. This is the matrix returned by `alpha_operator(u, v)`.
+
+The full finite-$N$ LMS/Kuramoto-on-sphere dynamics with linear order parameter is
+
+$$
+\dot x_i=x_i A^\top+Z-\langle Z,x_i\rangle x_i,
 \qquad
-\sum_i a_i p_i^\star=0.
-]
+Z=K\sum_{j=1}^N a_j x_j.
+$$
 
-In your earlier notation, if you define (w_\star) by
+Equivalently, the coupling term can be written pairwise as
 
-[
-p_i^\star=M_{-w_\star}(x_i),
-]
+$$
+\dot x_i=x_i A^\top+K\sum_{j=1}^N a_j\bigl(x_j-\langle x_j,x_i\rangle x_i\bigr).
+$$
 
-then
-
-[
-\boxed{c=-w_\star.}
-]
-
-Everything below is written in the (c)-convention because it makes the LMS (z)-coordinate identification direct:
-
-[
-\boxed{z=c.}
-]
+These two forms are identical for the linear mean field.
 
 ---
 
-# 1. Core numerical objects
+## 2. The LMS orbit ansatz
 
-Given a weighted cloud
+Fix a base cloud
 
-[
-x=(x_1,\dots,x_N)\in(S^{d-1})^N,
+$$
+p=(p_1,\dots,p_N) \in (S^{d-1})^N.
+$$
+
+The finite LMS orbit through $p$ is parametrized by a boost $w \in B^d$ and a rotation $\zeta \in SO(d)$:
+
+$$
+x_i=M_w(p_i)\,\zeta^\top.
+$$
+
+Define the body-frame field
+
+$$
+F_p(w)=\sum_{i=1}^N a_i M_w(p_i),
+$$
+
+and include coupling by
+
+$$
+Z_{\mathrm{body}}(w)=K F_p(w).
+$$
+
+The lab-frame order parameter is
+
+$$
+Z=Z_{\mathrm{body}}\zeta^\top.
+$$
+
+The lab-frame conformal center is
+
+$$
+z=-w\zeta^\top.
+$$
+
+With these conventions, the closed finite-dimensional reduced equations are
+
+$$
+\boxed{
+\dot w=-\frac12(1-|w|^2)Z_{\mathrm{body}}(w)
+}
+$$
+
+and
+
+$$
+\boxed{
+\dot\zeta=A\zeta-\zeta\,\alpha\bigl(w,Z_{\mathrm{body}}(w)\bigr).
+}
+$$
+
+This is the row-vector form of the LMS reduction implemented by `integrate_lms_reduced_euler`. The code also computes the same rotation equation as
+
+$$
+\dot\zeta=\bigl(A-\alpha(w\zeta^\top,Z)\bigr)\zeta,
+$$
+
+which is equivalent because
+
+$$
+\alpha(w\zeta^\top,Z_{\mathrm{body}}\zeta^\top)
+=\zeta\,\alpha(w,Z_{\mathrm{body}})\,\zeta^\top.
+$$
+
+The important point is that $F_p(w)$ depends on the stored base cloud $p$ and the low-dimensional coordinate $w$, but it does not require evolving the individual $x_i$.
+
+---
+
+## 3. The canonical centered slice
+
+The reduction above depends on a choice of base cloud $p$. Exact Busemann centering chooses a canonical representative of the Mobius orbit.
+
+Define the centered slice
+
+$$
+\mathcal S_0=
+\left\{p \in (S^{d-1})^N:\sum_{i=1}^N a_i p_i=0\right\}.
+$$
+
+Rotations preserve this slice because
+
+$$
+\sum_i a_i(p_i\zeta^\top)=\left(\sum_i a_i p_i\right)\zeta^\top.
+$$
+
+Boosts do not preserve it. Therefore $\mathcal S_0$ fixes the boost freedom and leaves exactly the rotational freedom. It is a boost gauge, not a complete gauge.
+
+Given an observed cloud $x=(x_i)$, define the canonical deboost center $z(x) \in B^d$ by
+
+$$
+\boxed{
+\sum_{i=1}^N a_i M_{z(x)}(x_i)=0.
+}
+$$
+
+Then the canonical centered representative is
+
+$$
+\boxed{
+p_i^\star(x)=M_{z(x)}(x_i).
+}
+$$
+
+By construction,
+
+$$
+\sum_i a_i p_i^\star(x)=0.
+$$
+
+In the widget's reduced coordinate convention, when $\zeta=I$,
+
+$$
+\boxed{w=-z.}
+$$
+
+So the canonical-gauge module uses $z$ for the deboost parameter, while the LMS reduced state uses $w=-z$ at identity rotation.
+
+Under the usual generic and non-majority hypotheses, for example $a_i>0$, $\sum_i a_i=1$, and $\max_i a_i<1/2$, the Busemann potential below has a unique interior critical point. Numerically, failure of the hypotheses appears as poor centering residuals, unstable centers near $\partial B^d$, or non-unique effective gauges.
+
+---
+
+## 4. The Busemann potential and exact inversion
+
+The canonical center can be found as a critical point of a finite-$N$ Busemann potential. For a fixed observed cloud $x$, define
+
+$$
+\Phi_x(z)=\sum_{i=1}^N a_i\log\frac{1-|z|^2}{|z-x_i|^2}.
+$$
+
+The Euclidean gradient identity is
+
+$$
+\boxed{
+\nabla_{\mathrm{euc}}\Phi_x(z)=\frac{2}{1-|z|^2}\sum_i a_i M_z(x_i).
+}
+$$
+
+Since the Poincare ball metric is conformal to the Euclidean metric with factor $2/(1-|z|^2)$, the hyperbolic gradient is
+
+$$
+\boxed{
+\nabla_{\mathrm{hyp}}\Phi_x(z)=\frac12(1-|z|^2)\sum_i a_i M_z(x_i).
+}
+$$
+
+Therefore the exact centering equation
+
+$$
+\sum_i a_iM_z(x_i)=0
+$$
+
+is equivalent to
+
+$$
+\nabla_{\mathrm{euc}}\Phi_x(z)=0
+\qquad\text{and}\qquad
+\nabla_{\mathrm{hyp}}\Phi_x(z)=0.
+$$
+
+This is the exact finite-$N$ inverse problem. It uses the full cloud, not only the centroid. It is therefore different from the Poisson-manifold shrink approximation, which estimates a radius from a continuum closure relation.
+
+The package implementation in `lmsspp.core.canonical_gauge` solves this problem by:
+
+- forming a local finite-$N$ initializer from the barycenter and inertia tensor,
+- maximizing $\Phi_x$ in rapidity coordinates so the iterate stays inside $B^d$,
+- polishing the residual equation $\sum_i a_iM_z(x_i)=0$ by a small Newton solve,
+- returning $z$, $w=-z$, the centered cloud $P=M_z(x)$, and centering diagnostics.
+
+---
+
+## 5. Exact finite-$N$ reconstruction from an arbitrary initial cloud
+
+Given an initial cloud $x^0=(x_i^0)$, compute its canonical center
+
+$$
+\sum_i a_iM_{z_0}(x_i^0)=0.
+$$
+
+Then define the frozen constants
+
+$$
+\boxed{
+p_i^0=M_{z_0}(x_i^0).
+}
+$$
+
+These constants satisfy
+
+$$
+\sum_i a_i p_i^0=0.
+$$
+
+The reduced initial state is
+
+$$
+\boxed{
+w_0=-z_0,
 \qquad
-a_i>0,\qquad
-\sum_i a_i=1,
-]
-
-define the LMS boost
-
-[
-M_c(y)
-======
-
-\frac{(1-|c|^2)y-(1-2\langle c,y\rangle+|y|^2)c}
-{1-2\langle c,y\rangle+|c|^2|y|^2}.
-]
-
-For (y\in S^{d-1}), this simplifies to
-
-[
-M_c(y)
-======
-
-\frac{(1-|c|^2)(y-c)}{|y-c|^2}-c.
-]
-
-The basic residual is
-
-[
-\boxed{
-B_x(c):=\sum_{i=1}^N a_i M_c(x_i).
+\zeta_0=I.
 }
-]
+$$
 
-The canonical gauge is the unique solution
+Because $M_{-z_0}$ is the inverse boost of $M_{z_0}$, the initial cloud is reconstructed exactly by
 
-[
+$$
+x_i^0=M_{w_0}(p_i^0).
+$$
+
+Now evolve only $(w(t),\zeta(t))$ by the reduced equations in Section 2, using the frozen constants $p^0$ to compute
+
+$$
+F_{p^0}(w)=\sum_i a_iM_w(p_i^0).
+$$
+
+At any time $t$, reconstruct the full cloud by
+
+$$
 \boxed{
-B_x(c_\star)=0.
+x_i(t)=M_{w(t)}(p_i^0)\,\zeta(t)^\top.
 }
-]
+$$
 
-The normalized cloud is
+This is the exact finite-$N$ reduction in operational form. The $N$-dependence is stored in the constants $p_i^0$. The evolved variables have dimension
 
-[
-\boxed{
-p_i^\star=M_{c_\star}(x_i).
-}
-]
+$$
+d+\frac{d(d-1)}2,
+$$
 
-The first diagnostic should always be
+independent of $N$.
 
-[
-\boxed{
-\left|\sum_i a_i p_i^\star\right|\approx 0.
-}
-]
+This is the finite-dimensional analogue of Watanabe-Strogatz reconstruction: the individual particles are not independently integrated; they are reconstructed from a finite list of constants and low-dimensional collective coordinates.
 
 ---
 
-# 2. Busemann potential for root-finding
+## 6. The moving canonical frame
 
-The corresponding potential is
+The canonical centered representative can also be computed at each time from the evolving cloud:
 
-[
-\Phi_x(c)
-=========
+$$
+p_i^\star(t)=M_{z(t)}(x_i(t)),
+\qquad
+\sum_i a_i p_i^\star(t)=0.
+$$
 
-\sum_{i=1}^N a_i
-\log\frac{1-|c|^2}{|c-x_i|^2}.
-]
+For a trajectory on one LMS Mobius orbit, the canonical center is
 
-It satisfies
+$$
+z(t)=-w(t)\zeta(t)^\top.
+$$
 
-[
+Using the factorization
+
+$$
+x_i(t)=M_{w(t)}(p_i^0)\zeta(t)^\top
+=M_{-z(t)}\bigl(p_i^0\zeta(t)^\top\bigr),
+$$
+
+we obtain
+
+$$
 \boxed{
-\nabla_{\mathrm{hyp}}\Phi_x(c)
-==============================
-
-\frac12(1-|c|^2)B_x(c).
+p_i^\star(t)=p_i^0\zeta(t)^\top.
 }
-]
+$$
 
-Equivalently, using the Euclidean gradient,
+Thus, after exact Busemann centering, the cloud moves only by rotation. The boost component has been removed by the canonical gauge.
 
-[
+In row-vector convention this means
+
+$$
 \boxed{
-\nabla_{\mathrm{euc}}\Phi_x(c)
-==============================
-
-\frac{2}{1-|c|^2}B_x(c).
+\dot p_i^\star=p_i^\star\Omega^\top
 }
-]
+$$
 
-So you can find (c_\star) in either of two equivalent ways:
+for a skew-symmetric matrix $\Omega(t)$. Equivalently, the covariant derivative
 
-[
-B_x(c)=0,
-]
+$$
+D_t p_i^\star=\dot p_i^\star-p_i^\star\Omega^\top
+$$
 
-or
+vanishes.
 
-[
-\nabla_{\mathrm{euc}}\Phi_x(c)=0.
-]
-
-Because (\Phi_x) is hyperbolically concave under the usual non-majority assumptions, this critical point is unique. Numerically, that makes the problem well-conditioned unless the cloud is close to a degenerate/majority configuration.
+This is the most compact finite-$N$ conservation law: the canonical centered shape is covariantly constant.
 
 ---
 
-# 3. Recommended helper functions
+## 7. Shape invariants
 
-A minimal helper layer should include:
+Since $p_i^\star(t)=p_i^0\zeta(t)^\top$, all rotational invariants of the centered cloud are conserved.
 
-```python
-boost(c, y)
-```
+The most direct invariant is the Gram matrix
 
-Returns (M_c(y)).
+$$
+G_{ij}=\langle p_i^\star,p_j^\star\rangle.
+$$
 
-```python
-boost_cloud(c, X)
-```
+Along an exact LMS orbit,
 
-Returns (M_c(x_i)) for all cloud points.
-
-```python
-residual(c, X, a)
-```
-
-Returns
-
-[
-B_x(c)=\sum_i a_i M_c(x_i).
-]
-
-```python
-busemann_potential(c, X, a)
-```
-
-Returns
-
-[
-\Phi_x(c)=\sum_i a_i\log\frac{1-|c|^2}{|c-x_i|^2}.
-]
-
-```python
-canonical_center(X, a)
-```
-
-Solves
-
-[
-B_x(c)=0
-]
-
-and returns (c_\star).
-
-```python
-canonical_cloud(X, a)
-```
-
-Returns
-
-[
-c_\star,\qquad p_i^\star=M_{c_\star}(x_i).
-]
-
-This is the central gauge-fixing routine.
-
----
-
-# 4. Canonical moving-frame quantities
-
-Once you have
-
-[
-p_i^\star=M_{c_\star}(x_i),
-]
-
-define the centered barycenter
-
-[
-\boxed{
-\bar p^\star:=\sum_i a_i p_i^\star.
-}
-]
-
-This should be numerically zero.
-
-Next define the Gram matrix
-
-[
-\boxed{
-G_{ij}:=\langle p_i^\star,p_j^\star\rangle.
-}
-]
-
-This is the most direct finite-(N) shape invariant.
-
-For a trajectory (x(t)) on a single LMS/Möbius orbit, the canonical centered clouds satisfy
-
-[
-p_i^\star(t)=\zeta(t)p_i^\star(0)
-]
-
-for some rotation (\zeta(t)\in SO(d)). Therefore
-
-[
+$$
 \boxed{
 G_{ij}(t)=G_{ij}(0).
 }
-]
+$$
 
-Computational test:
+The weighted inertia tensor is
 
-```python
-G = canonical_gram(P)
-```
+$$
+T(t)=\sum_i a_i p_i^\star(t)^\top p_i^\star(t),
+$$
 
-where
+where the expression is the matrix outer product. It transforms by conjugation:
 
-[
-P=(p_i^\star).
-]
+$$
+T(t)=\zeta(t)T(0)\zeta(t)^\top.
+$$
 
-Then track
+Therefore
 
-[
+$$
 \boxed{
-\Delta_G(t)
-===========
-
-\max_{i,j}|G_{ij}(t)-G_{ij}(0)|.
+\operatorname{spec} T(t)=\operatorname{spec} T(0).
 }
-]
+$$
 
-This should remain near numerical precision for an exact LMS simulation.
+Higher weighted moment tensors
+
+$$
+T_m(t)=\sum_i a_i\, p_i^\star(t)^{\otimes m}
+$$
+
+also rotate covariantly, so their rotational contractions and spectra give further invariants.
+
+For $d=2$, the same statement contains the classical Watanabe-Strogatz constants: after centering, all phases rotate together, so cross-ratios are conserved. For $d>2$, Gram and moment invariants are the natural higher-dimensional replacement.
 
 ---
 
-# 5. Weighted inertia tensor
+## 8. The connection term
+
+The centered cloud rotates with a connection determined by the LMS variables. In row-vector convention the predicted moving-frame connection is
+
+$$
+\boxed{
+\Omega=A+\alpha(z,Z),
+}
+$$
+
+where
+
+$$
+\alpha(z,Z)=Zz^\top-zZ^\top.
+$$
+
+Thus
+
+$$
+\boxed{
+\dot p_i^\star=p_i^\star\bigl(A+\alpha(z,Z)\bigr)^\top.
+}
+$$
+
+The same connection appears in the $z$-coordinate equation. Under the row-vector convention used in the code,
+
+$$
+\boxed{
+\dot z=zA^\top+\frac12(1+|z|^2)Z-\langle Z,z\rangle z.
+}
+$$
+
+The term $\alpha(z,Z)$ is not an extra force. It is the rotational connection induced by changing the boost center. Geometrically, it is present because infinitesimal boosts do not commute. In column-vector notation, if $B_U$ and $B_V$ are infinitesimal boost generators, then their commutator is rotational:
+
+$$
+[B_U,B_V](y)=\alpha(U,V)y.
+$$
+
+This is the finite-dimensional analogue of Thomas precession: a changing boost frame carries a curvature term in the rotational direction.
+
+---
+
+## 9. Estimating the connection from data
+
+The moving-frame equations give useful diagnostics for simulations and empirical trajectories.
+
+Given a canonical centered trajectory $P(t)=(p_i^\star(t))$, define
+
+$$
+T=\sum_i a_i p_i^{\star\top}p_i^\star,
+$$
+
+and
+
+$$
+C=\sum_i a_i \dot p_i^{\star\top}p_i^\star.
+$$
+
+If $\dot p_i^\star=p_i^\star\Omega^\top$, then, in matrix form,
+
+$$
+C=\Omega T.
+$$
+
+When $T$ is invertible,
+
+$$
+\Omega=CT^{-1}.
+$$
+
+In rank-deficient or noisy cases, use the pseudoinverse:
+
+$$
+Q=CT^+.
+$$
+
+Then decompose
+
+$$
+\Omega_{\mathrm{data}}=\frac12(Q-Q^\top),
+\qquad
+S_{\mathrm{strain}}=\frac12(Q+Q^\top).
+$$
+
+For exact LMS motion, $S_{\mathrm{strain}}$ should vanish up to numerical error. The skew part should match
+
+$$
+\Omega_{\mathrm{pred}}=A+\alpha(z,Z).
+$$
+
+The package diagnostics compute:
+
+- centering error $\left|\sum_i a_i p_i^\star\right|$,
+- Gram drift $\max_{i,j}|G_{ij}(t)-G_{ij}(0)|$,
+- inertia spectrum drift,
+- connection mismatch $\|\Omega_{\mathrm{data}}-\Omega_{\mathrm{pred}}\|$,
+- covariant derivative error $\left(\sum_i a_i|\dot p_i^\star-p_i^\star\Omega_{\mathrm{pred}}^\top|^2\right)^{1/2}$,
+- strain error $\|S_{\mathrm{strain}}\|$,
+- optional $z$-equation error.
+
+These are implemented in `moving_frame_diagnostics`.
+
+---
+
+## 10. Local source structure at the centered representative
+
+Let $P=(p_i)$ be centered:
+
+$$
+\sum_i a_i p_i=0.
+$$
 
 Define
 
-[
-\boxed{
-T:=\sum_i a_i p_i^\star\otimes p_i^\star.
-}
-]
-
-This is the weighted covariance/inertia tensor of the centered representative.
-
-Since
-
-[
-p_i^\star(t)=\zeta(t)p_i^\star(0),
-]
-
-we have
-
-[
-T(t)=\zeta(t)T(0)\zeta(t)^{-1}.
-]
-
-Therefore the eigenvalues of (T) are conserved:
-
-[
-\boxed{
-\operatorname{spec}T(t)=\operatorname{spec}T(0).
-}
-]
-
-Computational helpers:
-
-```python
-inertia_tensor(P, a)
-```
-
-returns
-
-[
-T=\sum_i a_i p_i p_i^\top.
-]
-
-```python
-inertia_spectrum(P, a)
-```
-
-returns eigenvalues of (T).
-
-Diagnostics:
-
-[
-\Delta_{\mathrm{spec}}(t)
-=========================
-
-\left|
-\operatorname{sort}(\lambda(T(t)))
-----------------------------------
-
-\operatorname{sort}(\lambda(T(0)))
-\right|.
-]
-
-In (d=2), (\operatorname{tr}T=1), so there is essentially one anisotropy invariant.
-
----
-
-# 6. Moving-frame connection from data
-
-For a canonically centered trajectory
-
-[
-p_i^\star(t)=M_{c(t)}(x_i(t)),
-]
-
-the moving-frame theorem says
-
-[
-\boxed{
-\dot p_i^\star=\Omega p_i^\star,
+$$
+F_P(u)=\sum_i a_iM_u(p_i),
 \qquad
-\Omega\in\mathfrak{so}(d).
-}
-]
+T=\sum_i a_i p_i^\top p_i.
+$$
 
-This is a very strong testable prediction.
+For small $u$, in row-vector convention,
 
-Given numerical derivatives (\dot p_i^\star), define
+$$
+F_P(u)=-2u(I-T)+O(|u|^2).
+$$
 
-[
-T=\sum_i a_i p_i^\star\otimes p_i^\star,
-]
+The reduced LMS boost equation near $u=0$ is
 
-and
+$$
+\dot u=-\frac12(1-|u|^2)F_P(u),
+$$
 
-[
-C=\sum_i a_i \dot p_i^\star\otimes p_i^\star.
-]
+so
 
-If
-
-[
-\dot p_i^\star=\Omega p_i^\star,
-]
-
-then
-
-[
-C=\Omega T.
-]
-
-So if (T) is invertible,
-
-[
+$$
 \boxed{
-\Omega_{\mathrm{data}}=C T^{-1}.
+\dot u=u(I-T)+O(|u|^2).
 }
-]
+$$
 
-With noisy data or rank issues, use a pseudoinverse and skew projection:
+Thus the local source exponents at the centered representative are the eigenvalues of
 
-[
-\boxed{
-\Omega_{\mathrm{data}}
-======================
+$$
+\boxed{I-T.}
+$$
 
-\operatorname{skew}\left(C T^+\right),
-}
-]
-
-where
-
-[
-\operatorname{skew}(Q)=\frac12(Q-Q^\top).
-]
-
-The symmetric part
-
-[
-\boxed{
-S_{\mathrm{strain}}
-===================
-
-\operatorname{sym}\left(C T^+\right)
-}
-]
-
-should vanish for exact Möbius-orbit motion. Thus
-
-[
-\boxed{
-|S_{\mathrm{strain}}|
-}
-]
-
-is a useful numerical diagnostic for departure from exact LMS/Möbius dynamics.
-
-Recommended helpers:
-
-```python
-estimate_connection(P, Pdot, a)
-```
-
-returns
-
-[
-\Omega_{\mathrm{data}}.
-]
-
-```python
-strain_error(P, Pdot, a)
-```
-
-returns
-
-[
-\left|\operatorname{sym}(C T^+)\right|.
-]
+This gives a direct finite-$N$ stability diagnostic from the canonical shape constants.
 
 ---
 
-# 7. Predicted LMS connection
+## 11. Euler-Sundman form
 
-For the LMS dynamics
+For a fixed centered cloud $P$, define the Busemann potential
 
-[
-\dot x_i=A x_i+Z-\langle Z,x_i\rangle x_i,
-]
+$$
+\Phi_P(w)=\sum_i a_i\log\frac{1-|w|^2}{|w-p_i|^2}.
+$$
 
-with
+As above,
 
-[
-Z=\sum_i a_i x_i,
-]
+$$
+\nabla_{\mathrm{euc}}\Phi_P(w)=\frac{2}{1-|w|^2}F_P(w).
+$$
 
-the canonical boost coordinate is
+The physical-time reduced equation is
 
-[
-z=c_\star.
-]
+$$
+\dot w=-\frac12(1-|w|^2)F_P(w).
+$$
 
-The LMS lifted frame equation gives
+Introduce Euler-Sundman time $\tau$ by
 
-[
-\boxed{
-\Omega_{\mathrm{pred}}=A+\alpha(z,Z).
-}
-]
-
-Here
-
-[
-\alpha(z,Z)y
-============
-
-\langle z,y\rangle Z-\langle Z,y\rangle z.
-]
-
-As a matrix,
-
-[
-\boxed{
-\alpha(z,Z)=Zz^\top-zZ^\top.
-}
-]
-
-So computationally:
-
-```python
-alpha_matrix(z, Z):
-    return np.outer(Z, z) - np.outer(z, Z)
-```
+$$
+\frac{dt}{d\tau}=\frac{4}{(1-|w|^2)^2}.
+$$
 
 Then
 
-```python
-Omega_pred = A + alpha_matrix(z, Z)
-```
-
-The key connection test is
-
-[
+$$
 \boxed{
-\Omega_{\mathrm{data}}\approx \Omega_{\mathrm{pred}}.
+\frac{dw}{d\tau}=-\nabla_{\mathrm{euc}}\Phi_P(w).
 }
-]
+$$
 
-Even more directly, test the covariant derivative:
+The conservative-lift diagnostic used in the code is
 
-[
+$$
 \boxed{
-D_t p_i^\star
-=============
-
-\dot p_i^\star-\Omega_{\mathrm{pred}}p_i^\star
-\approx 0.
+H_{\mathrm{ES}}(w,w_\tau)=\frac12|w_\tau|^2-\frac12|\nabla_{\mathrm{euc}}\Phi_P(w)|^2.
 }
-]
+$$
 
-Diagnostic:
+On the LMS gradient branch,
 
-[
-\boxed{
-E_{\mathrm{cov}}(t)
-===================
-
-\left(
-\sum_i a_i
-\left|
-\dot p_i^\star-\Omega_{\mathrm{pred}}p_i^\star
-\right|^2
-\right)^{1/2}.
-}
-]
-
-This is probably the most important test of the gauge-theoretic interpretation.
-
----
-
-# 8. Testing the (z)-equation directly
-
-The canonical boost coordinate
-
-[
-z(t)=c_\star(x(t))
-]
-
-should satisfy
-
-[
-\boxed{
-\dot z
-======
-
-Az+\frac12(1+|z|^2)Z-\langle Z,z\rangle z.
-}
-]
-
-So from your simulation:
-
-1. compute (z(t)) by canonical centering;
-2. finite-difference (\dot z(t));
-3. compute
-
-[
-\dot z_{\mathrm{pred}}
-======================
-
-Az+\frac12(1+|z|^2)Z-\langle Z,z\rangle z;
-]
-
-4. compare.
-
-Diagnostic:
-
-[
-\boxed{
-E_z(t)
-======
-
-|\dot z_{\mathrm{num}}-\dot z_{\mathrm{pred}}|.
-}
-]
-
-This test checks that the canonical inverse center evolves exactly as the LMS (z)-coordinate.
-
----
-
-# 9. Canonical cloud conservation tests
-
-For every time step:
-
-1. Compute canonical center (z(t)=c_\star(x(t))).
-2. Compute canonical cloud
-
-[
-p_i^\star(t)=M_{z(t)}(x_i(t)).
-]
-
-Then compute:
-
-### Centering error
-
-[
-\boxed{
-E_{\mathrm{center}}(t)
-======================
-
-\left|
-\sum_i a_i p_i^\star(t)
-\right|.
-}
-]
-
-### Gram conservation
-
-[
-\boxed{
-E_{\mathrm{Gram}}(t)
-====================
-
-|G(t)-G(0)|_{\max}.
-}
-]
-
-### Inertia spectrum conservation
-
-[
-\boxed{
-E_T(t)
-======
-
-|\lambda(T(t))-\lambda(T(0))|.
-}
-]
-
-### Covariant-frame error
-
-[
-\boxed{
-E_{\mathrm{cov}}(t)
-===================
-
-\left(
-\sum_i a_i
-|\dot p_i^\star-\Omega_{\mathrm{pred}}p_i^\star|^2
-\right)^{1/2}.
-}
-]
-
-### Connection mismatch
-
-[
-\boxed{
-E_\Omega(t)
-===========
-
-|\Omega_{\mathrm{data}}-\Omega_{\mathrm{pred}}|_F.
-}
-]
-
-These should all stay small for a correct implementation and exact LMS dynamics.
-
----
-
-# 10. Suggested code architecture
-
-A clean module structure could look like this (Please first locate all existing helper functions to deduce which modules are not needed, then rebuild the code architecture)
-
-## `mobius.py`
-
-Core geometry.
-
-```python
-boost(c, y)
-boost_cloud(c, X)
-residual(c, X, a)
-busemann_potential(c, X, a)
-```
-
-## `canonical_gauge.py`
-
-Gauge fixing.
-
-```python
-canonical_center(X, a)
-canonical_cloud(X, a)
-canonical_state(X, a)
-```
-
-where
-
-```python
-canonical_state
-```
-
-returns a dictionary like:
-
-```python
-{
-    "z": c_star,
-    "w": -c_star,
-    "P": P_star,
-    "center_error": norm(sum_i a_i P_i)
-}
-```
-
-## `invariants.py`
-
-Shape invariants.
-
-```python
-gram_matrix(P)
-inertia_tensor(P, a)
-inertia_spectrum(P, a)
-higher_moment_tensor(P, a, order)
-```
-
-## `connection.py`
-
-Moving-frame quantities.
-
-```python
-alpha_matrix(z, Z)
-predicted_connection(z, Z, A)
-estimate_connection(P, Pdot, a)
-covariant_derivative_error(P, Pdot, Omega, a)
-strain_error(P, Pdot, a)
-```
-
-## `diagnostics.py`
-
-Full trajectory tests.
-
-```python
-trajectory_canonical_data(X_series, a)
-gram_conservation_error(G_series)
-inertia_spectrum_error(T_series)
-z_equation_error(z_series, X_series, A_series, a, dt)
-connection_error(P_series, z_series, X_series, A_series, a, dt)
-```
-
----
-
-# 11. Practical root-finding notes
-
-The canonical center satisfies
-
-[
-B_x(c)=0,
-\qquad |c|<1.
-]
-
-Good strategies:
-
-### Option A: unconstrained ball parametrization
-
-Use
-
-[
-c=\tanh r,u,
-]
-
-or more generally
-
-[
-c=\frac{y}{\sqrt{1+|y|^2}},
-\qquad y\in\mathbb R^d.
-]
-
-Then solve in (y) unconstrained.
-
-### Option B: projected Newton or trust-region solve
-
-Use residual
-
-[
-B_x(c)
-]
-
-and enforce (|c|<1).
-
-### Option C: maximize (\Phi_x)
-
-Because (\Phi_x) is concave, maximize
-
-[
-\Phi_x(c)
-]
-
-inside the ball. This is often numerically more stable than solving the residual directly.
-
-The Euclidean gradient is
-
-[
-\nabla_{\mathrm{euc}}\Phi_x(c)
-==============================
-
-\frac{2}{1-|c|^2}B_x(c).
-]
-
-So you can provide the optimizer with an exact gradient once `residual` is implemented.
-
----
-
-# 12. Important distinction: moving center vs frozen flow
-
-There are two different computational experiments.
-
-## A. Moving-orbit experiment
-
-You simulate
-
-[
-\dot x_i=A x_i+Z-\langle Z,x_i\rangle x_i.
-]
-
-At each time, compute (z(t)) and (p^\star(t)). Then test:
-
-[
-p_i^\star(t)=\zeta(t)p_i^\star(0),
-]
-
-[
-G_{ij}(t)=G_{ij}(0),
-]
-
-[
-\dot p_i^\star=(A+\alpha(z,Z))p_i^\star.
-]
-
-This is the gauge-theoretic test.
-
-## B. Frozen-flow experiment
-
-Fix a centered cloud (p) with
-
-[
-\sum_i a_i p_i=0.
-]
-
-Then integrate the autonomous reduced flow
-
-[
-\dot u
-======
-
--\frac12(1-|u|^2)\sum_i a_i M_u(p_i).
-]
-
-This tests the Busemann gradient and Euler–Sundman conservative lift.
-
-Do not confuse these. Along the moving physical orbit, (z(t)) is a moving canonical center. Along the frozen flow, (u(t)) is a reduced LMS coordinate relative to a fixed centered representative.
-
----
-
-# 13. Frozen-flow BAV diagnostics
-
-For a fixed anchor cloud (p), define
-
-[
-F_p(u)=\sum_i a_iM_u(p_i),
-]
-
-[
-\Phi_p(u)=\sum_i a_i\log\frac{1-|u|^2}{|u-p_i|^2}.
-]
-
-Then
-
-[
-\dot u
-======
-
--\frac12(1-|u|^2)F_p(u).
-]
-
-The Euler–Sundman time satisfies
-
-[
-dt=\frac{4}{(1-|u|^2)^2},d\tau.
-]
-
-In (\tau)-time,
-
-[
-u_\tau=-\nabla_{\mathrm{euc}}\Phi_p(u).
-]
-
-The conservative Hamiltonian is
-
-[
-\boxed{
-H_{\mathrm{ES}}
-===============
-
-## \frac12|u_\tau|^2
-
-\frac12|\nabla_{\mathrm{euc}}\Phi_p(u)|^2.
-}
-]
-
-On the gradient branch,
-
-[
-\boxed{
+$$
 H_{\mathrm{ES}}=0.
-}
-]
+$$
 
-Numerical helper:
-
-```python
-es_energy(u, u_tau, P, a)
-```
-
-computes
-
-[
-H_{\mathrm{ES}}.
-]
-
-This is the right place to test the BAV/Euler–Sundman conservative lift.
+This form is mainly useful for diagnostics and theoretical interpretation. The widget and core integrator usually evolve the physical-time equation directly.
 
 ---
 
-# 14. Local source test from inertia tensor
+## 12. What is exact, and what is not being assumed
 
-For a centered cloud (p),
+The exact reduction described here is finite-$N$. It assumes only that the points remain on one LMS Mobius orbit generated by the identical-$A$ sphere dynamics with linear order parameter. It does not assume:
 
-[
-\sum_i a_i p_i=0,
-]
+- a hydrodynamic limit,
+- a continuum Poisson kernel,
+- the Poisson shrink law $|Z|/K=f_d(|z|)|z|$,
+- or that the centroid alone determines the reduced center.
 
-define
+The Poisson closure is still useful as a special continuum reference family. It is not needed for exact finite-$N$ reconstruction.
 
-[
-T=\sum_i a_i p_i\otimes p_i.
-]
+The exact finite-$N$ algorithm is:
 
-Near (u=0),
+1. Given $x^0$, solve $\sum_i a_iM_{z_0}(x_i^0)=0$.
+2. Store $p_i^0=M_{z_0}(x_i^0)$.
+3. Set $w_0=-z_0$ and $\zeta_0=I$.
+4. Evolve
 
-[
-F_p(u)
-======
+$$
+\dot w=-\frac12(1-|w|^2)K\sum_i a_iM_w(p_i^0),
+$$
 
--2(I-T)u+O(|u|^2).
-]
+$$
+\dot\zeta=A\zeta-\zeta\alpha\left(w,K\sum_i a_iM_w(p_i^0)\right).
+$$
 
-Therefore the frozen LMS flow satisfies
+5. Reconstruct
 
-[
+$$
+x_i(t)=M_{w(t)}(p_i^0)\zeta(t)^\top.
+$$
+
+The canonical moving-frame theorem is:
+
+$$
 \boxed{
-\dot u=(I-T)u+O(|u|^2).
+M_{z(t)}(x_i(t))=p_i^0\zeta(t)^\top.
 }
-]
+$$
 
-So the eigenvalues of
+Consequently, the centered shape is conserved up to rotation, the Gram matrix is conserved, the inertia spectrum is conserved, and the rotation of the centered frame is governed by
 
-[
-I-T
-]
-
-are the local source exponents.
-
-Helper:
-
-```python
-source_matrix(P, a):
-    T = inertia_tensor(P, a)
-    return I - T
-```
-
-Then compare numerically against the Jacobian of the frozen reduced flow at (u=0).
-
-Expected:
-
-[
+$$
 \boxed{
-D\dot u|_{0}=I-T.
+\Omega=A+\alpha(z,Z).
 }
-]
+$$
 
-This is a clean way to test the local theory.
-
----
-
-# 15. A compact testing checklist
-
-For each trajectory (x(t)):
-
-### Gauge fixing
-
-[
-\left|\sum_i a_i M_{z(t)}(x_i(t))\right|\ll1.
-]
-
-### (z)-equation
-
-[
-\dot z
-\approx
-Az+\frac12(1+|z|^2)Z-\langle Z,z\rangle z.
-]
-
-### Centered shape conservation
-
-[
-\langle p_i^\star(t),p_j^\star(t)\rangle
-\approx
-\langle p_i^\star(0),p_j^\star(0)\rangle.
-]
-
-### Inertia spectrum conservation
-
-[
-\operatorname{spec}T(t)
-\approx
-\operatorname{spec}T(0).
-]
-
-### Predicted connection
-
-[
-\Omega_{\mathrm{pred}}
-======================
-
-A+\alpha(z,Z).
-]
-
-### Covariant constancy
-
-[
-\dot p_i^\star
-\approx
-\Omega_{\mathrm{pred}}p_i^\star.
-]
-
-### Data-estimated connection
-
-[
-\Omega_{\mathrm{data}}
-======================
-
-\operatorname{skew}\left(
-\left(\sum_i a_i\dot p_i^\star\otimes p_i^\star\right)
-\left(\sum_i a_i p_i^\star\otimes p_i^\star\right)^+
-\right).
-]
-
-Compare
-
-[
-\Omega_{\mathrm{data}}\approx\Omega_{\mathrm{pred}}.
-]
-
-### Strain error
-
-[
-\operatorname{sym}\left(
-\left(\sum_i a_i\dot p_i^\star\otimes p_i^\star\right)
-T^+
-\right)
-\approx 0.
-]
-
-This last quantity is especially useful for debugging or for testing nonideal simulations.
-
----
-
-# 16. The computational interpretation
-
-The formal gauge theory translates into this pipeline:
-
-[
-x(t)
-\longrightarrow
-z(t)=c_\star(x(t))
-\longrightarrow
-p^\star(t)=M_{z(t)}x(t)
-\longrightarrow
-\text{shape invariants and connection}.
-]
-
-The canonical gauge removes the boost component. What remains is pure rotation:
-
-[
-p^\star(t)=\zeta(t)p^\star(0).
-]
-
-Therefore the cloud’s intrinsic shape is constant, and all nontrivial motion has been decomposed into:
-
-[
-\boxed{
-\text{boost motion }z(t)
-}
-]
-
-and
-
-[
-\boxed{
-\text{rotational connection }\Omega(t)=A+\alpha(z,Z).
-}
-]
-
-This is the computational version of the central theorem. The key numerical prediction is not merely that some scalar is conserved; it is that, after canonical centering, the entire cloud should move by rotation only.
+This is the mathematical structure implemented by `lmsspp.core.canonical_gauge`.

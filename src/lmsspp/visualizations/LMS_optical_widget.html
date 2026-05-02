@@ -1,0 +1,2798 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>LMS Optical Widget</title>
+  <style>
+    :root {
+      --canvas-max: 680px;
+      --bg: #f6f6f6;
+      --border: rgba(20, 20, 20, 0.14);
+      --ink: #0b0b0b;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Georgia, "Times New Roman", Times, serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: clamp(14px, 2.4vw, 32px);
+    }
+    body[data-visual-mode="dark"] {
+      --bg: #0b0c10;
+      color: #ffffff;
+    }
+
+    .widgetShell {
+      width: min(var(--canvas-max), 92vw);
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 0;
+    }
+
+    .tabChrome {
+      position: relative;
+      border: 1px solid var(--border);
+      border-bottom: none;
+      border-radius: 18px 18px 0 0;
+      background: rgba(255, 255, 255, 0.82);
+      box-shadow:
+        0 1px 0 rgba(0, 0, 0, 0.06),
+        0 12px 36px rgba(0, 0, 0, 0.08);
+      padding: 8px 10px 0;
+      min-height: 42px;
+      box-sizing: border-box;
+      overflow: hidden;
+      margin-bottom: -1px;
+      z-index: 2;
+    }
+    .tabChrome.tightWidth {
+      width: 100%;
+    }
+    body[data-visual-mode="dark"] .tabChrome {
+      background: rgba(11, 12, 16, 0.94);
+      border-color: rgba(255, 255, 255, 0.14);
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.04),
+        0 14px 40px rgba(0, 0, 0, 0.32);
+    }
+
+    .wrap {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      --uiScale: 1;
+      --titleX: 0px;
+      --titleY: 0px;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: none;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid var(--border);
+      border-top: none;
+      border-radius: 0 0 18px 18px;
+      overflow: hidden;
+      box-shadow:
+        0 1px 0 rgba(0, 0, 0, 0.06),
+        0 18px 60px rgba(0, 0, 0, 0.10);
+    }
+    body[data-visual-mode="dark"] .wrap {
+      background: rgba(11, 12, 16, 0.92);
+      border-color: rgba(255, 255, 255, 0.14);
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.04),
+        0 18px 60px rgba(0, 0, 0, 0.34);
+    }
+    .mainPanel {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .resizeHandle {
+      position: absolute;
+      width: 14px;
+      height: 14px;
+      pointer-events: auto;
+      z-index: 6;
+      background: transparent;
+    }
+    .resizeHandle.nw { left: 0; top: 0; cursor: nwse-resize; }
+    .resizeHandle.ne { right: 0; top: 0; cursor: nesw-resize; }
+    .resizeHandle.sw { left: 0; bottom: 0; cursor: nesw-resize; }
+    .resizeHandle.se { right: 0; bottom: 0; cursor: nwse-resize; }
+
+    .overlay {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+    .lmsModeControl {
+      position: absolute;
+      left: 12px;
+      top: 12px;
+      z-index: 7;
+      pointer-events: auto;
+      display: none;
+      align-items: stretch;
+      gap: 0;
+      padding: 0;
+      border: 1px solid rgba(0, 0, 0, 0.14);
+      border-radius: 11px;
+      background: rgba(255, 255, 255, 0.90);
+      box-shadow: 0 6px 16px rgba(0, 0, 0, 0.08);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      overflow: hidden;
+    }
+    .lmsModeControl.show {
+      display: inline-flex;
+    }
+    .lmsAtomControl {
+      left: auto;
+      right: 12px;
+    }
+    .lmsModeButtons {
+      display: inline-flex;
+      gap: 0;
+    }
+    .lmsModeBtn {
+      appearance: none;
+      -webkit-appearance: none;
+      border: 0;
+      border-left: 1px solid rgba(0, 0, 0, 0.14);
+      background: transparent;
+      color: rgba(0, 0, 0, 0.78);
+      border-radius: 0;
+      width: 42px;
+      min-width: 42px;
+      padding: 5px 0;
+      font-size: 11px;
+      line-height: 1.1;
+      cursor: pointer;
+      transition: background 120ms ease, color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+      box-shadow: none;
+    }
+    .lmsModeBtn:first-child {
+      border-left: 0;
+    }
+    .lmsModeBtn.active {
+      background: rgba(21, 21, 21, 0.94);
+      color: #fff;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+    }
+    .lmsAtomControl .lmsModeBtn {
+      width: 24px;
+      min-width: 8px;
+      aspect-ratio: 1 / 1;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+    }
+    body[data-visual-mode="dark"] .lmsModeControl {
+      background: rgba(11, 12, 16, 0.90);
+      border-color: rgba(255, 255, 255, 0.16);
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.30);
+    }
+    body[data-visual-mode="dark"] .lmsModeBtn {
+      background: transparent;
+      color: rgba(255, 255, 255, 0.86);
+      border-left-color: rgba(255, 255, 255, 0.12);
+      box-shadow: none;
+    }
+    body[data-visual-mode="dark"] .lmsModeBtn:first-child {
+      border-left: 0;
+    }
+    body[data-visual-mode="dark"] .lmsModeBtn.active {
+      background: rgba(241, 245, 249, 0.94);
+      color: #0b0c10;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.34);
+    }
+
+    .tabBar {
+      display: flex;
+      align-items: flex-end;
+      gap: 6px;
+      justify-content: flex-start;
+      flex-wrap: nowrap;
+      pointer-events: auto;
+      overflow-x: auto;
+      overflow-y: hidden;
+      scrollbar-width: none;
+    }
+    .tabBar::-webkit-scrollbar { display: none; }
+
+    .tabBtn {
+      appearance: none;
+      -webkit-appearance: none;
+      border: 1px solid rgba(0, 0, 0, 0.18);
+      background: rgba(255, 255, 255, 0.86);
+      border-radius: 11px;
+      padding: 6px 10px;
+      font-size: 12px;
+      line-height: 1.1;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      cursor: pointer;
+      color: rgba(0, 0, 0, 0.82);
+      user-select: none;
+      position: relative;
+      top: 0;
+      transition: background 120ms ease, color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+    }
+    .tabBtn.active {
+      background: rgba(21, 21, 21, 0.94);
+      color: #fff;
+      border-color: rgba(21, 21, 21, 0.98);
+      border-bottom-color: rgba(21, 21, 21, 0.98);
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.24) inset,
+        0 5px 14px rgba(0, 0, 0, 0.18);
+      font-weight: 600;
+      z-index: 1;
+    }
+    body[data-visual-mode="dark"] .tabBtn {
+      background: rgba(255, 255, 255, 0.08);
+      color: rgba(255, 255, 255, 0.86);
+      border-color: rgba(255, 255, 255, 0.16);
+    }
+    body[data-visual-mode="dark"] .tabBtn.active {
+      background: rgba(241, 245, 249, 0.96);
+      color: #0b0c10;
+      border-color: rgba(241, 245, 249, 0.98);
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.42) inset,
+        0 8px 20px rgba(0, 0, 0, 0.28);
+    }
+    .tabBtn:focus-visible {
+      outline: 2px solid rgba(0, 0, 0, 0.7);
+      outline-offset: 1px;
+    }
+
+    .titleDrag {
+      position: absolute;
+      left: 50%;
+      top: 3.5%;
+      transform: translate(-50%, 0) translate(var(--titleX), var(--titleY));
+      pointer-events: none;
+      cursor: grab;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: none;
+      z-index: 7;
+      width: auto;
+      max-width: min(100%, 820px);
+      display: inline-flex;
+      flex-direction: column;
+      align-items: center;
+      background: transparent;
+    }
+    .titleDrag > * {
+      pointer-events: auto;
+    }
+    .titleDrag:active,
+    .titleDrag:active > * { cursor: grabbing; }
+
+    .title {
+      text-align: center;
+      font-size: calc(26px * var(--uiScale));
+      line-height: 1.1;
+      margin: 0;
+      padding: 0;
+      display: inline-block;
+      white-space: nowrap;
+    }
+    .title .italic { font-style: italic; }
+    body[data-visual-mode="dark"] .titleDrag,
+    body[data-visual-mode="dark"] .title,
+    body[data-visual-mode="dark"] .tRange {
+      color: #ffffff;
+    }
+    .formula {
+      margin-top: calc(10px * var(--uiScale));
+      display: grid;
+      justify-items: center;
+      gap: calc(8px * var(--uiScale));
+    }
+    .box {
+      border: 2px solid #000;
+      padding: calc(8px * var(--uiScale)) calc(14px * var(--uiScale));
+      font-size: calc(24px * var(--uiScale));
+      line-height: 1;
+      background: rgba(255, 255, 255, 0.92);
+      max-width: none;
+      white-space: nowrap;
+    }
+    body[data-visual-mode="dark"] .box {
+      border-color: rgba(255, 255, 255, 0.84);
+      background: rgba(11, 12, 16, 0.92);
+      color: #ffffff;
+    }
+    .titleHidden #titleText,
+    .titleHidden .formula { display: none; }
+    .tRange {
+      font-size: calc(22px * var(--uiScale));
+    }
+    .settingsCard {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.88);
+      box-shadow:
+        0 1px 0 rgba(0, 0, 0, 0.05),
+        0 12px 36px rgba(0, 0, 0, 0.07);
+      padding: 8px 10px;
+      box-sizing: border-box;
+    }
+    body[data-visual-mode="dark"] .settingsCard {
+      background: rgba(11, 12, 16, 0.90);
+      border-color: rgba(255, 255, 255, 0.14);
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.04),
+        0 12px 36px rgba(0, 0, 0, 0.30);
+    }
+    .settingsToolbar {
+      display: flex;
+      min-height: 58px;
+    }
+    .settingsTitle {
+      margin: 0;
+      font-size: 11px;
+      letter-spacing: 0.2px;
+      text-transform: uppercase;
+      color: rgba(0, 0, 0, 0.72);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    .displayLayout {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      scrollbar-width: none;
+      width: 100%;
+    }
+    .displayLayout::-webkit-scrollbar { display: none; }
+    .displayLead {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 8px;
+      flex: 0 0 auto;
+      padding-right: 10px;
+      border-right: 1px solid rgba(0, 0, 0, 0.12);
+    }
+    .leadToggleRow {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+      gap: 6px;
+      width: min(240px, 100%);
+    }
+    .leadToggleRow .displayBtn {
+      width: 100%;
+      justify-content: center;
+      text-align: center;
+      padding-left: 0;
+      padding-right: 0;
+    }
+    body[data-visual-mode="dark"] .settingsTitle {
+      color: rgba(255, 255, 255, 0.76);
+    }
+    body[data-visual-mode="dark"] .displayLead {
+      border-right-color: rgba(255, 255, 255, 0.14);
+    }
+    .modeButtons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      max-width: 190px;
+    }
+    .modeBtn {
+      padding: 4px 9px;
+      font-size: 10px;
+    }
+    .settingsSections {
+      display: flex;
+      align-items: stretch;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .settingsSection {
+      display: flex;
+      flex: 1 1 0;
+      flex-direction: column;
+      gap: 8px;
+      min-width: 0;
+      padding: 2px 10px 4px;
+      box-sizing: border-box;
+      border-left: 1px solid rgba(0, 0, 0, 0.12);
+      transition: background 120ms ease;
+    }
+    body[data-visual-mode="dark"] .settingsSection {
+      border-left-color: rgba(255, 255, 255, 0.14);
+    }
+    .settingsSection:first-child {
+      border-left: none;
+    }
+    .settingsSection.inactive {
+      background: rgba(0, 0, 0, 0.06);
+    }
+    body[data-visual-mode="dark"] .settingsSection.inactive {
+      background: rgba(255, 255, 255, 0.07);
+    }
+    .sectionGate {
+      appearance: none;
+      -webkit-appearance: none;
+      border: 0;
+      background: rgba(255, 255, 255, 0.18);
+      color: rgba(0, 0, 0, 0.72);
+      padding: 4px 8px 6px;
+      border-radius: 8px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      font-size: 11px;
+      letter-spacing: 0.24px;
+      text-transform: uppercase;
+      text-align: left;
+      cursor: pointer;
+      transition: background 120ms ease, color 120ms ease;
+    }
+    body[data-visual-mode="dark"] .sectionGate {
+      background: rgba(255, 255, 255, 0.08);
+      color: rgba(255, 255, 255, 0.76);
+    }
+    .settingsSection.inactive .sectionGate {
+      background: rgba(0, 0, 0, 0.14);
+      color: rgba(0, 0, 0, 0.92);
+    }
+    body[data-visual-mode="dark"] .settingsSection.inactive .sectionGate {
+      background: rgba(255, 255, 255, 0.15);
+      color: rgba(255, 255, 255, 0.94);
+    }
+    .sectionButtons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      min-height: 31px;
+    }
+    .sectionBreak {
+      flex-basis: 100%;
+      width: 0;
+      height: 0;
+    }
+    .settingsSection.inactive .sectionButtons {
+      opacity: 0.34;
+    }
+    .displayBtn {
+      appearance: none;
+      -webkit-appearance: none;
+      border: 1px solid rgba(0, 0, 0, 0.18);
+      background: rgba(255, 255, 255, 0.36);
+      color: rgba(0, 0, 0, 0.76);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      font-size: 11px;
+      line-height: 1.1;
+      white-space: nowrap;
+      cursor: pointer;
+      transition: background 120ms ease, color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55);
+    }
+    .displayBtn.active {
+      background: rgba(21, 21, 21, 0.94);
+      color: #fff;
+      border-color: rgba(21, 21, 21, 0.98);
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.18) inset,
+        0 5px 14px rgba(0, 0, 0, 0.14);
+    }
+    body[data-visual-mode="dark"] .displayBtn {
+      background: rgba(255, 255, 255, 0.08);
+      color: rgba(255, 255, 255, 0.84);
+      border-color: rgba(255, 255, 255, 0.16);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    }
+    body[data-visual-mode="dark"] .displayBtn.active {
+      background: rgba(241, 245, 249, 0.94);
+      color: #0b0c10;
+      border-color: rgba(241, 245, 249, 0.96);
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.34) inset,
+        0 5px 14px rgba(0, 0, 0, 0.26);
+    }
+    .displayBtn.stored {
+      background: rgba(21, 21, 21, 0.10);
+      color: rgba(21, 21, 21, 0.90);
+      border-color: rgba(21, 21, 21, 0.32);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.32);
+    }
+    body[data-visual-mode="dark"] .displayBtn.stored {
+      background: rgba(255, 255, 255, 0.14);
+      color: rgba(255, 255, 255, 0.90);
+      border-color: rgba(255, 255, 255, 0.26);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    }
+    .displayBtn.unsupported {
+      opacity: 0.72;
+    }
+    .displayBtn:focus-visible {
+      outline: 2px solid rgba(0, 0, 0, 0.70);
+      outline-offset: 1px;
+    }
+
+    .cornerBtn {
+      position: absolute;
+      bottom: 12px;
+      z-index: 5;
+      pointer-events: auto;
+      appearance: none;
+      -webkit-appearance: none;
+      border: 1px solid rgba(0, 0, 0, 0.18);
+      background: rgba(255, 255, 255, 0.82);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-size: 14px;
+      touch-action: manipulation;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      cursor: pointer;
+    }
+    body[data-visual-mode="dark"] .cornerBtn {
+      background: rgba(11, 12, 16, 0.88);
+      color: #e8e8e8;
+      border-color: rgba(255, 255, 255, 0.16);
+    }
+    .cornerBtn:hover { background: rgba(255, 255, 255, 0.95); }
+    body[data-visual-mode="dark"] .cornerBtn:hover { background: rgba(17, 18, 24, 0.96); }
+    .cornerLeft { left: 12px; }
+    .cornerRight { right: 12px; }
+
+    .helpCard {
+      position: absolute;
+      right: 12px;
+      bottom: 60px;
+      z-index: 6;
+      width: min(380px, calc(100% - 24px));
+      box-sizing: border-box;
+      border: 1px solid rgba(0, 0, 0, 0.15);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.90);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.14);
+      padding: 11px 12px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      font-size: 13px;
+      line-height: 1.45;
+      color: rgba(0, 0, 0, 0.82);
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity 140ms ease, transform 140ms ease;
+    }
+    body[data-visual-mode="dark"] .helpCard {
+      background: rgba(11, 12, 16, 0.94);
+      color: #e8e8e8;
+      border-color: rgba(255, 255, 255, 0.14);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.34);
+    }
+    .helpCard.show {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+  </style>
+</head>
+<body>
+  <div class="widgetShell">
+    <div id="tabChrome" class="tabChrome tightWidth">
+      <div id="tabBar" class="tabBar" role="tablist" aria-label="Geometry mode tabs"></div>
+    </div>
+    <div class="mainPanel">
+      <div class="wrap" id="wrap">
+        <canvas id="c"></canvas>
+        <button id="btnReset" class="cornerBtn cornerLeft" type="button">Reset</button>
+        <button id="btnHelp" class="cornerBtn cornerRight" type="button">Help</button>
+        <div id="helpCard" class="helpCard">
+          Drag points inside the disk, switch tabs above the widget, drag the title, reset the state, or resize from any corner.
+        </div>
+        <div class="resizeHandle nw" data-handle="nw" aria-hidden="true"></div>
+        <div class="resizeHandle ne" data-handle="ne" aria-hidden="true"></div>
+        <div class="resizeHandle sw" data-handle="sw" aria-hidden="true"></div>
+        <div class="resizeHandle se" data-handle="se" aria-hidden="true"></div>
+
+        <div class="overlay">
+          <div id="lmsAtomControl" class="lmsModeControl lmsAtomControl" aria-label="LMS boundary atom count"></div>
+          <div id="titleDrag" class="titleDrag" aria-label="Drag to reposition the title">
+            <div id="titleText" class="title">Gyro-geodesic through two draggable points</div>
+            <div class="formula">
+              <div id="formulaText" class="box">A ⊕ (⊖A ⊕ B) ⊗ t</div>
+              <div id="rangeText" class="tRange"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="settingsCard" class="settingsCard">
+        <div id="settingsToolbar" class="settingsToolbar">
+          <div id="displayControls" class="displayLayout" role="group" aria-label="Display controls">
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ---------- core math ----------
+    const EPS = 1e-10;
+    const TAU = Math.PI * 2;
+
+    function norm2(v){ return v.x*v.x + v.y*v.y; }
+    function norm(v){ return Math.hypot(v.x, v.y); }
+    function dot(a,b){ return a.x*b.x + a.y*b.y; }
+    function cross(a,b){ return a.x*b.y - a.y*b.x; }
+    function add(a,b){ return {x:a.x+b.x, y:a.y+b.y}; }
+    function sub(a,b){ return {x:a.x-b.x, y:a.y-b.y}; }
+    function scale(v,s){ return {x:v.x*s, y:v.y*s}; }
+    function neg(v){ return {x:-v.x, y:-v.y}; }
+    function perp(v){ return {x:-v.y, y:v.x}; }
+    function unit(v){
+      const r = norm(v);
+      if (r < EPS) return {x:1, y:0};
+      return scale(v, 1/r);
+    }
+    function rot(v, ang){
+      const c = Math.cos(ang), s = Math.sin(ang);
+      return { x: c*v.x - s*v.y, y: s*v.x + c*v.y };
+    }
+    function clampToDisk(v, maxR=0.999){
+      const r = norm(v);
+      if (r <= maxR) return v;
+      return scale(v, maxR / r);
+    }
+    function angleOf(v){
+      return Math.atan2(v.y, v.x);
+    }
+    function formatNum(x, digits=3){
+      return Number.isFinite(x) ? x.toFixed(digits) : "0.000";
+    }
+
+    // Möbius action / gyroaddition on the unit disk
+    function mobiusAdd(a,b){
+      const a2 = norm2(a), b2 = norm2(b), ab = dot(a,b);
+      const denom = 1 + 2*ab + a2*b2;
+      return {
+        x: ((1 + 2*ab + b2)*a.x + (1 - a2)*b.x) / denom,
+        y: ((1 + 2*ab + b2)*a.y + (1 - a2)*b.y) / denom
+      };
+    }
+    function mobiusScalar(t, v){
+      const r = norm(v);
+      if (r < EPS) return {x:0, y:0};
+      const rr = Math.min(r, 0.999999999);
+      const k = Math.tanh(t * Math.atanh(rr)) / r;
+      return scale(v, k);
+    }
+    function gyroPoint(A,B,t){
+      const delta = mobiusAdd(neg(A), B);
+      return mobiusAdd(A, mobiusScalar(t, delta));
+    }
+    function mobiusBoundaryAction(w, x){
+      // Continuous boundary extension of Möbius addition for a unit boundary input.
+      return unit(mobiusAdd(w, unit(x)));
+    }
+    function householderReflect(y, w){
+      const d = Math.max(EPS, norm2(w));
+      return sub(y, scale(w, 2 * dot(w, y) / d));
+    }
+    // ---------- hyperbolic geodesic helpers ----------
+    function geodesicFromTwoPoints(P,Q){
+      const det = cross(P,Q);
+      if (Math.abs(det) < 1e-8) {
+        const u = unit(norm(P) > EPS ? P : (norm(Q) > EPS ? Q : {x:1,y:0}));
+        return { type:"diameter", u };
+      }
+      const k1 = (1 + norm2(P)) / 2;
+      const k2 = (1 + norm2(Q)) / 2;
+      const invDet = 1 / det;
+      const c = {
+        x: (k1*Q.y - k2*P.y) * invDet,
+        y: (-k1*Q.x + k2*P.x) * invDet
+      };
+      const r = Math.sqrt(Math.max(norm2(c) - 1, 0));
+      return { type:"circle", c, r };
+    }
+    function circleIntersectionsUnit(c,r){
+      const d = norm(c);
+      const a = (1 - r*r + d*d) / (2*d);
+      const h = Math.sqrt(Math.max(1 - a*a, 0));
+      const p2 = scale(c, a/d);
+      const v = scale(perp(c), h/d);
+      return [ add(p2, v), sub(p2, v) ];
+    }
+    function mod2pi(x){
+      x = x % TAU;
+      if (x < 0) x += TAU;
+      return x;
+    }
+    function sampleGeodesic(g, N=400){
+      if (g.type === "diameter") {
+        const pts = [];
+        for (let i=0; i<=N; i++){
+          const s = -0.999 + 1.998*i/N;
+          pts.push(scale(g.u, s));
+        }
+        return pts;
+      }
+      const [I1,I2] = circleIntersectionsUnit(g.c, g.r);
+      const a1 = Math.atan2(I1.y - g.c.y, I1.x - g.c.x);
+      const a2 = Math.atan2(I2.y - g.c.y, I2.x - g.c.x);
+      const dccw = mod2pi(a2 - a1);
+      const midCcw = a1 + dccw/2;
+      const midPt = add(g.c, {x: g.r*Math.cos(midCcw), y: g.r*Math.sin(midCcw)});
+      let delta = dccw;
+      if (norm(midPt) >= 1 - 1e-6) delta = dccw - TAU;
+
+      const pts = [];
+      for (let i=0; i<=N; i++){
+        const t = i/N;
+        const ang = a1 + delta*t;
+        pts.push(clampToDisk(add(g.c, {x: g.r*Math.cos(ang), y: g.r*Math.sin(ang)}), 0.999999));
+      }
+      return pts;
+    }
+    function geodesicFromPointTangent(M, tDir){
+      const t = unit(tDir);
+      if (norm(M) < EPS) return { type:"diameter", u: t };
+      if (Math.abs(cross(M, t)) < 1e-8) return { type:"diameter", u: unit(M) };
+      const n = unit(perp(t));
+      const denom = 2 * dot(M, n);
+      if (Math.abs(denom) < 1e-10) return { type:"diameter", u: t };
+      const s = (1 - norm2(M)) / denom;
+      const c = add(M, scale(n, s));
+      const r = Math.sqrt(Math.max(norm2(c) - 1, 0));
+      return { type:"circle", c, r };
+    }
+    function horosphereCircle(xi, throughPoint){
+      const cVal = Math.max(EPS, norm2(sub(throughPoint, xi)) / Math.max(EPS, 1 - norm2(throughPoint)));
+      return {
+        cVal,
+        center: scale(xi, 1 / (1 + cVal)),
+        radius: cVal / (1 + cVal)
+      };
+    }
+    function horosphereCircleFromValue(xi, bValue){
+      const cVal = Math.max(EPS, Math.exp(bValue));
+      return {
+        cVal,
+        center: scale(xi, 1 / (1 + cVal)),
+        radius: cVal / (1 + cVal)
+      };
+    }
+    function sampleHorocycleAnchoredFan(xi, circle, anchorPoint, countPerSide=4){
+      const fans = [];
+      const center = circle.center;
+      const radius = Math.max(circle.radius, EPS);
+      const baseAngle = Math.atan2(anchorPoint.y - center.y, anchorPoint.x - center.x);
+      const tangentAngle = Math.atan2(xi.y - center.y, xi.x - center.x);
+      const angleGap = Math.max(0.12, Math.abs(Math.atan2(Math.sin(baseAngle - tangentAngle), Math.cos(baseAngle - tangentAngle))));
+      const step = Math.min(0.34, Math.max(0.12, 0.78 * angleGap / Math.max(countPerSide, 1)));
+
+      for (let offsetIndex = -countPerSide; offsetIndex <= countPerSide; offsetIndex++) {
+        const ang = baseAngle + offsetIndex * step;
+        const point = {
+          x: center.x + radius * Math.cos(ang),
+          y: center.y + radius * Math.sin(ang)
+        };
+        if (norm(sub(point, xi)) < 0.035) continue;
+        fans.push(sampleGeodesic(
+          geodesicFromTwoPoints(clampToDisk(point, 0.999999), scale(xi, 0.999999)),
+          260
+        ));
+      }
+      if (!fans.length) {
+        fans.push(sampleGeodesic(
+          geodesicFromTwoPoints(clampToDisk(anchorPoint, 0.999999), scale(xi, 0.999999)),
+          260
+        ));
+      }
+      return fans;
+    }
+    function centeredHorocycleFoliation(xi, centerValue, count=7, step=0.42){
+      const circles = [];
+      const half = Math.floor(count / 2);
+      for (let i = -half; i <= half; i++) {
+        circles.push(horosphereCircleFromValue(xi, centerValue + i * step));
+      }
+      if (count % 2 === 0) {
+        circles.push(horosphereCircleFromValue(xi, centerValue + (half + 1) * step));
+      }
+      return circles;
+    }
+    const LMS_ATOM_COUNT_OPTIONS = [4, 8, 16, 32];
+    const LMS_DEFAULT_ATOM_COUNT = 16;
+    const LMS_ATOM_CACHE = new Map();
+    function weightedSum(points, weights){
+      return points.reduce((sum, point, idx) => add(sum, scale(point, weights[idx] ?? 0)), {x:0, y:0});
+    }
+    function lmsAtomCount(local){
+      return LMS_ATOM_COUNT_OPTIONS.includes(local?.atomCount) ? local.atomCount : LMS_DEFAULT_ATOM_COUNT;
+    }
+    function lmsBaseAtoms(count=LMS_DEFAULT_ATOM_COUNT){
+      if (LMS_ATOM_CACHE.has(count)) return LMS_ATOM_CACHE.get(count);
+      const angles = Array.from({ length: count }, (_, idx) => TAU * idx / count);
+      const atoms = {
+        points: angles.map((ang) => ({ x: Math.cos(ang), y: Math.sin(ang) })),
+        weights: Array.from({ length: count }, () => 1 / count)
+      };
+      LMS_ATOM_CACHE.set(count, atoms);
+      return atoms;
+    }
+    function lmsConfiguredAtoms(local){
+      const count = lmsAtomCount(local);
+      const defaults = lmsBaseAtoms(count);
+      if (
+        !Array.isArray(local?.atomPoints) || local.atomPoints.length !== count ||
+        !Array.isArray(local?.atomIds) || local.atomIds.length !== count
+      ) {
+        return {
+          points: defaults.points.map((point) => ({ ...point })),
+          ids: Array.from({ length: count }, (_, idx) => idx),
+          weights: defaults.weights.slice()
+        };
+      }
+      return {
+        points: local.atomPoints.map((point, idx) => {
+          if (norm(point || { x: 0, y: 0 }) > EPS) return unit(point);
+          return { ...defaults.points[idx] };
+        }),
+        ids: local.atomIds.map((id, idx) => Number.isFinite(id) ? id : idx),
+        weights: defaults.weights.slice()
+      };
+    }
+    function normalizeWeights(weights, count, fallbackWeights=null){
+      const source = Array.isArray(weights) && weights.length === count
+        ? weights.map((weight) => Number.isFinite(weight) && weight > 0 ? weight : 0)
+        : (Array.isArray(fallbackWeights) && fallbackWeights.length === count
+            ? fallbackWeights.slice()
+            : Array.from({ length: count }, () => 1 / Math.max(1, count)));
+      const total = source.reduce((sum, weight) => sum + weight, 0);
+      if (!(total > EPS)) return Array.from({ length: count }, () => 1 / Math.max(1, count));
+      return source.map((weight) => weight / total);
+    }
+    function closestPointOnSegment(a, b, point){
+      const edge = sub(b, a);
+      const len2 = Math.max(EPS, norm2(edge));
+      const t = Math.max(0, Math.min(1, dot(sub(point, a), edge) / len2));
+      return add(a, scale(edge, t));
+    }
+    function pointInConvexPolygon(point, polygon){
+      if (!polygon || polygon.length < 3) return false;
+      let sign = 0;
+      for (let i = 0; i < polygon.length; i++) {
+        const a = polygon[i];
+        const b = polygon[(i + 1) % polygon.length];
+        const orient = cross(sub(b, a), sub(point, a));
+        if (Math.abs(orient) < 1e-8) continue;
+        const nextSign = orient > 0 ? 1 : -1;
+        if (!sign) {
+          sign = nextSign;
+        } else if (sign !== nextSign) {
+          return false;
+        }
+      }
+      return true;
+    }
+    function clampToConvexPolygon(point, polygon){
+      if (!polygon || polygon.length < 3) return clampToDisk(point, 0.999);
+      const insidePoint = clampToDisk(point, 0.999);
+      if (pointInConvexPolygon(insidePoint, polygon)) return insidePoint;
+      let best = polygon[0];
+      let bestDist = Infinity;
+      for (let i = 0; i < polygon.length; i++) {
+        const candidate = closestPointOnSegment(polygon[i], polygon[(i + 1) % polygon.length], insidePoint);
+        const dist2 = norm2(sub(candidate, insidePoint));
+        if (dist2 < bestDist) {
+          best = candidate;
+          bestDist = dist2;
+        }
+      }
+      return best;
+    }
+    function convexPolygonWeights(point, polygon){
+      const n = polygon?.length || 0;
+      if (!n) return [];
+      for (let i = 0; i < n; i++) {
+        if (norm(sub(point, polygon[i])) < 1e-6) {
+          return Array.from({ length: n }, (_, idx) => idx === i ? 1 : 0);
+        }
+      }
+      for (let i = 0; i < n; i++) {
+        const a = polygon[i];
+        const b = polygon[(i + 1) % n];
+        const edge = sub(b, a);
+        const len2 = Math.max(EPS, norm2(edge));
+        const t = dot(sub(point, a), edge) / len2;
+        const projected = add(a, scale(edge, Math.max(0, Math.min(1, t))));
+        if (norm(sub(projected, point)) < 1e-6 && t >= -1e-6 && t <= 1 + 1e-6) {
+          return Array.from({ length: n }, (_, idx) => {
+            if (idx === i) return 1 - Math.max(0, Math.min(1, t));
+            if (idx === (i + 1) % n) return Math.max(0, Math.min(1, t));
+            return 0;
+          });
+        }
+      }
+      const tanHalf = [];
+      for (let i = 0; i < n; i++) {
+        const ri = sub(polygon[i], point);
+        const rj = sub(polygon[(i + 1) % n], point);
+        const denom = Math.max(EPS, norm(ri) * norm(rj) + dot(ri, rj));
+        tanHalf[i] = Math.abs(cross(ri, rj)) / denom;
+      }
+      const weights = [];
+      for (let i = 0; i < n; i++) {
+        const dist = Math.max(EPS, norm(sub(polygon[i], point)));
+        weights[i] = Math.max(0, (tanHalf[(i - 1 + n) % n] + tanHalf[i]) / dist);
+      }
+      return normalizeWeights(weights, n);
+    }
+    function xParameterModeId(shared=state.shared){
+      if (shared?.xParameterMode === "neg_z") return "neg_z";
+      if (!shared?.xParameterMode && shared?.boundarySource === "B") return "neg_z";
+      return "x";
+    }
+    function xParameterSpec(shared=state.shared){
+      if (xParameterModeId(shared) === "neg_z") {
+        return {
+          pointLabel: "z",
+          formulaLabel: "-z",
+          actionPoint: neg(shared.A)
+        };
+      }
+      return {
+        pointLabel: "x",
+        formulaLabel: "x",
+        actionPoint: shared.A
+      };
+    }
+    function boundarySourceId(shared=state.shared){
+      return xParameterModeId(shared) === "neg_z" ? "B" : "A";
+    }
+    function boundaryRoles(shared=state.shared){
+      const xSpec = xParameterSpec(shared);
+      const sourceId = boundarySourceId(shared);
+      const evalId = sourceId === "A" ? "B" : "A";
+      const evalIsA = evalId === "A";
+      return {
+        sourceId,
+        sourcePoint: shared[sourceId],
+        sourceLabel: sourceId === "A" ? "x" : "w",
+        evalId,
+        evalPoint: evalIsA ? shared.A : shared.B,
+        evalLabel: evalIsA ? xSpec.pointLabel : "w",
+        actionPoint: evalIsA ? xSpec.actionPoint : shared.B,
+        actionLabel: evalIsA ? xSpec.formulaLabel : "w",
+        mode: sourceId === "A" ? "w" : "z"
+      };
+    }
+    function actionRoles(shared=state.shared){
+      const xSpec = xParameterSpec(shared);
+      return {
+        actorId: "B",
+        actorPoint: shared.B,
+        actorLabel: "w",
+        inputId: "A",
+        inputPoint: xSpec.actionPoint,
+        inputLabel: xSpec.formulaLabel,
+        xPointLabel: xSpec.pointLabel
+      };
+    }
+    function lmsCoordinateMode(_local){
+      return boundaryRoles().mode;
+    }
+    function ensureSharedBoundaryPoint(shared=state.shared){
+      const direct = shared?.C || null;
+      if (norm(direct || {x:0, y:0}) > EPS) {
+        shared.C = unit(direct);
+        return shared.C;
+      }
+      if (typeof shared?.xiAngle === "number") {
+        const fromAngle = { x: Math.cos(shared.xiAngle), y: Math.sin(shared.xiAngle) };
+        shared.C = fromAngle;
+        return fromAngle;
+      }
+      const fallbackSourceId = boundarySourceId(shared);
+      const fallbackPoint = shared?.[fallbackSourceId] || {x: 1, y: 0};
+      if (norm(fallbackPoint) > EPS) {
+        shared.C = unit(fallbackPoint);
+        return shared.C;
+      }
+      shared.C = {x: Math.cos(-0.3), y: Math.sin(-0.3)};
+      return shared.C;
+    }
+    function setSharedBoundaryDirection(shared, diskPt){
+      if (norm(diskPt) <= EPS) return;
+      const dir = unit(diskPt);
+      shared.C = dir;
+      shared.xiAngle = angleOf(dir);
+    }
+    function lmsReducedPair(shared, local){
+      const boundary = boundaryRoles(shared);
+      const mode = boundary.mode;
+      const zeta = sharedBoundaryDirection();
+      const phi = angleOf(zeta);
+      let z;
+      let w;
+      let activePoint;
+      let activeId;
+      let activeLabel;
+      let derivedPoint;
+      let derivedName;
+      if (mode === "w") {
+        w = clampToDisk(shared.B, 0.999);
+        z = clampToDisk(scale(rot(w, phi), -1), 0.999);
+        activePoint = w;
+        activeId = "B";
+        activeLabel = "w";
+        derivedPoint = z;
+        derivedName = "z";
+      } else {
+        z = clampToDisk(shared.A, 0.999);
+        w = clampToDisk(scale(rot(z, -phi), -1), 0.999);
+        activePoint = z;
+        activeId = "A";
+        activeLabel = "z";
+        derivedPoint = w;
+        derivedName = "w";
+      }
+      return { mode, phi, zeta, z, w, activePoint, activeId, activeLabel, derivedPoint, derivedName };
+    }
+    function lmsBoundaryCloud(shared, local){
+      const base = lmsConfiguredAtoms(local);
+      const pair = lmsReducedPair(shared, local);
+      const atoms = base.points.map((point, idx) => {
+        let labPoint;
+        let bodyPoint;
+        if (pair.mode === "w") {
+          bodyPoint = clampToDisk(mobiusBoundaryAction(pair.w, point), 0.999999);
+          labPoint = clampToDisk(rot(bodyPoint, pair.phi), 0.999999);
+        } else {
+          labPoint = clampToDisk(mobiusBoundaryAction(neg(pair.z), rot(point, pair.phi)), 0.999999);
+          bodyPoint = clampToDisk(rot(labPoint, -pair.phi), 0.999999);
+        }
+        return {
+          id: base.ids[idx],
+          basePoint: point,
+          labPoint,
+          bodyPoint
+        };
+      }).sort((a, b) => mod2pi(angleOf(a.labPoint)) - mod2pi(angleOf(b.labPoint)));
+
+      local.atomPoints = atoms.map((atom) => ({ ...atom.basePoint }));
+      local.atomIds = atoms.map((atom) => atom.id);
+
+      const labPoints = atoms.map((atom) => atom.labPoint);
+      const bodyPoints = atoms.map((atom) => atom.bodyPoint);
+      const labLoop = labPoints.length ? [...labPoints, labPoints[0]] : [];
+      const bodyLoop = bodyPoints.length ? [...bodyPoints, bodyPoints[0]] : [];
+      const defaultOrderPoint = clampToConvexPolygon(clampToDisk(weightedSum(labPoints, base.weights), 0.999), labPoints);
+      const orderPoint = clampToConvexPolygon(clampToDisk(local?.orderPoint || defaultOrderPoint, 0.999), labPoints);
+      local.orderPoint = orderPoint;
+      const weights = convexPolygonWeights(orderPoint, labPoints);
+      const Z = clampToDisk(weightedSum(labPoints, weights), 0.999);
+      return {
+        ...pair,
+        weights,
+        bodyPoints,
+        bodyLoop,
+        labPoints,
+        labLoop,
+        atomIds: atoms.map((atom) => atom.id),
+        Z
+      };
+    }
+    function setLmsBoundaryAtom(shared, local, atomId, diskPt){
+      const target = norm(diskPt) > EPS ? unit(diskPt) : null;
+      if (!target) return;
+      const configured = lmsConfiguredAtoms(local);
+      const idx = configured.ids.indexOf(atomId);
+      if (idx < 0) return;
+      const points = configured.points.slice();
+      const pair = lmsReducedPair(shared, local);
+      let basePoint;
+      if (pair.mode === "w") {
+        const bodyPoint = rot(target, -pair.phi);
+        basePoint = mobiusBoundaryAction(neg(pair.w), bodyPoint);
+      } else {
+        const unshifted = mobiusBoundaryAction(pair.z, target);
+        basePoint = rot(unshifted, -pair.phi);
+      }
+      points[idx] = unit(basePoint);
+      local.atomPoints = points;
+      local.atomIds = configured.ids.slice();
+    }
+    function lmsWeightedPotentialValue(v, xis, weights){
+      const directions = Array.isArray(xis) ? xis : [];
+      if (!directions.length) return 0;
+      const normalizedWeights = normalizeWeights(weights, directions.length);
+      const num = Math.max(1 - norm2(v), EPS);
+      let total = 0;
+      for (let i = 0; i < directions.length; i++) {
+        const delta = sub(v, directions[i]);
+        total += normalizedWeights[i] * Math.log(num / Math.max(norm2(delta), EPS));
+      }
+      return total;
+    }
+    function lmsWeightedPotentialGradient(v, xis, weights){
+      const directions = Array.isArray(xis) ? xis : [];
+      if (!directions.length) return { x: 0, y: 0 };
+      const normalizedWeights = normalizeWeights(weights, directions.length);
+      const v2 = norm2(v);
+      const denomBall = Math.max(1 - v2, EPS);
+      let gradient = { x: 0, y: 0 };
+      for (let i = 0; i < directions.length; i++) {
+        const dx = v.x - directions[i].x;
+        const dy = v.y - directions[i].y;
+        const denomXi = Math.max(dx * dx + dy * dy, EPS);
+        gradient = add(gradient, {
+          x: normalizedWeights[i] * ((-2 * v.x / denomBall) - (2 * dx / denomXi)),
+          y: normalizedWeights[i] * ((-2 * v.y / denomBall) - (2 * dy / denomXi))
+        });
+      }
+      return gradient;
+    }
+    function traceLmsPotentialFlow(seed, xis, weights, direction=1, stepSize=0.026, maxSteps=92){
+      const pts = [];
+      let point = clampToDisk(seed, 0.985);
+      for (let step = 0; step < maxSteps; step++) {
+        pts.push(point);
+        const gradient = lmsWeightedPotentialGradient(point, xis, weights);
+        const magnitude = norm(gradient);
+        if (!(magnitude > 1e-6)) break;
+        const delta = scale(gradient, direction * stepSize / magnitude);
+        const next = add(point, delta);
+        if (norm(next) >= 0.992) {
+          pts.push(clampToDisk(next, 0.992));
+          break;
+        }
+        if (norm(sub(next, point)) < 1e-5) break;
+        point = next;
+      }
+      return pts;
+    }
+    function lmsPotentialFlowCurves(scene){
+      const directions = Array.isArray(scene?.samplePoints) ? scene.samplePoints : [];
+      if (!directions.length) return [];
+      const normalizedWeights = normalizeWeights(scene.weights, directions.length);
+      const wPoint = clampToDisk(scene.w || scene.activePoint || { x: 0, y: 0 }, 0.9);
+      const centroid = clampToDisk(scene.Z || { x: 0, y: 0 }, 0.9);
+      const connector = sub(wPoint, centroid);
+      const tangent = norm(connector) > EPS
+        ? unit(perp(connector))
+        : (() => {
+            const flowAtW = lmsWeightedPotentialGradient(wPoint, directions, normalizedWeights);
+            return norm(flowAtW) > EPS ? unit(perp(flowAtW)) : { x: 1, y: 0 };
+          })();
+      const spread = Math.max(0.035, Math.min(0.11, 0.22 * norm(connector) + 0.02));
+      const offsets = [-2, -1, 0, 1, 2].map((k) => k * spread);
+      return offsets.map((offset) => {
+        const seed = clampToDisk(add(wPoint, scale(tangent, offset)), 0.94);
+        const backward = traceLmsPotentialFlow(seed, directions, normalizedWeights, -1).reverse();
+        const forward = traceLmsPotentialFlow(seed, directions, normalizedWeights, 1).slice(1);
+        return backward.concat(forward);
+      }).filter((curve) => curve.length > 1);
+    }
+    function currentHorocyclePoint(circle, point){
+      const dir = unit(sub(point, circle.center));
+      return add(circle.center, scale(dir, circle.radius));
+    }
+    function sharedBoundaryDirection(shared=state.shared){
+      return ensureSharedBoundaryPoint(shared);
+    }
+    function closestPointIndex(pts, target){
+      let bestIdx = 0;
+      let bestDist = Infinity;
+      for (let i = 0; i < pts.length; i++) {
+        const d = norm2(sub(pts[i], target));
+        if (d < bestDist) {
+          bestDist = d;
+          bestIdx = i;
+        }
+      }
+      return bestIdx;
+    }
+    function tangentFromPolyline(pts, idx, span=3){
+      const i0 = Math.max(0, idx - span);
+      const i1 = Math.min(pts.length - 1, idx + span);
+      return unit(sub(pts[i1], pts[i0]));
+    }
+    function buildOrthogonalFanFromGeodesic(geodesic, anchorPoint, lineCount=5, sampleN=420){
+      if (!geodesic || !anchorPoint) return [];
+      const base = sampleGeodesic(geodesic, sampleN);
+      if (base.length < 12) return [];
+      const idx0 = closestPointIndex(base, anchorPoint);
+      const half = Math.floor(lineCount / 2);
+      const stride = Math.max(18, Math.floor(sampleN / 12));
+      const curves = [];
+      for (let k = -half; k <= half; k++) {
+        const idx = Math.max(5, Math.min(base.length - 6, idx0 + k * stride));
+        const point = base[idx];
+        const tangent = tangentFromPolyline(base, idx, 4);
+        const normalGeo = geodesicFromPointTangent(point, perp(tangent));
+        curves.push(sampleGeodesic(normalGeo, 240));
+      }
+      return curves;
+    }
+    function buildEquidistantOffsets(geodesic, distances=[0.38, 0.76], sampleN=420){
+      if (!geodesic) return [];
+      const base = sampleGeodesic(geodesic, sampleN);
+      if (base.length < 10) return [];
+      const curves = [];
+      for (const d of distances) {
+        const step = Math.tanh(Math.max(0, d) / 2);
+        for (const sign of [-1, 1]) {
+          const curve = [];
+          for (let i = 4; i < base.length - 4; i++) {
+            const tangent = tangentFromPolyline(base, i, 3);
+            const normal = scale(unit(perp(tangent)), sign);
+            curve.push(clampToDisk(mobiusAdd(base[i], scale(normal, step)), 0.999999));
+          }
+          curves.push(curve);
+        }
+      }
+      return curves;
+    }
+    function precessionValue(z, ZLab){
+      return cross(z, ZLab);
+    }
+    function precessionVisibilityValue(z, ZLab){
+      const scale = norm(z) * norm(ZLab);
+      if (scale <= EPS) return 0;
+      return Math.max(0, Math.min(1, Math.abs(cross(z, ZLab)) / scale));
+    }
+    function normalizedPrecessionMagnitude(magnitude){
+      return Math.max(0, Math.min(1, 1 - Math.exp(-3.6 * Math.max(0, magnitude))));
+    }
+    function thomasPrecessionOpacity(level){
+      const u = Math.max(0, Math.min(1, level));
+      const vanishBand = 0.006;
+      const midBand = 0.56;
+      const minVisible = 0.16;
+      const baseOpacity = 0.62;
+      if (u <= vanishBand) return 0;
+      if (u <= midBand) {
+        const t = (u - vanishBand) / Math.max(EPS, midBand - vanishBand);
+        const eased = 0.5 - 0.5 * Math.cos(Math.PI * t);
+        return interpolate(minVisible, baseOpacity, eased);
+      }
+      const t = (u - midBand) / Math.max(EPS, 1 - midBand);
+      const eased = 0.5 - 0.5 * Math.cos(Math.PI * t);
+      return interpolate(baseOpacity, 0.96, eased);
+    }
+
+    // ---------- DOM and widget shell ----------
+    const canvas = document.getElementById("c");
+    const widgetShell = document.querySelector(".widgetShell");
+    const wrap = document.getElementById("wrap");
+    const tabChrome = document.getElementById("tabChrome");
+    const settingsCard = document.getElementById("settingsCard");
+    const ctx = canvas.getContext("2d");
+    const lmsPotentialCanvas = document.createElement("canvas");
+    const lmsPotentialCtx = lmsPotentialCanvas.getContext("2d");
+    const titleDrag = document.getElementById("titleDrag");
+    const titleText = document.getElementById("titleText");
+    const formulaText = document.getElementById("formulaText");
+    const rangeText = document.getElementById("rangeText");
+    const lmsAtomControl = document.getElementById("lmsAtomControl");
+    const displayControls = document.getElementById("displayControls");
+    const tabBar = document.getElementById("tabBar");
+    const btnReset = document.getElementById("btnReset");
+    const btnHelp = document.getElementById("btnHelp");
+    const helpCard = document.getElementById("helpCard");
+
+    const DISPLAY_DETAILS = [
+      { id: "normals", label: "Orthogonals", group: "stateGeometry", tabs: "all" },
+      { id: "equidistants", label: "Hypercycles", group: "stateGeometry", tabs: "all" },
+      { id: "foliation", label: "Horospheres", group: "potentialGeometry", tabs: ["mobius-action", "householder-action", "lms-reduced"] },
+      { id: "fan", label: "Gradient Flow", group: "potentialGeometry", tabs: ["mobius-action", "householder-action", "lms-reduced"] }
+    ];
+    const DISPLAY_GROUPS = [
+      { id: "stateGeometry", label: "State Geometry" },
+      { id: "potentialGeometry", label: "Potential Geometry" }
+    ];
+    const VISUAL_MODES = [
+      { id: "bland", label: "Bland" },
+      { id: "dark", label: "Dark" },
+      { id: "contrast", label: "Contrast" }
+    ];
+
+    function defaultDisplayState(){
+      return {
+        normals: true,
+        equidistants: true,
+        foliation: true,
+        fan: false
+      };
+    }
+    function defaultDisplayGroups(){
+      return {
+        stateGeometry: true,
+        potentialGeometry: false
+      };
+    }
+    function defaultVisualMode(){
+      return "bland";
+    }
+    function tabSupportsDisplayKey(tabId, key){
+      const detail = DISPLAY_DETAILS.find((entry) => entry.id === key);
+      if (!detail) return false;
+      return detail.tabs === "all" || detail.tabs.includes(tabId);
+    }
+    function ensureDisplayState(){
+      const existing = state.shared.display || {};
+      const next = { ...defaultDisplayState(), ...existing };
+      if (existing.foliation === undefined && existing.foliationGeodesics !== undefined) next.foliation = !!existing.foliationGeodesics;
+      if (existing.fan === undefined && existing.foliationGeodesics !== undefined) next.fan = !!existing.foliationGeodesics;
+      state.shared.display = next;
+      return state.shared.display;
+    }
+    function ensureDisplayGroups(){
+      state.shared.displayGroups = { ...defaultDisplayGroups(), ...(state.shared.displayGroups || {}) };
+      return state.shared.displayGroups;
+    }
+    function ensureVisualMode(){
+      const next = state.shared.visualMode;
+      if (!VISUAL_MODES.some((mode) => mode.id === next)) {
+        state.shared.visualMode = defaultVisualMode();
+      }
+      return state.shared.visualMode;
+    }
+    function displayDetailIsVisible(key, tabId=currentTab().id){
+      if (!tabSupportsDisplayKey(tabId, key)) return false;
+      const detail = DISPLAY_DETAILS.find((entry) => entry.id === key);
+      if (!detail) return false;
+      return !!ensureDisplayState()[key] && !!ensureDisplayGroups()[detail.group];
+    }
+
+    // ---------- shared widget state ----------
+    const INITIAL_X = clampToDisk({x: 0.30, y: -0.62});
+    const INITIAL_W = clampToDisk({x: 0.30, y: -0.30});
+    const INITIAL_C = unit(INITIAL_X);
+
+    const state = {
+      shared: {
+        A: { ...INITIAL_X },
+        B: { ...INITIAL_W },
+        C: { ...INITIAL_C },
+        boundarySource: "A",
+        xParameterMode: "x",
+        activeTabId: "lms-reduced",
+        titleEnabled: true,
+        display: defaultDisplayState(),
+        displayGroups: defaultDisplayGroups(),
+        visualMode: defaultVisualMode(),
+      },
+      perTab: {},
+      dragTarget: null,
+      uiBaseW: null,
+      titleDragState: null,
+      resizing: null,
+      needsRedraw: true,
+      lastTimestampMs: 0,
+    };
+
+    function invalidate(){
+      state.needsRedraw = true;
+    }
+    function currentVisualMode(){
+      return ensureVisualMode();
+    }
+    function syncVisualMode(){
+      document.body.dataset.visualMode = currentVisualMode();
+    }
+    function hexToRgb(hex){
+      const normalized = hex.replace("#", "");
+      const full = normalized.length === 3
+        ? normalized.split("").map((ch) => ch + ch).join("")
+        : normalized;
+      if (full.length !== 6) return null;
+      return {
+        r: parseInt(full.slice(0, 2), 16),
+        g: parseInt(full.slice(2, 4), 16),
+        b: parseInt(full.slice(4, 6), 16)
+      };
+    }
+    function rgbaHex(hex, alpha=1){
+      const rgb = hexToRgb(hex);
+      if (!rgb) return hex;
+      return `rgba(${rgb.r},${rgb.g},${rgb.b},${alpha})`;
+    }
+    function interpolate(from, to, t){
+      return from + (to - from) * t;
+    }
+    function fadeByCenter(idx, total, centerAlpha, edgeAlpha){
+      if (total <= 1) return centerAlpha;
+      const mid = (total - 1) / 2;
+      const maxDist = Math.max(mid, 1);
+      const t = Math.abs(idx - mid) / maxDist;
+      return interpolate(centerAlpha, edgeAlpha, Math.max(0, Math.min(1, t)));
+    }
+    function currentVisualTheme(){
+      const mode = currentVisualMode();
+      const warmRed = "#ff3b30";
+      const warmOrange = "#ff8c42";
+      const coolBlue = "#1e90ff";
+      const coolCyan = "#00bcd4";
+      const stateNormalBlue = "#74b3ea";
+      const stateHyperBlue = "#2d6bcf";
+      const potentialMid = "#d89260";
+      const potentialDeep = "#bf6f3d";
+      if (mode === "dark") {
+        return {
+          mode,
+          ink: "#ffffff",
+          paper: "#0b0c10",
+          warmRed,
+          warmOrange,
+          coolBlue,
+          coolCyan,
+          stateNormal(idx, total){
+            const dist = total <= 1 ? 0 : Math.abs(idx - (total - 1) / 2) / Math.max((total - 1) / 2, 1);
+            return {
+              stroke: rgbaHex(stateNormalBlue, fadeByCenter(idx, total, 0.44, 0.20)),
+              lineWidth: interpolate(1.14, 0.96, dist)
+            };
+          },
+          stateEquidistant(idx){
+            const band = idx < 2 ? 0 : 1;
+            return {
+              stroke: rgbaHex(stateHyperBlue, band === 0 ? 0.70 : 0.38),
+              lineWidth: band === 0 ? 1.14 : 1.0
+            };
+          },
+          potentialFoliation(idx, total){
+            const dist = total <= 1 ? 0 : Math.abs(idx - (total - 1) / 2) / Math.max((total - 1) / 2, 1);
+            return {
+              stroke: rgbaHex(warmRed, fadeByCenter(idx, total, 0.72, 0.34)),
+              lineWidth: interpolate(1.34, 1.02, dist)
+            };
+          },
+          potentialFan(idx, total){
+            const dist = total <= 1 ? 0 : Math.abs(idx - (total - 1) / 2) / Math.max((total - 1) / 2, 1);
+            return {
+              stroke: rgbaHex(potentialMid, fadeByCenter(idx, total, 0.56, 0.22)),
+              lineWidth: interpolate(1.1, 0.92, dist)
+            };
+          },
+          potentialCircle(){
+            return { stroke: rgbaHex("#ffffff", 0.82), lineWidth: 1.45, lineDash: [3, 5] };
+          },
+          potentialGeodesic(){
+            return { stroke: rgbaHex("#ffffff", 0.76), lineWidth: 1.5 };
+          },
+          potentialConnector(){
+            return { stroke: rgbaHex(potentialDeep, 0.24), lineWidth: 1.2, lineDash: [5, 6] };
+          },
+          gradient(){
+            return { stroke: warmRed, lineWidth: 2.05, headSize: 0.022 };
+          },
+          curvedArrow: rgbaHex("#ffffff", 0.58)
+        };
+      }
+      if (mode === "contrast") {
+        return {
+          mode,
+          ink: "#0b0b0b",
+          paper: "#ffffff",
+          warmRed,
+          warmOrange,
+          coolBlue,
+          coolCyan,
+          stateNormal(idx, total){
+            const dist = total <= 1 ? 0 : Math.abs(idx - (total - 1) / 2) / Math.max((total - 1) / 2, 1);
+            return {
+              stroke: rgbaHex(stateNormalBlue, fadeByCenter(idx, total, 0.60, 0.24)),
+              lineWidth: interpolate(1.18, 0.98, dist)
+            };
+          },
+          stateEquidistant(idx){
+            const band = idx < 2 ? 0 : 1;
+            return {
+              stroke: rgbaHex(stateHyperBlue, band === 0 ? 0.84 : 0.48),
+              lineWidth: band === 0 ? 1.18 : 1.02
+            };
+          },
+          potentialFoliation(idx, total){
+            const dist = total <= 1 ? 0 : Math.abs(idx - (total - 1) / 2) / Math.max((total - 1) / 2, 1);
+            return {
+              stroke: rgbaHex(warmRed, fadeByCenter(idx, total, 0.62, 0.30)),
+              lineWidth: interpolate(1.36, 1.06, dist)
+            };
+          },
+          potentialFan(idx, total){
+            const dist = total <= 1 ? 0 : Math.abs(idx - (total - 1) / 2) / Math.max((total - 1) / 2, 1);
+            return {
+              stroke: rgbaHex(potentialMid, fadeByCenter(idx, total, 0.68, 0.28)),
+              lineWidth: interpolate(1.12, 0.94, dist)
+            };
+          },
+          potentialCircle(){
+            return { stroke: "rgba(0,0,0,0.88)", lineWidth: 1.45, lineDash: [3, 5] };
+          },
+          potentialGeodesic(){
+            return { stroke: "rgba(0,0,0,0.88)", lineWidth: 1.5 };
+          },
+          potentialConnector(){
+            return { stroke: rgbaHex(potentialDeep, 0.28), lineWidth: 1.2, lineDash: [5, 6] };
+          },
+          gradient(){
+            return { stroke: warmRed, lineWidth: 2.05, headSize: 0.022 };
+          },
+          curvedArrow: "rgba(0,0,0,0.56)"
+        };
+      }
+      return {
+        mode,
+        ink: "#0b0b0b",
+        paper: "#ffffff",
+        warmRed,
+        warmOrange,
+        coolBlue,
+        coolCyan,
+        stateNormal(idx, total){
+          const dist = total <= 1 ? 0 : Math.abs(idx - (total - 1) / 2) / Math.max((total - 1) / 2, 1);
+          return {
+            stroke: rgbaHex(stateNormalBlue, fadeByCenter(idx, total, 0.20, 0.08)),
+            lineWidth: interpolate(1.08, 0.94, dist)
+          };
+        },
+        stateEquidistant(idx){
+          const band = idx < 2 ? 0 : 1;
+          return {
+            stroke: rgbaHex(stateHyperBlue, band === 0 ? 0.40 : 0.20),
+            lineWidth: band === 0 ? 1.08 : 0.96
+          };
+        },
+        potentialFoliation(idx, total){
+          const rank = total <= 1 ? 0 : idx / Math.max(total - 1, 1);
+          return {
+            stroke: rgbaHex(warmRed, interpolate(0.20, 0.04, rank)),
+            lineWidth: interpolate(1.18, 0.88, rank)
+          };
+        },
+        potentialFan(idx, total){
+          const dist = total <= 1 ? 0 : Math.abs(idx - (total - 1) / 2) / Math.max((total - 1) / 2, 1);
+          return {
+            stroke: rgbaHex(potentialMid, fadeByCenter(idx, total, 0.24, 0.10)),
+            lineWidth: interpolate(1.02, 0.9, dist)
+          };
+        },
+        potentialCircle(){
+          return { stroke: "rgba(0,0,0,0.46)", lineWidth: 1.15, lineDash: [2, 6] };
+        },
+        potentialGeodesic(){
+          return { stroke: "rgba(0,0,0,0.34)", lineWidth: 1.15 };
+        },
+        potentialConnector(){
+          return { stroke: rgbaHex(potentialDeep, 0.14), lineWidth: 1.2, lineDash: [5, 6] };
+        },
+        gradient(){
+          return { stroke: "red", lineWidth: 2.0, headSize: 0.022 };
+        },
+        curvedArrow: "rgba(0,0,0,0.52)"
+      };
+    }
+    function resolveCanvasColor(color){
+      if (!color) return color;
+      const mode = currentVisualMode();
+      if (mode === "bland") return color;
+      const theme = currentVisualTheme();
+      const normalized = String(color).replace(/\s+/g, "").toLowerCase();
+      if (normalized === "#000" || normalized === "#000000" || normalized === "black" || normalized === "rgb(0,0,0)") {
+        return theme.ink;
+      }
+      if (normalized === "#fff" || normalized === "#ffffff" || normalized === "white" || normalized === "rgb(255,255,255)") {
+        return theme.paper;
+      }
+      if (normalized === "red") {
+        return theme.warmRed;
+      }
+      const rgbaMatch = normalized.match(/^rgba?\((\d+),(\d+),(\d+)(?:,([^)]+))?\)$/);
+      if (rgbaMatch) {
+        const r = Number(rgbaMatch[1]);
+        const g = Number(rgbaMatch[2]);
+        const b = Number(rgbaMatch[3]);
+        const alpha = rgbaMatch[4] === undefined ? 1 : Number(rgbaMatch[4]);
+        if (r === 0 && g === 0 && b === 0) return rgbaHex(theme.ink, alpha);
+        if (r === 255 && g === 255 && b === 255) return rgbaHex(theme.paper, alpha);
+      }
+      return color;
+    }
+    function heatJetColor(t){
+      const stops = [
+        { t: 0.00, rgb: [146, 148, 152] },
+        { t: 0.42, rgb: [188, 176, 160] },
+        { t: 0.70, rgb: [228, 187, 142] },
+        { t: 0.88, rgb: [224, 128, 68] },
+        { t: 1.00, rgb: [182, 76, 28] }
+      ];
+      const u = Math.max(0, Math.min(1, t));
+      for (let i = 0; i < stops.length - 1; i++) {
+        const left = stops[i];
+        const right = stops[i + 1];
+        if (u <= right.t) {
+          const localT = (u - left.t) / Math.max(EPS, right.t - left.t);
+          const r = Math.round(interpolate(left.rgb[0], right.rgb[0], localT));
+          const g = Math.round(interpolate(left.rgb[1], right.rgb[1], localT));
+          const b = Math.round(interpolate(left.rgb[2], right.rgb[2], localT));
+          return `rgb(${r},${g},${b})`;
+        }
+      }
+      const tail = stops[stops.length - 1].rgb;
+      return `rgb(${tail[0]},${tail[1]},${tail[2]})`;
+    }
+    function lmsWeightLevel(weight){
+      const clamped = Math.max(0, Math.min(1, Number.isFinite(weight) ? weight : 0));
+      return Math.sqrt(clamped);
+    }
+    function lmsWeightSizeLevel(weight){
+      const clamped = Math.max(0, Math.min(1, Number.isFinite(weight) ? weight : 0));
+      return Math.sqrt(Math.sqrt(clamped));
+    }
+    function currentUiScale(){
+      return parseFloat(getComputedStyle(wrap).getPropertyValue("--uiScale")) || 1;
+    }
+    function setTitleOffset(xPx, yPx){
+      wrap.style.setProperty("--titleX", `${xPx.toFixed(1)}px`);
+      wrap.style.setProperty("--titleY", `${yPx.toFixed(1)}px`);
+    }
+    function geom(){
+      const w = wrap.getBoundingClientRect().width;
+      const h = wrap.getBoundingClientRect().height;
+      const pad = 20;
+      return { w, h, R: Math.min(w,h)/2 - pad, cx: w/2, cy: h/2 };
+    }
+    function diskToPx(v){
+      const {R,cx,cy} = geom();
+      return { x: cx + v.x*R, y: cy - v.y*R };
+    }
+    function pxToDisk(p){
+      const {R,cx,cy} = geom();
+      return { x: (p.x - cx)/R, y: (cy - p.y)/R };
+    }
+    function pointerPos(ev){
+      const r = wrap.getBoundingClientRect();
+      return {
+        x: (ev.clientX ?? ev.touches?.[0]?.clientX) - r.left,
+        y: (ev.clientY ?? ev.touches?.[0]?.clientY) - r.top
+      };
+    }
+    function resize(){
+      const rect = wrap.getBoundingClientRect();
+      const panelWidth = wrap.clientWidth;
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      canvas.width  = Math.round(rect.width * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+      if (state.uiBaseW === null) state.uiBaseW = Math.max(1, rect.width);
+      // Match LMS behavior: preserve the baseline size at the initial square size,
+      // shrink proportionally on smaller embeds, but never upscale on larger ones.
+      const ui = Math.max(0.72, Math.min(1, rect.width / state.uiBaseW));
+      wrap.style.setProperty("--uiScale", ui.toFixed(3));
+      // Use content-box width to avoid border-width feedback loops.
+      if (tabChrome) tabChrome.style.width = `${panelWidth}px`;
+      if (settingsCard) settingsCard.style.width = `${panelWidth}px`;
+      invalidate();
+    }
+    window.addEventListener("resize", resize);
+    if (window.ResizeObserver) {
+      const ro = new ResizeObserver(() => resize());
+      ro.observe(wrap);
+    }
+
+    // ---------- drawing helpers ----------
+    function withDiskClip(fn){
+      const {R,cx,cy} = geom();
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, R - 0.5, 0, TAU);
+      ctx.clip();
+      fn();
+      ctx.restore();
+    }
+    function drawDiskBoundary(){
+      const {w,h,R,cx,cy} = geom();
+      ctx.clearRect(0,0,w,h);
+      ctx.save();
+      ctx.lineWidth = 2.2;
+      ctx.strokeStyle = resolveCanvasColor("#000");
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, 0, TAU);
+      ctx.stroke();
+      ctx.restore();
+    }
+    function applyStrokeStyle(style={}){
+      ctx.setLineDash(style.lineDash || []);
+      ctx.lineWidth = style.lineWidth ?? 2;
+      ctx.lineCap = style.lineCap || "round";
+      ctx.lineJoin = style.lineJoin || "round";
+      ctx.strokeStyle = resolveCanvasColor(style.stroke || "#000");
+      ctx.globalAlpha = style.alpha ?? 1;
+    }
+    function applyFillStyle(style={}){
+      ctx.fillStyle = resolveCanvasColor(style.fill || "#000");
+      ctx.globalAlpha = style.alpha ?? 1;
+    }
+    function drawPolyline(pts, style={}){
+      if (!pts || pts.length < 2) return;
+      ctx.save();
+      applyStrokeStyle(style);
+      const p0 = diskToPx(pts[0]);
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      for (let i=1; i<pts.length; i++){
+        const p = diskToPx(pts[i]);
+        ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+    function drawSegment(a, b, style={}){
+      drawPolyline([a,b], style);
+    }
+    function drawPoint(v, style={}){
+      const p = diskToPx(v);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, style.radius ?? 8, 0, TAU);
+      if (style.fill !== false) {
+        applyFillStyle({ fill: style.fill || "#000", alpha: style.alpha ?? 1 });
+        ctx.fill();
+      }
+      if (style.stroke) {
+        applyStrokeStyle({ stroke: style.stroke, lineWidth: style.lineWidth ?? 2, alpha: style.alpha ?? 1 });
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    function drawVector(from, to, style={}){
+      const a = diskToPx(from);
+      const b = diskToPx(to);
+      ctx.save();
+      applyStrokeStyle(style);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+      const dir = unit(sub(to, from));
+      const head = style.headSize ?? 0.03;
+      const left = sub(to, add(scale(dir, head), scale(perp(dir), head*0.65)));
+      const right = sub(to, add(scale(dir, head), scale(perp(dir), -head*0.65)));
+      const lp = diskToPx(left);
+      const rp = diskToPx(right);
+      ctx.beginPath();
+      ctx.moveTo(b.x, b.y);
+      ctx.lineTo(lp.x, lp.y);
+      ctx.lineTo(rp.x, rp.y);
+      ctx.closePath();
+      applyFillStyle({ fill: style.stroke || "#000", alpha: style.alpha ?? 1 });
+      ctx.fill();
+      ctx.restore();
+    }
+    function drawCircle(center, radius, style={}){
+      const {R} = geom();
+      const c = diskToPx(center);
+      ctx.save();
+      if (style.fill) {
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, radius * R, 0, TAU);
+        applyFillStyle(style);
+        ctx.fill();
+      }
+      if (style.stroke !== false) {
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, radius * R, 0, TAU);
+        applyStrokeStyle(style);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    function drawTextAtDisk(text, point, style={}){
+      const p = diskToPx(point);
+      ctx.save();
+      ctx.globalAlpha = style.alpha ?? 1;
+      ctx.fillStyle = resolveCanvasColor(style.fill || "#000");
+      ctx.font = style.font || `${Math.max(13, Math.round(18 * currentUiScale()))}px Georgia, Times, serif`;
+      ctx.textBaseline = style.textBaseline || "middle";
+      ctx.fillText(text, p.x + (style.dx ?? 12), p.y + (style.dy ?? -12));
+      ctx.restore();
+    }
+    function drawTransformLabelAtDisk(symbol, subscript, argument, point, style={}){
+      const p = diskToPx(point);
+      const baseSize = style.fontSize || Math.max(11, Math.round(14 * currentUiScale()));
+      const subSize = style.subFontSize || Math.max(9, Math.round(baseSize * 0.72));
+      const family = style.family || "Georgia, Times, serif";
+      const fill = resolveCanvasColor(style.fill || "#000");
+      let x = p.x + (style.dx ?? 10);
+      const y = p.y + (style.dy ?? -12);
+
+      ctx.save();
+      ctx.globalAlpha = style.alpha ?? 1;
+      ctx.fillStyle = fill;
+      ctx.textBaseline = "alphabetic";
+
+      ctx.font = `${baseSize}px ${family}`;
+      ctx.fillText(symbol, x, y);
+      x += ctx.measureText(symbol).width;
+
+      ctx.font = `italic ${subSize}px ${family}`;
+      ctx.fillText(subscript, x, y + baseSize * 0.28);
+      x += ctx.measureText(subscript).width;
+
+      ctx.font = `${baseSize}px ${family}`;
+      ctx.fillText(`(${argument})`, x, y);
+      ctx.restore();
+    }
+    function drawCurvedArrow(directionSign, magnitude=1, visibilityLevel=null){
+      const {R,cx,cy} = geom();
+      const scaleMag = normalizedPrecessionMagnitude(magnitude);
+      const opacity = thomasPrecessionOpacity(visibilityLevel == null ? scaleMag : visibilityLevel);
+      if (opacity <= 0.005) return;
+      const radiusPx = R * interpolate(0.055, 0.23, Math.pow(scaleMag, 0.9));
+      const span = interpolate(0.10, 1.56, Math.pow(scaleMag, 0.8));
+      const mid = directionSign >= 0 ? 0.45 : 0.35;
+      const a0 = directionSign >= 0 ? mid - span / 2 : mid + span / 2;
+      const a1 = directionSign >= 0 ? mid + span / 2 : mid - span / 2;
+      const theme = currentVisualTheme();
+      ctx.save();
+      ctx.globalAlpha = opacity;
+      ctx.strokeStyle = resolveCanvasColor(theme.curvedArrow);
+      ctx.lineWidth = interpolate(0.85, 2.1, Math.pow(scaleMag, 0.85));
+      ctx.beginPath();
+      ctx.arc(cx, cy, radiusPx, a0, a1, directionSign < 0);
+      ctx.stroke();
+      const endAng = a1;
+      const tip = { x: cx + radiusPx*Math.cos(endAng), y: cy + radiusPx*Math.sin(endAng) };
+      const tangent = directionSign >= 0
+        ? { x: -Math.sin(endAng), y: Math.cos(endAng) }
+        : { x: Math.sin(endAng), y: -Math.cos(endAng) };
+      const head = 8;
+      ctx.beginPath();
+      ctx.moveTo(tip.x, tip.y);
+      ctx.lineTo(tip.x - tangent.x*head - tangent.y*head*0.55, tip.y - tangent.y*head + tangent.x*head*0.55);
+      ctx.lineTo(tip.x - tangent.x*head + tangent.y*head*0.55, tip.y - tangent.y*head - tangent.x*head*0.55);
+      ctx.closePath();
+      ctx.fillStyle = resolveCanvasColor(theme.curvedArrow);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    const drawApi = {
+      geom, diskToPx, pxToDisk, currentUiScale,
+      drawDiskBoundary, withDiskClip, drawPolyline, drawSegment, drawPoint, drawVector, drawCircle, drawTextAtDisk, drawCurvedArrow
+    };
+
+    function metricOverlayForTab(tab, scene){
+      if (!tab || !scene) return null;
+      if (tab.id === "mobius-action") {
+        const midpoint = gyroPoint(scene.inputPoint, scene.image, 0.5);
+        return {
+          geodesic: geodesicFromTwoPoints(scene.inputPoint, scene.image),
+          anchor: midpoint
+        };
+      }
+      if (tab.id === "householder-action") {
+        const midpoint = gyroPoint(scene.inputPoint, scene.reflected, 0.5);
+        return {
+          geodesic: geodesicFromTwoPoints(scene.inputPoint, scene.reflected),
+          anchor: midpoint
+        };
+      }
+      if (tab.id === "lms-reduced") {
+        const midpoint = gyroPoint(scene.w, scene.z, 0.5);
+        return {
+          geodesic: geodesicFromTwoPoints(scene.w, scene.z),
+          anchor: midpoint
+        };
+      }
+      return null;
+    }
+    function potentialOverlayForTab(tab, scene){
+      if (tab.id === "lms-reduced") return null;
+      return { xi: scene?.xiBoundary || sharedBoundaryDirection(), w: scene?.potentialPoint || state.shared.A };
+    }
+    function ensureImageData(context, imageData, w, h){
+      if (imageData && imageData.width === w && imageData.height === h) return imageData;
+      return context.createImageData(w, h);
+    }
+    function mixRgb(a, b, t){
+      const blend = Math.max(0, Math.min(1, t));
+      return {
+        r: Math.round(a.r + (b.r - a.r) * blend),
+        g: Math.round(a.g + (b.g - a.g) * blend),
+        b: Math.round(a.b + (b.b - a.b) * blend)
+      };
+    }
+    let lmsPotentialImageData = null;
+    function lmsPotentialPalette(theme){
+      const mode = currentVisualMode();
+      const low = hexToRgb(theme.warmOrange) || { r: 255, g: 140, b: 66 };
+      const high = hexToRgb(theme.warmRed) || { r: 255, g: 59, b: 48 };
+      return {
+        low,
+        high,
+        line: mixRgb(low, high, 0.82),
+        levelAlpha: mode === "dark" ? 0.44 : mode === "contrast" ? 0.34 : 0.18
+      };
+    }
+    function drawLmsWeightedPotentialField(scene, theme){
+      const directions = Array.isArray(scene?.samplePoints) ? scene.samplePoints : [];
+      if (!directions.length) return;
+      const normalizedWeights = normalizeWeights(scene.weights, directions.length);
+      const g = geom();
+      const N = Math.max(180, Math.min(340, Math.round(Math.min(g.w, g.h) * 0.44)));
+      if (lmsPotentialCanvas.width !== N) lmsPotentialCanvas.width = N;
+      if (lmsPotentialCanvas.height !== N) lmsPotentialCanvas.height = N;
+      lmsPotentialImageData = ensureImageData(lmsPotentialCtx, lmsPotentialImageData, N, N);
+      const img = lmsPotentialImageData;
+      const data = img.data;
+      data.fill(0);
+      const palette = lmsPotentialPalette(theme);
+      const levelStep = 0.58;
+      const levelBand = 0.05;
+      for (let py = 0; py < N; py++) {
+        const y = 1 - 2 * (py + 0.5) / N;
+        const y2 = y * y;
+        for (let px = 0; px < N; px++) {
+          const x = 2 * (px + 0.5) / N - 1;
+          if (x * x + y2 >= 1) continue;
+          const score = lmsWeightedPotentialValue({ x, y }, directions, normalizedWeights);
+          let color = palette.low;
+          let alpha = 0;
+
+          const levelCoord = score / levelStep;
+          const levelDist = Math.abs(levelCoord - Math.round(levelCoord));
+          const levelStrength = Math.pow(Math.max(0, Math.min(1, (levelBand - levelDist) / levelBand)), 0.9);
+          if (levelStrength > 0) {
+            color = palette.line;
+            alpha = palette.levelAlpha * levelStrength;
+          }
+
+          if (alpha <= 0) continue;
+          const idx = (py * N + px) * 4;
+          data[idx] = color.r;
+          data[idx + 1] = color.g;
+          data[idx + 2] = color.b;
+          data[idx + 3] = Math.round(Math.max(0, Math.min(1, alpha)) * 255);
+        }
+      }
+      lmsPotentialCtx.putImageData(img, 0, 0);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(g.cx, g.cy, g.R - 0.5, 0, TAU);
+      ctx.clip();
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(lmsPotentialCanvas, g.cx - g.R, g.cy - g.R, g.R * 2, g.R * 2);
+      ctx.restore();
+    }
+    function drawLmsWeightedPotentialFlow(scene, theme){
+      const curves = lmsPotentialFlowCurves(scene);
+      if (!curves.length) return;
+      drawApi.withDiskClip(() => {
+        curves.forEach((curve, idx) => {
+          drawApi.drawPolyline(curve, theme.potentialFan(idx, curves.length));
+        });
+      });
+    }
+    function drawMetricOverlays(tab, scene){
+      const overlay = metricOverlayForTab(tab, scene);
+      if (!overlay) return;
+      const theme = currentVisualTheme();
+      const showPotentialLevels = displayDetailIsVisible("foliation", tab.id);
+      const showPotentialFlow = displayDetailIsVisible("fan", tab.id);
+      if (tab.id === "lms-reduced" && showPotentialLevels) {
+        drawLmsWeightedPotentialField(scene, theme);
+      }
+      drawApi.withDiskClip(() => {
+        if (displayDetailIsVisible("equidistants", tab.id) && overlay.geodesic) {
+          const curves = buildEquidistantOffsets(overlay.geodesic, [0.34, 0.68], 420);
+          curves.forEach((curve, idx) => {
+            drawApi.drawPolyline(curve, theme.stateEquidistant(idx));
+          });
+        }
+        if (displayDetailIsVisible("normals", tab.id) && overlay.geodesic && overlay.anchor) {
+          const curves = buildOrthogonalFanFromGeodesic(overlay.geodesic, overlay.anchor, 5, 420);
+          curves.forEach((curve, idx) => {
+            drawApi.drawPolyline(curve, theme.stateNormal(idx, curves.length));
+          });
+        }
+        if (tab.id === "lms-reduced") return;
+        const potential = potentialOverlayForTab(tab, scene);
+        if (potential && (showPotentialLevels || showPotentialFlow)) {
+          const xi = unit(potential.xi);
+          const w = potential.w;
+          const circle = horosphereCircle(xi, w);
+          const valueAtW = Math.log(Math.max(EPS, norm2(sub(w, xi)) / Math.max(EPS, 1 - norm2(w))));
+          const horocyclePoint = currentHorocyclePoint(circle, w);
+
+          if (showPotentialLevels) {
+            const foliationLevels = centeredHorocycleFoliation(xi, valueAtW, 7, 0.42);
+            foliationLevels.forEach((levelCircle, idx) => {
+              drawApi.drawCircle(levelCircle.center, levelCircle.radius, theme.potentialFoliation(idx, foliationLevels.length));
+            });
+          }
+          if (showPotentialFlow) {
+            const fanCurves = sampleHorocycleAnchoredFan(xi, circle, horocyclePoint, 4);
+            fanCurves.forEach((curve, idx) => {
+              drawApi.drawPolyline(curve, theme.potentialFan(idx, fanCurves.length));
+            });
+          }
+        }
+      });
+      if (tab.id === "lms-reduced" && showPotentialFlow) {
+        drawLmsWeightedPotentialFlow(scene, theme);
+      }
+    }
+
+    // ---------- shared / per-tab state plumbing ----------
+    function ensureTabState(tabId){
+      if (!state.perTab[tabId]) {
+        const tab = GEOMETRY_TABS.find((entry) => entry.id === tabId);
+        state.perTab[tabId] = tab?.initTabState ? tab.initTabState(state.shared) : {};
+      }
+      return state.perTab[tabId];
+    }
+    function currentTab(){
+      return GEOMETRY_TABS.find((tab) => tab.id === state.shared.activeTabId) || GEOMETRY_TABS[0];
+    }
+    function resolveUiValue(value, shared=state.shared, scene=null, local=null){
+      return typeof value === "function" ? value(shared, scene, local) : value;
+    }
+    function setLmsAtomCount(count){
+      const local = ensureTabState("lms-reduced");
+      if (lmsAtomCount(local) === count) return;
+      local.atomCount = count;
+      syncActiveTabUi();
+      invalidate();
+    }
+    function renderLmsAtomControl(){
+      if (!lmsAtomControl) return;
+      const show = currentTab().id === "lms-reduced";
+      lmsAtomControl.classList.toggle("show", show);
+      lmsAtomControl.innerHTML = "";
+      if (!show) return;
+      const local = ensureTabState("lms-reduced");
+      const buttonRow = document.createElement("div");
+      buttonRow.className = "lmsModeButtons";
+      for (const count of LMS_ATOM_COUNT_OPTIONS) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = `lmsModeBtn${lmsAtomCount(local) === count ? " active" : ""}`;
+        btn.setAttribute("aria-pressed", lmsAtomCount(local) === count ? "true" : "false");
+        btn.textContent = `${count}`;
+        btn.addEventListener("click", () => setLmsAtomCount(count));
+        buttonRow.appendChild(btn);
+      }
+      lmsAtomControl.appendChild(buttonRow);
+    }
+    function renderSettingsControls(){
+      if (!displayControls) return;
+      const tabId = currentTab().id;
+      const display = ensureDisplayState();
+      const groups = ensureDisplayGroups();
+      const visualMode = currentVisualMode();
+      displayControls.innerHTML = "";
+      const buttonOrderByGroup = {
+        stateGeometry: ["normals", "equidistants"],
+        potentialGeometry: ["foliation", "fan"]
+      };
+      const rowBreakAfter = {
+        potentialGeometry: "fan"
+      };
+
+      const lead = document.createElement("div");
+      lead.className = "displayLead";
+      const leadTitle = document.createElement("h3");
+      leadTitle.className = "settingsTitle";
+      leadTitle.textContent = "Display";
+      lead.appendChild(leadTitle);
+
+      const titleBtn = document.createElement("button");
+      titleBtn.type = "button";
+      titleBtn.className = `displayBtn${state.shared.titleEnabled ? " active" : ""}`;
+      titleBtn.setAttribute("aria-pressed", state.shared.titleEnabled ? "true" : "false");
+      titleBtn.textContent = "Title";
+      titleBtn.addEventListener("click", () => {
+        state.shared.titleEnabled = !state.shared.titleEnabled;
+        syncActiveTabUi();
+        invalidate();
+      });
+
+      const row = document.createElement("div");
+      row.className = "leadToggleRow";
+      row.appendChild(titleBtn);
+      lead.appendChild(row);
+
+      const modeRow = document.createElement("div");
+      modeRow.className = "modeButtons";
+      modeRow.setAttribute("role", "group");
+      modeRow.setAttribute("aria-label", "Visual mode");
+      for (const mode of VISUAL_MODES) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = `displayBtn modeBtn${mode.id === visualMode ? " active" : ""}`;
+        btn.setAttribute("aria-pressed", mode.id === visualMode ? "true" : "false");
+        btn.textContent = mode.label;
+        btn.addEventListener("click", () => {
+          if (state.shared.visualMode === mode.id) return;
+          state.shared.visualMode = mode.id;
+          syncVisualMode();
+          renderSettingsControls();
+          invalidate();
+        });
+        modeRow.appendChild(btn);
+      }
+      lead.appendChild(modeRow);
+      displayControls.appendChild(lead);
+
+      const sections = document.createElement("div");
+      sections.className = "settingsSections";
+
+      for (const group of DISPLAY_GROUPS) {
+        const section = document.createElement("section");
+        const groupEnabled = !!groups[group.id];
+        section.className = `settingsSection${groupEnabled ? "" : " inactive"}`;
+
+        const gate = document.createElement("button");
+        gate.type = "button";
+        gate.className = "sectionGate";
+        gate.textContent = group.label;
+        gate.setAttribute("aria-pressed", groupEnabled ? "true" : "false");
+        gate.addEventListener("click", () => {
+          const nextGroups = ensureDisplayGroups();
+          nextGroups[group.id] = !nextGroups[group.id];
+          renderSettingsControls();
+          invalidate();
+        });
+        section.appendChild(gate);
+
+        const buttonRow = document.createElement("div");
+        buttonRow.className = "sectionButtons";
+        const details = DISPLAY_DETAILS
+          .filter((entry) => entry.group === group.id)
+          .sort((a, b) => {
+            const order = buttonOrderByGroup[group.id];
+            if (!order) return 0;
+            return order.indexOf(a.id) - order.indexOf(b.id);
+          });
+        for (const detail of details) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          const selected = !!display[detail.id];
+          const visible = displayDetailIsVisible(detail.id, tabId);
+          const supported = tabSupportsDisplayKey(tabId, detail.id);
+          let className = "displayBtn";
+          if (selected) className += visible ? " active" : " stored";
+          if (!supported) className += " unsupported";
+          btn.className = className;
+          btn.disabled = !groupEnabled;
+          btn.setAttribute("aria-pressed", selected ? "true" : "false");
+          btn.textContent = detail.label;
+          btn.addEventListener("click", () => {
+            const nextDisplay = ensureDisplayState();
+            nextDisplay[detail.id] = !nextDisplay[detail.id];
+            renderSettingsControls();
+            invalidate();
+          });
+          buttonRow.appendChild(btn);
+          if (rowBreakAfter[group.id] === detail.id) {
+            const breaker = document.createElement("span");
+            breaker.className = "sectionBreak";
+            breaker.setAttribute("aria-hidden", "true");
+            buttonRow.appendChild(breaker);
+          }
+        }
+        section.appendChild(buttonRow);
+        sections.appendChild(section);
+      }
+      displayControls.appendChild(sections);
+    }
+    function renderTabBar(){
+      if (!tabBar) return;
+      tabBar.innerHTML = "";
+      for (const tab of GEOMETRY_TABS) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = `tabBtn${tab.id === state.shared.activeTabId ? " active" : ""}`;
+        btn.role = "tab";
+        btn.setAttribute("aria-selected", tab.id === state.shared.activeTabId ? "true" : "false");
+        btn.textContent = tab.label;
+        btn.addEventListener("click", () => {
+          if (state.shared.activeTabId === tab.id) return;
+          state.shared.activeTabId = tab.id;
+          syncActiveTabUi();
+          invalidate();
+        });
+        tabBar.appendChild(btn);
+      }
+    }
+    function syncActiveTabUi(){
+      const tab = currentTab();
+      const local = ensureTabState(tab.id);
+      syncVisualMode();
+      titleText.innerHTML = resolveUiValue(tab.ui.titleHtml, state.shared, null, local) || "";
+      formulaText.innerHTML = resolveUiValue(tab.ui.formulaHtml, state.shared, null, local) || "";
+      const rangeHtml = resolveUiValue(tab.ui.rangeHtml, state.shared, null, local) || "";
+      rangeText.innerHTML = rangeHtml;
+      rangeText.style.display = rangeHtml ? "" : "none";
+      titleDrag.classList.toggle("titleHidden", !state.shared.titleEnabled);
+      if (helpCard) helpCard.textContent = resolveUiValue(tab.ui.helpText, state.shared, null, local) || "";
+      renderTabBar();
+      renderSettingsControls();
+      renderLmsAtomControl();
+    }
+    function resetWidget(){
+      state.shared.A = { ...INITIAL_X };
+      state.shared.B = { ...INITIAL_W };
+      state.shared.C = { ...INITIAL_C };
+      state.shared.boundarySource = "A";
+      state.shared.xParameterMode = "x";
+      state.shared.xiAngle = angleOf(INITIAL_C);
+      state.shared.activeTabId = "lms-reduced";
+      state.shared.titleEnabled = true;
+      state.shared.display = defaultDisplayState();
+      state.shared.displayGroups = defaultDisplayGroups();
+      state.shared.visualMode = defaultVisualMode();
+      state.perTab = {};
+      setTitleOffset(0, 0);
+      syncActiveTabUi();
+      invalidate();
+    }
+    function sharedHandles(tab, scene=null, local=null){
+      const ui = tab?.ui || {};
+      const handles = [];
+      const showA = resolveUiValue(ui.showSharedPointA, state.shared, scene, local) !== false;
+      const showB = resolveUiValue(ui.showSharedPointB, state.shared, scene, local) !== false;
+      if (showA) handles.push({ id: "A", point: state.shared.A, radiusPx: 18 });
+      if (showB) handles.push({ id: "B", point: state.shared.B, radiusPx: 18 });
+      return handles;
+    }
+    function hitTest(ptPx){
+      const tab = currentTab();
+      const local = ensureTabState(tab.id);
+      const scene = tab.getScene(state.shared, local, drawApi);
+      const extra = tab.getHandles ? tab.getHandles(scene, state.shared, local, drawApi) : [];
+      let bestTarget = null;
+      let bestDist = Infinity;
+      for (const handle of extra) {
+        const hp = diskToPx(handle.point);
+        const dist = Math.hypot(ptPx.x - hp.x, ptPx.y - hp.y);
+        if (dist < (handle.radiusPx ?? 16) && dist < bestDist) {
+          bestTarget = { scope: "tab", id: handle.id };
+          bestDist = dist;
+        }
+      }
+      for (const handle of sharedHandles(tab, scene, local)) {
+        const hp = diskToPx(handle.point);
+        const dist = Math.hypot(ptPx.x - hp.x, ptPx.y - hp.y);
+        if (dist < handle.radiusPx && dist < bestDist) {
+          bestTarget = { scope: "shared", id: handle.id };
+          bestDist = dist;
+        }
+      }
+      return bestTarget;
+    }
+    function beginDragTarget(target){
+      if (!target || target.scope !== "tab") return;
+      const tab = currentTab();
+      const local = ensureTabState(tab.id);
+      const scene = tab.getScene(state.shared, local, drawApi);
+      tab.beginHandleDrag?.(target.id, scene, state.shared, local, drawApi);
+    }
+    function applyDrag(target, ptPx){
+      const diskPt = pxToDisk(ptPx);
+      if (target.scope === "shared") {
+        const next = clampToDisk(diskPt, 0.999);
+        if (target.id === "A") state.shared.A = next;
+        if (target.id === "B") state.shared.B = next;
+      } else {
+        const tab = currentTab();
+        const local = ensureTabState(tab.id);
+        tab.dragHandle?.(target.id, diskPt, state.shared, local, drawApi);
+      }
+      invalidate();
+    }
+
+    function drawSharedAnchorPoints(tab, scene){
+      const local = ensureTabState(tab.id);
+      const showA = resolveUiValue(tab.ui.showSharedPointA, state.shared, scene, local) !== false;
+      const showB = resolveUiValue(tab.ui.showSharedPointB, state.shared, scene, local) !== false;
+      const pointAStyle = resolveUiValue(tab.ui.sharedPointAStyle, state.shared, scene, local) || { radius: 9, fill: "#000" };
+      const pointBStyle = resolveUiValue(tab.ui.sharedPointBStyle, state.shared, scene, local) || { radius: 9, fill: "#000" };
+      if (showA) drawApi.drawPoint(state.shared.A, pointAStyle);
+      if (showB) drawApi.drawPoint(state.shared.B, pointBStyle);
+      if (tab.drawSharedAnchors) tab.drawSharedAnchors(scene, drawApi);
+    }
+    function drawSharedAnchorLabels(tab, scene){
+      const ui = tab.ui;
+      const local = ensureTabState(tab.id);
+      const A = state.shared.A;
+      const B = state.shared.B;
+      const Ap = diskToPx(A);
+      const Bp = diskToPx(B);
+      const labelFont = Math.max(14, Math.round(24 * currentUiScale()));
+
+      ctx.save();
+      ctx.fillStyle = resolveCanvasColor("#000");
+      ctx.textBaseline = "middle";
+
+      const pointAName = resolveUiValue(ui.pointAName, state.shared, scene, local) || "A";
+      const pointBName = resolveUiValue(ui.pointBName, state.shared, scene, local) || "B";
+      const aInfo = resolveUiValue(ui.pointAInfo, state.shared, scene, local) || "";
+      const bInfo = resolveUiValue(ui.pointBInfo, state.shared, scene, local) || "";
+      const hasAInfo = !!(aInfo && String(aInfo).trim());
+      const hasBInfo = !!(bInfo && String(bInfo).trim());
+
+      const showA = resolveUiValue(ui.showSharedPointA, state.shared, scene, local) !== false;
+      const showB = resolveUiValue(ui.showSharedPointB, state.shared, scene, local) !== false;
+
+      if (showA) {
+        ctx.font = `italic ${labelFont}px Georgia, Times, serif`;
+        ctx.fillText(hasAInfo ? `${pointAName},` : `${pointAName}`, Ap.x + 14, Ap.y - 14);
+        ctx.font = `${labelFont}px Georgia, Times, serif`;
+        if (hasAInfo) ctx.fillText(aInfo, Ap.x + 40, Ap.y - 14);
+      }
+
+      if (showB) {
+        ctx.font = `italic ${labelFont}px Georgia, Times, serif`;
+        ctx.fillText(hasBInfo ? `${pointBName},` : `${pointBName}`, Bp.x + 14, Bp.y + 18);
+        ctx.font = `${labelFont}px Georgia, Times, serif`;
+        if (hasBInfo) ctx.fillText(bInfo, Bp.x + 40, Bp.y + 18);
+      }
+      ctx.restore();
+    }
+
+    function draw(){
+      const tab = currentTab();
+      const local = ensureTabState(tab.id);
+      const scene = tab.getScene(state.shared, local, drawApi);
+      drawApi.drawDiskBoundary();
+      drawMetricOverlays(tab, scene);
+      tab.drawScene(scene, drawApi);
+      drawSharedAnchorPoints(tab, scene);
+      drawSharedAnchorLabels(tab, scene);
+      tab.drawLabels?.(scene, drawApi);
+    }
+
+    // ---------- tab registry ----------
+    const GEOMETRY_TABS = [
+      {
+        id: "mobius-action",
+        label: "Möbius",
+        ui: {
+          titleHtml: () => {
+            const roles = actionRoles();
+            return `Möbius action of <span class="italic">${roles.actorLabel}</span> on <span class="italic">${roles.inputLabel}</span>`;
+          },
+          formulaHtml: () => {
+            const roles = actionRoles();
+            return `M<sub>${roles.actorLabel}</sub>(${roles.inputLabel}) = ${roles.actorLabel} ⊕ ${roles.inputLabel}`;
+          },
+          rangeHtml: "",
+          pointAName: (shared) => xParameterSpec(shared).pointLabel,
+          pointBName: "w",
+          pointAInfo: () => "",
+          pointBInfo: () => "",
+          helpText: () => {
+            const roles = actionRoles();
+            return `Möbius action tab. The widget shows M_${roles.actorLabel}(${roles.inputLabel}); the input label follows the current LMS reduction state. Drag ξ independently on the boundary to retune the directional geometry.`;
+          }
+        },
+        initTabState(){ return {}; },
+        getScene(shared){
+          const roles = actionRoles(shared);
+          const xiBoundary = sharedBoundaryDirection(shared);
+          const xi = scale(xiBoundary, 0.999);
+          const negZPoint = xParameterModeId(shared) === "neg_z" ? clampToDisk(neg(shared.A), 0.999) : null;
+          const image = mobiusAdd(roles.actorPoint, roles.inputPoint);
+          const boundaryImage = clampToDisk(mobiusBoundaryAction(roles.actorPoint, xiBoundary), 0.999999);
+          const guide = sampleGeodesic(geodesicFromTwoPoints(roles.inputPoint, image), 420);
+          return { image, xi, xiBoundary, negZPoint, boundaryImage, guide, inputPoint: roles.inputPoint, actorPoint: roles.actorPoint, roles };
+        },
+        getHandles(scene){
+          return [{ id: "xi", point: scene.xi, radiusPx: 18 }];
+        },
+        dragHandle(handleId, diskPt, shared){
+          if (handleId === "xi") setSharedBoundaryDirection(shared, diskPt);
+        },
+        drawScene(scene, api){
+          api.withDiskClip(() => {
+            api.drawPolyline(scene.guide, { stroke: "rgba(0,0,0,0.18)", lineWidth: 1.4, lineDash: [4, 6] });
+            api.drawSegment({x:0,y:0}, scene.actorPoint, { stroke: "rgba(0,0,0,0.35)", lineWidth: 1.6, lineDash: [5, 5] });
+            api.drawSegment(scene.inputPoint, scene.image, { stroke: "#000", lineWidth: 2.1 });
+            api.drawSegment({x:0,y:0}, scene.inputPoint, { stroke: "rgba(0,0,0,0.28)", lineWidth: 1.2 });
+            api.drawSegment({x:0,y:0}, scene.image, { stroke: "rgba(0,0,0,0.28)", lineWidth: 1.2 });
+          });
+          if (scene.negZPoint) {
+            api.drawPoint(scene.negZPoint, { radius: 4.8, fill: "#fff", stroke: "#000", lineWidth: 1.7 });
+          }
+          api.drawPoint(scene.image, { radius: 7.5, fill: "#fff", stroke: "#000", lineWidth: 2.1 });
+          api.drawPoint(scene.xi, { radius: 4.6, fill: "#000" });
+          api.drawPoint(scene.boundaryImage, { radius: 4.6, fill: "#fff", stroke: "#000", lineWidth: 1.6 });
+        },
+        drawLabels(scene, api){
+          if (scene.negZPoint) {
+            api.drawTextAtDisk("-z", scene.negZPoint, { dx: 8, dy: 14, font: `italic ${Math.max(11, Math.round(14 * api.currentUiScale()))}px Georgia, Times, serif` });
+          }
+          drawTransformLabelAtDisk("M", scene.roles.actorLabel, scene.roles.inputLabel, scene.image, {
+            dx: 12,
+            dy: -14,
+            fontSize: Math.max(14, Math.round(18 * api.currentUiScale())),
+            subFontSize: Math.max(10, Math.round(13 * api.currentUiScale()))
+          });
+          api.drawTextAtDisk("ξ", scene.xi, { dx: 10, dy: -12, font: `italic ${Math.max(13, Math.round(17 * api.currentUiScale()))}px Georgia, Times, serif` });
+          drawTransformLabelAtDisk("M", scene.roles.actorLabel, "ξ", scene.boundaryImage, {
+            dx: 10,
+            dy: 14,
+            fontSize: Math.max(12, Math.round(16 * api.currentUiScale())),
+            subFontSize: Math.max(9, Math.round(11 * api.currentUiScale()))
+          });
+        }
+      },
+      {
+        id: "householder-action",
+        label: "Householder",
+        ui: {
+          titleHtml: () => {
+            const roles = actionRoles();
+            return `Reflection of <span class="italic">${roles.inputLabel}</span> across the hyperplane <span class="italic">${roles.actorLabel}</span><sup>⊥</sup>`;
+          },
+          formulaHtml: () => {
+            const roles = actionRoles();
+            return `H<sub>${roles.actorLabel}</sub>(${roles.inputLabel}) = ${roles.inputLabel} - 2⟨${roles.actorLabel},${roles.inputLabel}⟩${roles.actorLabel} / |${roles.actorLabel}|²`;
+          },
+          rangeHtml: "",
+          pointAName: (shared) => xParameterSpec(shared).pointLabel,
+          pointBName: "w",
+          pointAInfo: () => "",
+          pointBInfo: () => "",
+          helpText: () => {
+            const roles = actionRoles();
+            return `Householder action tab. The widget shows H_${roles.actorLabel}(${roles.inputLabel}); the input label follows the current LMS reduction state. Drag ξ independently on the boundary to retune the directional geometry.`;
+          }
+        },
+        initTabState(){ return {}; },
+        getScene(shared){
+          const roles = actionRoles(shared);
+          const xiBoundary = sharedBoundaryDirection(shared);
+          const xi = scale(xiBoundary, 0.999);
+          const negZPoint = xParameterModeId(shared) === "neg_z" ? clampToDisk(neg(shared.A), 0.999) : null;
+          const reflected = householderReflect(roles.inputPoint, roles.actorPoint);
+          const axisDir = perp(unit(norm(roles.actorPoint) > EPS ? roles.actorPoint : {x:1,y:0}));
+          const axis = [scale(axisDir, -0.999), scale(axisDir, 0.999)];
+          return { reflected, axis, actorPoint: roles.actorPoint, inputPoint: roles.inputPoint, xiBoundary, xi, negZPoint, roles };
+        },
+        getHandles(scene){
+          return [{ id: "xi", point: scene.xi, radiusPx: 18 }];
+        },
+        dragHandle(handleId, diskPt, shared){
+          if (handleId === "xi") setSharedBoundaryDirection(shared, diskPt);
+        },
+        drawScene(scene, api){
+          api.withDiskClip(() => {
+            api.drawPolyline(scene.axis, { stroke: "rgba(0,0,0,0.18)", lineWidth: 1.4, lineDash: [4, 6] });
+            api.drawSegment({x:0,y:0}, scene.actorPoint, { stroke: "rgba(0,0,0,0.35)", lineWidth: 1.6, lineDash: [5, 5] });
+            api.drawSegment(scene.inputPoint, scene.reflected, { stroke: "#000", lineWidth: 2.1 });
+            api.drawSegment({x:0,y:0}, scene.inputPoint, { stroke: "rgba(0,0,0,0.28)", lineWidth: 1.2 });
+            api.drawSegment({x:0,y:0}, scene.reflected, { stroke: "rgba(0,0,0,0.28)", lineWidth: 1.2 });
+          });
+          if (scene.negZPoint) {
+            api.drawPoint(scene.negZPoint, { radius: 4.8, fill: "#fff", stroke: "#000", lineWidth: 1.7 });
+          }
+          api.drawPoint(scene.reflected, { radius: 7.5, fill: "#fff", stroke: "#000", lineWidth: 2.1 });
+          api.drawPoint(scene.xi, { radius: 4.6, fill: "#000" });
+        },
+        drawLabels(scene, api){
+          if (scene.negZPoint) {
+            api.drawTextAtDisk("-z", scene.negZPoint, { dx: 8, dy: 14, font: `italic ${Math.max(11, Math.round(14 * api.currentUiScale()))}px Georgia, Times, serif` });
+          }
+          api.drawTextAtDisk(`${scene.roles.actorLabel}⊥`, scale(unit(perp(scene.actorPoint)), 0.72), { dx: 10, dy: -10, font: `${Math.max(12, Math.round(16 * api.currentUiScale()))}px Georgia, Times, serif` });
+          drawTransformLabelAtDisk("H", scene.roles.actorLabel, scene.roles.inputLabel, scene.reflected, {
+            dx: 12,
+            dy: 16,
+            fontSize: Math.max(13, Math.round(17 * api.currentUiScale())),
+            subFontSize: Math.max(10, Math.round(12 * api.currentUiScale()))
+          });
+          api.drawTextAtDisk("ξ", scene.xi, { dx: 10, dy: -12, font: `italic ${Math.max(13, Math.round(17 * api.currentUiScale()))}px Georgia, Times, serif` });
+        }
+      },
+      {
+        id: "lms-reduced",
+        label: "LMS",
+        ui: {
+          titleHtml: (_shared, _scene, local) => `Reduced LMS state on <span class="italic">(${lmsCoordinateMode(local)},ζ)</span>`,
+          formulaHtml: (_shared, _scene, local) => lmsCoordinateMode(local) === "w"
+            ? "z = -ζw,&nbsp; ẇ = -1/2 (1-|w|²) ζ<sup>-1</sup>Z<br/>ξ<sub>i</sub> = ζ M<sub>w</sub>(p<sub>i</sub>),&nbsp; Z = Σ a<sub>i</sub> ξ<sub>i</sub>"
+            : "w = -ζ<sup>-1</sup>z,&nbsp; <br/>ξ<sub>i</sub> = M<sub>-z</sub>(ζp<sub>i</sub>),&nbsp; Z = Σ a<sub>i</sub> ξ<sub>i</sub>",
+          rangeHtml: "",
+          showSharedPointA: (shared) => boundaryRoles(shared).mode === "z",
+          showSharedPointB: (shared) => boundaryRoles(shared).mode === "w",
+          pointAName: (_shared, _scene, local) => lmsCoordinateMode(local) === "z" ? "z" : "x",
+          pointBName: "w",
+          pointAInfo: (_shared, scene, local) => scene?.activeId === "A"
+            ? ` |${lmsCoordinateMode(local) === "z" ? "z" : "x"}|=${formatNum(norm(scene.activePoint), 2)}`
+            : "",
+          pointBInfo: (_shared, scene) => scene?.activeId === "B" ? ` |w|=${formatNum(norm(scene.activePoint), 2)}` : "",
+          helpText: (_shared, _scene, local) => `LMS tab. The top-right switch sets the number of boundary atoms. Drag ζ on the boundary, drag the displayed interior point in the disk, drag the boundary atoms themselves, grab the white derived point to flip between (${lmsCoordinateMode(local)},ζ) reductions, and drag Z inside the convex hull to reweight the boundary atoms shown by their size and warm grey-to-orange color. LMS Potential Geometry now comes from the weighted boundary potential of those atoms, rather than from ζ itself.`
+        },
+        initTabState(){ return { atomCount: LMS_DEFAULT_ATOM_COUNT, orderPoint: null }; },
+        getScene(shared, local){
+          const boundary = lmsBoundaryCloud(shared, local);
+          return {
+            mode: boundary.mode,
+            phi: boundary.phi,
+            zeta: boundary.zeta,
+            zetaHandle: scale(boundary.zeta, 0.999),
+            z: boundary.z,
+            w: boundary.w,
+            activePoint: boundary.activePoint,
+            activeId: boundary.activeId,
+            activeName: boundary.activeLabel,
+            derivedPoint: boundary.derivedPoint,
+            derivedName: boundary.derivedName,
+            samplePoints: boundary.labPoints,
+            atomIds: boundary.atomIds,
+            hullLoop: boundary.labLoop,
+            bodyLoop: boundary.bodyLoop,
+            weights: boundary.weights,
+            Z: boundary.Z,
+            precession: precessionValue(boundary.z, boundary.Z)
+          };
+        },
+        getHandles(scene){
+          const atomHandles = scene.samplePoints.map((point, idx) => ({
+            id: `atom-${scene.atomIds[idx]}`,
+            point,
+            radiusPx: 16
+          }));
+          return [
+            { id: "derived", point: scene.derivedPoint, radiusPx: 18 },
+            { id: "zeta", point: scene.zetaHandle, radiusPx: 18 },
+            { id: "Z", point: scene.Z, radiusPx: 18 },
+            ...atomHandles
+          ];
+        },
+        beginHandleDrag(handleId, scene, shared){
+          if (handleId !== "derived") return;
+          if (scene.mode === "w") {
+            shared.A = clampToDisk(scene.derivedPoint, 0.999);
+            shared.xParameterMode = "neg_z";
+            shared.boundarySource = "B";
+          } else {
+            shared.B = clampToDisk(scene.derivedPoint, 0.999);
+            shared.xParameterMode = "x";
+            shared.boundarySource = "A";
+          }
+          syncActiveTabUi();
+          invalidate();
+        },
+        dragHandle(handleId, diskPt, shared, local){
+          if (handleId.startsWith("atom-")) {
+            const atomId = Number(handleId.slice(5));
+            setLmsBoundaryAtom(shared, local, atomId, diskPt);
+            return;
+          }
+          if (handleId === "derived") {
+            if (lmsCoordinateMode(local) === "w") {
+              shared.B = clampToDisk(diskPt, 0.999);
+            } else {
+              shared.A = clampToDisk(diskPt, 0.999);
+            }
+            return;
+          }
+          if (handleId === "zeta") {
+            setSharedBoundaryDirection(shared, diskPt);
+            return;
+          }
+          if (handleId === "Z") {
+            const boundary = lmsBoundaryCloud(shared, local);
+            const clamped = clampToConvexPolygon(clampToDisk(diskPt, 0.999), boundary.labPoints);
+            local.orderPoint = clamped;
+          }
+        },
+        drawScene(scene, api){
+          const theme = currentVisualTheme();
+          const inkDim = rgbaHex(theme.ink, 0.26);
+          const inkFaint = rgbaHex(theme.ink, 0.12);
+          const inkGhost = rgbaHex(theme.ink, 0.20);
+          api.withDiskClip(() => {
+            if (scene.bodyLoop?.length > 1) {
+              api.drawPolyline(scene.bodyLoop, { stroke: inkFaint, lineWidth: 0.95, lineDash: [2, 6] });
+            }
+            if (scene.hullLoop?.length > 1) {
+              api.drawPolyline(scene.hullLoop, { stroke: inkDim, lineWidth: 1.15 });
+            }
+            api.drawSegment({x:0,y:0}, scene.z, { stroke: inkGhost, lineWidth: 1.2 });
+            api.drawSegment({x:0,y:0}, scene.w, { stroke: inkGhost, lineWidth: 1.2 });
+            api.drawVector({x:0,y:0}, scene.Z, { stroke: theme.ink, lineWidth: 1.9, headSize: 0.026 });
+          });
+          scene.samplePoints.forEach((point, idx) => {
+            const weight = scene.weights[idx] ?? 0;
+            const level = lmsWeightLevel(weight);
+            const sizeLevel = lmsWeightSizeLevel(weight);
+            const radius = interpolate(3.3, 12.6, sizeLevel);
+            api.drawPoint(point, {
+              radius,
+              fill: heatJetColor(level),
+              stroke: rgbaHex(theme.ink, 0.82),
+              lineWidth: interpolate(0.75, 1.35, level),
+              alpha: interpolate(0.78, 0.98, level)
+            });
+          });
+          api.drawPoint(scene.zetaHandle, { radius: 8.0, fill: "#000" });
+          api.drawPoint(scene.Z, { radius: 7.0, fill: "#000" });
+          api.drawPoint(scene.derivedPoint, { radius: 7.2, fill: "#fff", stroke: theme.ink, lineWidth: 2.0 });
+          api.drawCurvedArrow(
+            scene.precession >= 0 ? 1 : -1,
+            Math.abs(scene.precession),
+            precessionVisibilityValue(scene.z, scene.Z)
+          );
+        },
+        drawLabels(scene, api){
+          const precessionAlpha = thomasPrecessionOpacity(precessionVisibilityValue(scene.z, scene.Z));
+          api.drawTextAtDisk("ζ", scene.zetaHandle, { dx: 10, dy: -14, font: `italic ${Math.max(16, Math.round(19 * api.currentUiScale()))}px Georgia, Times, serif` });
+          api.drawTextAtDisk("Z", scene.Z, { dx: 10, dy: -12, font: `${Math.max(14, Math.round(24 * api.currentUiScale()))}px Georgia, Times, serif` });
+          api.drawTextAtDisk(scene.derivedName, scene.derivedPoint, { dx: 10, dy: 14, font: `italic ${Math.max(15, Math.round(18 * api.currentUiScale()))}px Georgia, Times, serif` });
+          api.drawTextAtDisk("Thomas Precession", {x:0.13, y:0.13}, { dx: 0, dy: 0, alpha: precessionAlpha, font: `${Math.max(11, Math.round(13 * api.currentUiScale()))}px Georgia, Times, serif` });
+        }
+      }
+    ];
+
+    // Keep tabs in a stable pedagogical order.
+    const TAB_ORDER = [
+      "householder-action",
+      "mobius-action",
+      "lms-reduced"
+    ];
+    GEOMETRY_TABS.sort((a, b) => TAB_ORDER.indexOf(a.id) - TAB_ORDER.indexOf(b.id));
+
+    // ---------- interaction shell ----------
+    if (titleDrag) {
+      titleDrag.addEventListener("pointerdown", (ev) => {
+        const cs = getComputedStyle(wrap);
+        state.titleDragState = {
+          startX: ev.clientX,
+          startY: ev.clientY,
+          baseX: parseFloat(cs.getPropertyValue("--titleX")) || 0,
+          baseY: parseFloat(cs.getPropertyValue("--titleY")) || 0,
+          pid: ev.pointerId
+        };
+        try { titleDrag.setPointerCapture(ev.pointerId); } catch {}
+        ev.preventDefault();
+        ev.stopPropagation();
+      });
+      window.addEventListener("pointermove", (ev) => {
+        if (!state.titleDragState) return;
+        const dx = ev.clientX - state.titleDragState.startX;
+        const dy = ev.clientY - state.titleDragState.startY;
+        setTitleOffset(state.titleDragState.baseX + dx, state.titleDragState.baseY + dy);
+        invalidate();
+        ev.preventDefault();
+      });
+      window.addEventListener("pointerup", () => { state.titleDragState = null; });
+      window.addEventListener("pointercancel", () => { state.titleDragState = null; });
+    }
+    if (btnHelp && helpCard) {
+      btnHelp.addEventListener("click", () => {
+        helpCard.classList.toggle("show");
+      });
+    }
+    if (btnReset) {
+      btnReset.addEventListener("click", () => {
+        resetWidget();
+      });
+    }
+
+    function startResize(ev, handle){
+      const rect = wrap.getBoundingClientRect();
+      state.resizing = { handle, startX: ev.clientX, startY: ev.clientY, startW: rect.width, pid: ev.pointerId };
+      try { wrap.setPointerCapture(ev.pointerId); } catch {}
+      ev.preventDefault();
+      ev.stopPropagation();
+    }
+    function onResizeMove(ev){
+      if (!state.resizing) return;
+      const dx = ev.clientX - state.resizing.startX;
+      const dy = ev.clientY - state.resizing.startY;
+      let delta = 0;
+      if (state.resizing.handle === "se") delta = Math.max(dx, dy);
+      if (state.resizing.handle === "nw") delta = -Math.max(dx, dy);
+      if (state.resizing.handle === "ne") delta = Math.max(dx, -dy);
+      if (state.resizing.handle === "sw") delta = Math.max(-dx, dy);
+      const minSize = 320;
+      const maxSize = Math.min(window.innerWidth * 0.98, window.innerHeight * 0.86, 2200);
+      const next = Math.max(minSize, Math.min(maxSize, state.resizing.startW + delta));
+      wrap.style.width = `${next}px`;
+      wrap.style.height = `${next}px`;
+      resize();
+      ev.preventDefault();
+      ev.stopPropagation();
+    }
+    function endResize(ev){
+      if (!state.resizing) return;
+      state.resizing = null;
+      try { wrap.releasePointerCapture(ev.pointerId); } catch {}
+      ev.preventDefault();
+      ev.stopPropagation();
+    }
+    wrap.querySelectorAll(".resizeHandle").forEach((el) => {
+      el.addEventListener("pointerdown", (ev) => startResize(ev, el.dataset.handle || "se"));
+    });
+    wrap.addEventListener("pointermove", onResizeMove);
+    wrap.addEventListener("pointerup", endResize);
+    wrap.addEventListener("pointercancel", endResize);
+
+    // ---------- pointer dragging for shared + per-tab handles ----------
+    wrap.addEventListener("mousedown", (e) => {
+      const target = hitTest(pointerPos(e));
+      if (!target) return;
+      beginDragTarget(target);
+      state.dragTarget = target;
+      e.preventDefault();
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!state.dragTarget) return;
+      applyDrag(state.dragTarget, pointerPos(e));
+      e.preventDefault();
+    });
+    window.addEventListener("mouseup", () => {
+      state.dragTarget = null;
+    });
+
+    wrap.addEventListener("touchstart", (e) => {
+      const target = hitTest(pointerPos(e));
+      if (!target) return;
+      beginDragTarget(target);
+      state.dragTarget = target;
+      e.preventDefault();
+    }, { passive: false });
+    window.addEventListener("touchmove", (e) => {
+      if (!state.dragTarget) return;
+      applyDrag(state.dragTarget, pointerPos(e));
+      e.preventDefault();
+    }, { passive: false });
+    window.addEventListener("touchend", () => {
+      state.dragTarget = null;
+    });
+
+    // ---------- animation / repaint loop ----------
+    function tick(ts){
+      const tab = currentTab();
+      const local = ensureTabState(tab.id);
+      const dt = state.lastTimestampMs ? Math.min(0.05, (ts - state.lastTimestampMs) / 1000) : 0.016;
+      state.lastTimestampMs = ts;
+      if (typeof tab.step === "function") {
+        tab.step(dt, state.shared, local, drawApi);
+        invalidate();
+      }
+      if (state.needsRedraw) {
+        draw();
+        state.needsRedraw = false;
+      }
+      requestAnimationFrame(tick);
+    }
+
+    syncActiveTabUi();
+    resize();
+    requestAnimationFrame(tick);
+  </script>
+</body>
+</html>

@@ -152,6 +152,49 @@ def local_busemann_initializer(
     return clamp_to_ball(z0, radius=0.999999)
 
 
+def _newton_polish_center(
+    z: Tensor,
+    points: Tensor,
+    weights: Tensor,
+    *,
+    tol: float,
+    max_steps: int = 8,
+) -> tuple[Tensor, float]:
+    """Polish the low-dimensional residual equation after potential ascent."""
+    z_cur = z.detach()
+    res_cur = canonical_residual(z_cur, points, weights)
+    norm_cur = float(torch.linalg.norm(res_cur))
+    for _ in range(max_steps):
+        if norm_cur <= float(tol):
+            break
+        z_req = z_cur.detach().clone().requires_grad_(True)
+
+        def residual_fn(inp: Tensor) -> Tensor:
+            return canonical_residual(inp, points, weights)
+
+        jac = torch.autograd.functional.jacobian(residual_fn, z_req).detach()
+        res = residual_fn(z_req).detach()
+        try:
+            delta = torch.linalg.solve(jac, -res)
+        except RuntimeError:
+            delta = torch.linalg.lstsq(jac, -res.unsqueeze(-1)).solution.squeeze(-1)
+        if not torch.isfinite(delta).all():
+            break
+
+        accepted = False
+        for step in (1.0, 0.5, 0.25, 0.125, 0.0625):
+            cand = clamp_to_ball(z_cur + float(step) * delta, radius=0.999999)
+            norm_cand = float(torch.linalg.norm(canonical_residual(cand, points, weights)))
+            if norm_cand < norm_cur:
+                z_cur = cand.detach()
+                norm_cur = norm_cand
+                accepted = True
+                break
+        if not accepted:
+            break
+    return z_cur, norm_cur
+
+
 def solve_canonical_center(
     points: Tensor,
     weights: Tensor,
@@ -200,9 +243,12 @@ def solve_canonical_center(
 
     with torch.no_grad():
         z_star = rapidity_to_ball(y.detach())
-        potential = float(busemann_cloud_potential(z_star, points, w))
         if not torch.isfinite(z_star).all() or not math.isfinite(res_norm):
             raise RuntimeError("canonical Busemann center solve produced non-finite values.")
+    if res_norm > float(tol):
+        z_star, res_norm = _newton_polish_center(z_star, points, w, tol=float(tol))
+    with torch.no_grad():
+        potential = float(busemann_cloud_potential(z_star, points, w))
     return CanonicalCenterSolve(
         z=z_star,
         residual_norm=res_norm,
