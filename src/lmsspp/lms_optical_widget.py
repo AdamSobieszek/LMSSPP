@@ -482,6 +482,7 @@ def _initialized_observed_cloud_np(
     preset: OpticalPreset,
     target_radius: float,
     direction: np.ndarray | None = None,
+    dimension: int = 2,
 ) -> np.ndarray:
     """Sample x_i^0 with a requested exact-gauge radius before inversion.
 
@@ -491,7 +492,8 @@ def _initialized_observed_cloud_np(
     requested |w|.  The widget still computes displayed w* from x_i^0 by exact
     Busemann inversion afterward.
     """
-    base = _random_sphere_points_np(int(n), 2, rng, preset=preset)
+    d = max(2, int(dimension))
+    base = _random_sphere_points_np(int(n), d, rng, preset=preset)
     weights = np.full((base.shape[0],), 1.0 / float(base.shape[0]), dtype=np.float64)
     P_t, a_t = _prepare_points_weights(base, weights)
     try:
@@ -499,11 +501,16 @@ def _initialized_observed_cloud_np(
     except Exception:
         centered = P_t
     if direction is None:
-        u = np.array([1.0, 0.0], dtype=np.float64)
+        u = np.zeros(d, dtype=np.float64)
+        u[0] = 1.0
     else:
-        u = np.asarray(direction, dtype=np.float64).reshape(2)
+        u = np.asarray(direction, dtype=np.float64).reshape(d)
         u_norm = float(np.linalg.norm(u))
-        u = np.array([1.0, 0.0], dtype=np.float64) if u_norm <= 1e-12 else u / u_norm
+        if u_norm <= 1e-12:
+            u = np.zeros(d, dtype=np.float64)
+            u[0] = 1.0
+        else:
+            u = u / u_norm
     r = float(np.clip(float(target_radius), 0.0, 0.985))
     w = torch.as_tensor(r * u, dtype=centered.dtype, device=centered.device)
     observed = normalize(mobius_sphere(centered, w))
@@ -601,8 +608,10 @@ def _covariance_ellipse_2d(
 
 def _reflected_series_np(w_series: np.ndarray, points: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
     """Vectorized r_i(w)=H_{p_i-w}(p_i) for many reduced points."""
-    W = np.asarray(w_series, dtype=np.float64).reshape(-1, 2)
-    P = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    P = np.asarray(points, dtype=np.float64)
+    if P.ndim != 2:
+        raise ValueError("points must have shape [N,d].")
+    W = np.asarray(w_series, dtype=np.float64).reshape(-1, P.shape[1])
     normals = P[None, :, :] - W[:, None, :]
     denom = np.maximum(np.sum(normals * normals, axis=-1, keepdims=True), float(eps))
     scale = 2.0 * np.sum(P[None, :, :] * normals, axis=-1, keepdims=True) / denom
@@ -612,9 +621,11 @@ def _reflected_series_np(w_series: np.ndarray, points: np.ndarray, *, eps: float
 
 
 def _mobius_sphere_series_np(w_series: np.ndarray, points_series: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
-    """Vectorized M_w(x) for w shape [T,2] and x shape [T,N,2]."""
-    W = np.asarray(w_series, dtype=np.float64).reshape(-1, 2)
+    """Vectorized M_w(x) for w shape [T,d] and x shape [T,N,d]."""
     X = np.asarray(points_series, dtype=np.float64)
+    if X.ndim < 2:
+        raise ValueError("points_series must have trailing dimension d.")
+    W = np.asarray(w_series, dtype=np.float64).reshape(-1, X.shape[-1])
     diff = X - W[:, None, :]
     denom = np.maximum(np.sum(diff * diff, axis=-1, keepdims=True), float(eps))
     w2 = np.sum(W * W, axis=1).reshape(-1, 1, 1)
@@ -625,8 +636,8 @@ def _spherical_inversion_chart_np(x: np.ndarray, center: np.ndarray, *, eps: flo
     """Pointwise spherical inversion chart y=(x-center)/|x-center|^2."""
     X = np.asarray(x, dtype=np.float64)
     original_shape = X.shape
-    X2 = X.reshape(-1, 2)
-    c = np.asarray(center, dtype=np.float64).reshape(2)
+    c = np.asarray(center, dtype=np.float64).reshape(-1)
+    X2 = X.reshape(-1, c.shape[0])
     diff = X2 - c[None, :]
     den = np.sum(diff * diff, axis=1)
     out = diff / np.maximum(den, float(eps))[:, None]
@@ -638,8 +649,8 @@ def _unit_distance_chart_np(x: np.ndarray, center: np.ndarray, *, eps: float = 1
     """Map every nonzero radial distance from center to 1, preserving direction."""
     X = np.asarray(x, dtype=np.float64)
     original_shape = X.shape
-    X2 = X.reshape(-1, 2)
-    c = np.asarray(center, dtype=np.float64).reshape(2)
+    c = np.asarray(center, dtype=np.float64).reshape(-1)
+    X2 = X.reshape(-1, c.shape[0])
     diff = X2 - c[None, :]
     dist = np.linalg.norm(diff, axis=1)
     out = np.full_like(X2, np.nan)
@@ -1523,7 +1534,7 @@ class LMSOpticalDiskBaseWidget:
         r0 = float(np.linalg.norm(w0))
         if not (np.isfinite(r0) and r0 < float(radius_stop)):
             return fallback
-        q0 = _reflected_series_np(w0.reshape(1, 2), points)[0]
+        q0 = _reflected_series_np(w0.reshape(1, points.shape[1]), points)[0]
         R0 = np.einsum("n,nj->j", weights, q0, optimize=True)
         radial = float(np.dot(R0, w0 / max(r0, 1e-12)))
         if radial <= 1e-12:
@@ -1567,7 +1578,7 @@ class LMSOpticalDiskBaseWidget:
                 fit_point_steps += 1
                 w2_now = float(np.dot(w, w))
                 denom = max(1.0 - w2_now, 1e-8)
-                q = _reflected_series_np(w.reshape(1, 2), P)[0]
+                q = _reflected_series_np(w.reshape(1, P.shape[1]), P)[0]
                 R = np.einsum("n,nj->j", a, q, optimize=True)
                 if time_mode == "euler_sundman":
                     velocity = 2.0 * R / denom
@@ -2623,6 +2634,357 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                     self.fig.data[self.tr[f"{prefix}_selected_anchor"]].y = [float(ys[bounded])]
 
 
+class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
+    """Single-panel 3D dynamic inversion view of the frozen LMS constants.
+
+    This reuses the base widget's exact-gauge preprocessing, target-radius
+    orbit precompute, playback, and physical/ES time mode.  The rendered scene
+    is only the 3D analogue of the lower-right dynamic inversion chart:
+
+        I_{-w_t}(x) = (x + w_t) / |x + w_t|^2.
+    """
+
+    _SPHERE_WIREFRAME_LATITUDES = 25
+    _SPHERE_WIREFRAME_LONGITUDES = 36
+    _SPHERE_WIREFRAME_SAMPLES = 180
+
+    def __init__(
+        self,
+        *,
+        N: int = 18,
+        preset: OpticalPreset = "random",
+        seed: int = 7,
+        init_radius: float = 0.35,
+        grid_size: int = 80,
+        width: int = 1040,
+        height: int = 820,
+        points: np.ndarray | Tensor | None = None,
+        weights: np.ndarray | Tensor | None = None,
+    ) -> None:
+        rng = np.random.default_rng(int(seed))
+        init_radius_value = float(np.clip(float(init_radius), 0.0, 0.985))
+        init_points = (
+            _initialized_observed_cloud_np(
+                int(N),
+                rng,
+                preset=preset,
+                target_radius=init_radius_value,
+                dimension=3,
+            )
+            if points is None
+            else points
+        )
+        super().__init__(
+            N=N,
+            preset=preset,
+            seed=seed,
+            init_radius=init_radius,
+            grid_size=grid_size,
+            width=width,
+            height=height,
+            points=init_points,
+            weights=weights,
+            select_pi=False,
+        )
+
+    def _layout_header_html(self) -> str:
+        return (
+            "<b>LMS 3D dynamic inversion chart</b><br>"
+            "Single scene: frozen constants pᵢ⁰, the reduced orbit w(t), and S² are shown through "
+            "I₋wₜ(x)=(x+wₜ)/|x+wₜ|². The orbit uses the shared physical/ES target-radius precompute."
+        )
+
+    def _build_controls(self, *, preset: OpticalPreset) -> None:
+        super()._build_controls(preset=preset)
+        self.show_contours.value = False
+        children = list(self.controls.children)
+        children[4] = widgets.HBox([])
+        self.controls.children = tuple(children)
+
+    def _initial_w(self) -> np.ndarray:
+        return np.asarray(getattr(self, "w_star", np.zeros(3)), dtype=np.float64).reshape(3).copy()
+
+    def _sync_exact_center_label(self) -> None:
+        w = np.asarray(getattr(self, "w_star", np.zeros(3)), dtype=np.float64).reshape(3)
+        r = float(np.linalg.norm(w))
+        self.exact_center_html.value = (
+            f"<b>Exact gauge:</b> "
+            f"w*=({w[0]:+.4f},{w[1]:+.4f},{w[2]:+.4f}), "
+            f"|w*|={r:.4f}"
+        )
+
+    def _resample_anchors_and_precompute(self) -> None:
+        self.init_radius_value = float(np.clip(float(self.init_radius_slider.value), 0.0, 0.985))
+        self.raw_points = _initialized_observed_cloud_np(
+            int(self.n_slider.value),
+            self.rng,
+            preset=self.preset_dropdown.value,
+            target_radius=self.init_radius_value,
+            dimension=3,
+        )
+        self.weights = np.full((self.raw_points.shape[0],), 1.0 / float(self.raw_points.shape[0]), dtype=np.float64)
+        self.points = self._canonicalized_points(self.raw_points)
+        self._sync_anchor_controls()
+        self._rebuild_orbit()
+
+    def _build_figure(self) -> None:
+        self.fig = go.FigureWidget()
+        self.tr: dict[str, int] = {}
+        self._reset_subplot_legend_state()
+
+        def add(trace: Any, key: str) -> None:
+            self.fig.add_trace(trace)
+            self.tr[key] = len(self.fig.data) - 1
+
+        add(
+            go.Scatter3d(
+                x=[],
+                y=[],
+                z=[],
+                mode="lines",
+                line=dict(color="rgba(20,20,20,0.38)", width=2),
+                name="I₋wₜ(S²)",
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            "inv_wire",
+        )
+        add(
+            go.Scatter3d(
+                x=[],
+                y=[],
+                z=[],
+                mode="lines",
+                line=dict(color="rgba(20,20,20,0.42)", width=4),
+                name="I₋wₜ(w(t))",
+                hoverinfo="skip",
+            ),
+            "inv_path",
+        )
+        add(
+            go.Scatter3d(
+                x=[],
+                y=[],
+                z=[],
+                mode="markers",
+                marker=dict(size=4, color="#244C9A", opacity=0.78),
+                name="I₋wₜ(pᵢ⁰)",
+            ),
+            "inv_anchors",
+        )
+        add(
+            go.Scatter3d(
+                x=[],
+                y=[],
+                z=[],
+                mode="markers",
+                marker=dict(size=6, color="white", line=dict(color="black", width=2)),
+                name="I₋wₜ(0)",
+            ),
+            "inv_origin",
+        )
+        add(
+            go.Scatter3d(
+                x=[],
+                y=[],
+                z=[],
+                mode="markers",
+                marker=dict(size=6, color="black"),
+                name="I₋wₜ(w)",
+            ),
+            "inv_w",
+        )
+        add(
+            go.Scatter3d(
+                x=[],
+                y=[],
+                z=[],
+                mode="lines+markers",
+                line=dict(color="#D72638", width=6),
+                marker=dict(size=3, color="#D72638"),
+                name="I₋wₜ(w+R)",
+            ),
+            "inv_R",
+        )
+        add(
+            go.Scatter3d(
+                x=[],
+                y=[],
+                z=[],
+                mode="lines+markers",
+                line=dict(color="#188038", width=5, dash="dash"),
+                marker=dict(size=3, color="#188038"),
+                name="I₋wₜ(w+ẇ)",
+            ),
+            "inv_velocity",
+        )
+        self.fig.update_layout(
+            width=self.width,
+            height=self.height,
+            template="plotly_white",
+            margin=dict(l=0, r=0, t=20, b=0),
+            showlegend=True,
+            legend=dict(
+                x=0.98,
+                y=0.98,
+                xanchor="right",
+                yanchor="top",
+                bgcolor="rgba(255,255,255,0.78)",
+                bordercolor="rgba(40,40,40,0.18)",
+                borderwidth=1,
+                font=dict(size=11),
+            ),
+            scene=dict(
+                aspectmode="cube",
+                xaxis=dict(title="I₋wₜ(e₁)", showgrid=True, zeroline=True),
+                yaxis=dict(title="I₋wₜ(e₂)", showgrid=True, zeroline=True),
+                zaxis=dict(title="I₋wₜ(e₃)", showgrid=True, zeroline=True),
+                camera=dict(eye=dict(x=1.45, y=1.45, z=1.15)),
+            ),
+        )
+
+    @classmethod
+    def _sphere_wireframe_points(cls) -> np.ndarray:
+        theta = np.linspace(0.0, TAU, int(cls._SPHERE_WIREFRAME_SAMPLES), dtype=np.float64)
+        rows: list[np.ndarray] = []
+        for z in np.linspace(-0.95, 0.95, int(cls._SPHERE_WIREFRAME_LATITUDES), dtype=np.float64):
+            r = math.sqrt(max(0.0, 1.0 - float(z) * float(z)))
+            rows.append(np.column_stack([r * np.cos(theta), r * np.sin(theta), np.full_like(theta, z)]))
+            rows.append(np.full((1, 3), np.nan, dtype=np.float64))
+        phi_vals = np.linspace(0.0, TAU, int(cls._SPHERE_WIREFRAME_LONGITUDES), endpoint=False, dtype=np.float64)
+        meridian_t = np.linspace(-0.5 * math.pi, 0.5 * math.pi, int(cls._SPHERE_WIREFRAME_SAMPLES), dtype=np.float64)
+        for phi in phi_vals:
+            r = np.cos(meridian_t)
+            rows.append(
+                np.column_stack(
+                    [
+                        r * math.cos(float(phi)),
+                        r * math.sin(float(phi)),
+                        np.sin(meridian_t),
+                    ]
+                )
+            )
+            rows.append(np.full((1, 3), np.nan, dtype=np.float64))
+        return np.vstack(rows)
+
+    @staticmethod
+    def _chart_range_from_payloads(payloads: list[dict[str, Any]]) -> list[list[float]]:
+        chunks: list[np.ndarray] = []
+        keys = ("inv_wire", "inv_path", "inv_anchors", "inv_origin", "inv_w", "inv_R", "inv_velocity")
+        for payload in payloads:
+            for key in keys:
+                arr = np.asarray(payload[key], dtype=np.float64).reshape(-1, 3)
+                arr = arr[np.isfinite(arr).all(axis=1)]
+                if arr.size:
+                    chunks.append(arr)
+        if not chunks:
+            return [[-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0]]
+        finite = np.vstack(chunks)
+        lo = np.nanquantile(finite, 0.03, axis=0)
+        hi = np.nanquantile(finite, 0.97, axis=0)
+        center = 0.5 * (lo + hi)
+        radius = max(1.0, float(np.max(0.5 * (hi - lo))))
+        return [[float(c - 1.12 * radius), float(c + 1.12 * radius)] for c in center]
+
+    def _build_frame_payloads(self, orbit: np.ndarray, *, include_contours: bool) -> list[dict[str, Any]]:
+        _ = include_contours
+        W = np.asarray(orbit, dtype=np.float64).reshape(-1, 3)
+        if W.size == 0:
+            return []
+        P = np.asarray(self.points, dtype=np.float64).reshape(-1, 3)
+        a = np.asarray(self.weights, dtype=np.float64).reshape(-1)
+        parameter_time = np.asarray(getattr(self, "_orbit_parameter_time", np.arange(W.shape[0])), dtype=np.float64)
+        physical_time = np.asarray(getattr(self, "_orbit_physical_time", np.arange(W.shape[0])), dtype=np.float64)
+        if parameter_time.shape[0] != W.shape[0]:
+            parameter_time = np.arange(W.shape[0], dtype=np.float64)
+        if physical_time.shape[0] != W.shape[0]:
+            physical_time = parameter_time.copy()
+        Q = _reflected_series_np(W, P)
+        R = np.einsum("n,tnj->tj", a, Q, optimize=True)
+        w2 = np.sum(W * W, axis=1)
+        physical_velocity = 0.5 * (1.0 - w2)[:, None] * R
+        wire = self._sphere_wireframe_points()
+        line_t = np.linspace(0.0, 1.0, 48, dtype=np.float64)[:, None]
+        time_mode = self._time_mode()
+        payloads: list[dict[str, Any]] = []
+        for i, w_np in enumerate(W):
+            center = -w_np
+            r_curve = w_np[None, :] + line_t * (0.48 * R[i])[None, :]
+            v_curve = w_np[None, :] + line_t * (1.6 * physical_velocity[i])[None, :]
+            inv_wire = _spherical_inversion_chart_np(wire, center)
+            inv_path = _spherical_inversion_chart_np(W, center)
+            inv_anchors = _spherical_inversion_chart_np(P, center)
+            inv_origin = _spherical_inversion_chart_np(np.zeros((1, 3), dtype=np.float64), center)
+            inv_w = _spherical_inversion_chart_np(w_np.reshape(1, 3), center)
+            inv_R = _spherical_inversion_chart_np(r_curve, center)
+            inv_velocity = _spherical_inversion_chart_np(v_curve, center)
+            coh = float(np.linalg.norm(R[i]))
+            speed = float(np.linalg.norm(physical_velocity[i]))
+            payloads.append(
+                {
+                    "w": w_np.copy(),
+                    "P": P,
+                    "R": R[i].copy(),
+                    "velocity": physical_velocity[i].copy(),
+                    "inv_wire": inv_wire,
+                    "inv_path": inv_path,
+                    "inv_anchors": inv_anchors,
+                    "inv_origin": inv_origin,
+                    "inv_w": inv_w,
+                    "inv_R": inv_R,
+                    "inv_velocity": inv_velocity,
+                    "coherence": coh,
+                    "speed": speed,
+                    "parameter_time": float(parameter_time[i]),
+                    "physical_time": float(physical_time[i]),
+                    "stats": (
+                        "<b>3D inversion diagnostics</b> "
+                        f"|w|={float(np.linalg.norm(w_np)):.6f}; "
+                        f"|Rₚ⁰(w)|={coh:.6f}; "
+                        f"|ẇ|={speed:.6f}; "
+                        f"time={'ES' if time_mode == 'euler_sundman' else 'physical'}; "
+                        f"τ={float(parameter_time[i]):.6g}; "
+                        f"t={float(physical_time[i]):.6g}; "
+                        f"center error={self._center_error:.2e}"
+                    ),
+                }
+            )
+        scene_ranges = self._chart_range_from_payloads(payloads)
+        for payload in payloads:
+            payload["scene_ranges"] = scene_ranges
+        return payloads
+
+    def _apply_static_payload_to_figure(self) -> None:
+        if not self._frame_payloads:
+            return
+        ranges = self._frame_payloads[0].get("scene_ranges", [[-1, 1], [-1, 1], [-1, 1]])
+        with self.fig.batch_update():
+            self.fig.update_layout(
+                scene=dict(
+                    xaxis=dict(range=ranges[0]),
+                    yaxis=dict(range=ranges[1]),
+                    zaxis=dict(range=ranges[2]),
+                    aspectmode="cube",
+                )
+            )
+
+    def _apply_dynamic_payload_to_figure(self, payload: dict[str, Any]) -> None:
+        def set_xyz(trace_key: str, payload_key: str) -> None:
+            arr = np.asarray(payload[payload_key], dtype=np.float64).reshape(-1, 3)
+            self.fig.data[self.tr[trace_key]].x = _plotly_values(arr[:, 0])
+            self.fig.data[self.tr[trace_key]].y = _plotly_values(arr[:, 1])
+            self.fig.data[self.tr[trace_key]].z = _plotly_values(arr[:, 2])
+
+        with self.fig.batch_update():
+            set_xyz("inv_wire", "inv_wire")
+            set_xyz("inv_path", "inv_path")
+            set_xyz("inv_anchors", "inv_anchors")
+            set_xyz("inv_origin", "inv_origin")
+            set_xyz("inv_w", "inv_w")
+            set_xyz("inv_R", "inv_R")
+            set_xyz("inv_velocity", "inv_velocity")
+
+
 class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
     """2D optical explorer with a weighted-Busemann Cayley half-plane chart.
 
@@ -3286,6 +3648,7 @@ __all__ = [
     "LMSOpticalDiskBaseWidget",
     "LMSOpticalDiskWidget",
     "LMSOpticalDynamicInversionCayleyDiskWidget",
+    "LMSOpticalDynamicInversionBall3DWidget",
     "LMSOpticalWeightedCayleyDiskWidget",
     "LMSOpticalHyperboloidScreenWidget",
 ]
