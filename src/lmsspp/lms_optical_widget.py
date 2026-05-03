@@ -659,18 +659,17 @@ def _spherical_inversion_chart_np(x: np.ndarray, center: np.ndarray, *, eps: flo
     return out.reshape(original_shape)
 
 
-def _one_sided_unit_distance_chart_np(x: np.ndarray, center: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
-    """Keep points at least unit distance from center, preserving direction."""
+def _unit_distance_chart_np(x: np.ndarray, center: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+    """Map every nonzero radial distance from center to 1, preserving direction."""
     X = np.asarray(x, dtype=np.float64)
     original_shape = X.shape
     X2 = X.reshape(-1, 2)
     c = np.asarray(center, dtype=np.float64).reshape(2)
     diff = X2 - c[None, :]
     dist = np.linalg.norm(diff, axis=1)
-    out = X2.copy()
-    mask = (dist < 1.0) & (dist >= float(eps))
-    out[mask] = c[None, :] + diff[mask] / dist[mask, None]
-    out[dist < float(eps)] = c
+    out = np.full_like(X2, np.nan)
+    mask = dist >= float(eps)
+    out[mask] = c[None, :] + diff[mask] / dist[mask][:, None]
     return out.reshape(original_shape)
 
 
@@ -1063,8 +1062,12 @@ class LMSOpticalDiskBaseWidget:
     payload precompute, cache invalidation, and frame/play callbacks.
 
     Subclasses can change the visualization without copying the LMS optics
-    helpers by overriding `_build_figure`, `_apply_payload_to_figure`, and
-    optionally `_layout_header_html` / `_augment_frame_payload`.
+    helpers by overriding `_build_figure`, the granular render hooks
+    `_apply_static_payload_to_figure` /
+    `_apply_dynamic_payload_to_figure` /
+    `_apply_overlay_payload_to_figure`, and optionally
+    `_layout_header_html` / `_augment_frame_payload` /
+    `_finalize_frame_payloads`.
 
     Left panel: the exact constants of motion p_i^0=M_{-w_*}(x_i^0)
     and the one-dimensional reduced orbit w(t) initialized at w(0)=w_*.
@@ -1076,8 +1079,8 @@ class LMSOpticalDiskBaseWidget:
     dw/dt=0.5*(1-|w|^2)*sum_i a_i r_i(w), not by the gradient of S_{r(w)} at w.
     """
 
-    _ES_BOUNDARY_TARGET_RADIUS = 0.9995
-    _ES_BOUNDARY_FIT_TOLERANCE = 5e-4
+    _DEFAULT_FLOW_TARGET_RADIUS = 0.999
+    _FLOW_TARGET_FIT_TOLERANCE = 5e-4
 
     def __init__(
         self,
@@ -1091,6 +1094,7 @@ class LMSOpticalDiskBaseWidget:
         height: int = 760,
         points: np.ndarray | Tensor | None = None,
         weights: np.ndarray | Tensor | None = None,
+        select_pi: bool = False,
     ) -> None:
         _require_widgets()
         self.rng = np.random.default_rng(int(seed))
@@ -1102,12 +1106,13 @@ class LMSOpticalDiskBaseWidget:
         self.level_grid_size = max(36, min(int(grid_size), 80))
         self.width = int(width)
         self.height = int(height)
+        self.select_pi = bool(select_pi)
         self._updating = False
         self._frame_index = 0
         self._cache_valid = False
         self._frame_payloads: list[dict[str, Any]] = []
-        self._es_step_fit_cache: dict[tuple[str, int, float], dict[str, float | bool]] = {}
-        self._es_step_fit_last: dict[str, Any] | None = None
+        self._flow_step_fit_cache: dict[tuple[str, str, int, float], dict[str, float | bool]] = {}
+        self._flow_step_fit_last: dict[str, Any] | None = None
         if points is None:
             self.raw_points = _initialized_observed_cloud_np(
                 int(N),
@@ -1194,9 +1199,23 @@ class LMSOpticalDiskBaseWidget:
             tooltip="Switch orbit precompute between physical time and Euler-Sundman time.",
             layout=widgets.Layout(width="150px"),
         )
-        self.selected = widgets.IntSlider(value=0, min=0, max=max(0, int(self.points.shape[0]) - 1), step=1, description="selected i", continuous_update=False, layout=widgets.Layout(width="260px"))
-        self.anchor_theta = widgets.FloatSlider(value=0.0, min=-math.pi, max=math.pi, step=0.01, description="edit x_i^0", readout_format=".2f", continuous_update=False, layout=widgets.Layout(width="330px"))
-        self.step_size = widgets.FloatSlider(value=0.16, min=0.005, max=0.5, step=0.005, description="flow step", readout_format=".3f", continuous_update=False, layout=widgets.Layout(width="280px"))
+        self._selected_index = 0
+        if self.select_pi:
+            self.selected = widgets.IntSlider(value=0, min=0, max=max(0, int(self.points.shape[0]) - 1), step=1, description="selected i", continuous_update=False, layout=widgets.Layout(width="260px"))
+            self.anchor_theta = widgets.FloatSlider(value=0.0, min=-math.pi, max=math.pi, step=0.01, description="edit x_i^0", readout_format=".2f", continuous_update=False, layout=widgets.Layout(width="330px"))
+        else:
+            self.selected = None
+            self.anchor_theta = None
+        self.target_radius = widgets.FloatSlider(
+            value=float(self._DEFAULT_FLOW_TARGET_RADIUS),
+            min=0.1,
+            max=0.9995,
+            step=0.0005,
+            description="target |w|",
+            readout_format=".4f",
+            continuous_update=False,
+            layout=widgets.Layout(width="280px"),
+        )
         self.max_frames = widgets.IntSlider(value=20, min=2, max=300, step=1, description="max frames", continuous_update=False, layout=widgets.Layout(width="300px"))
         self.orbit_frames = self.max_frames
         self.frame_slider = widgets.IntSlider(value=0, min=0, max=0, step=1, description="frame", continuous_update=True, disabled=True, layout=widgets.Layout(width="640px"))
@@ -1221,13 +1240,16 @@ class LMSOpticalDiskBaseWidget:
             self.play.repeat = True
         self.cache_status_html = widgets.HTML(value="", layout=widgets.Layout(width="360px"))
         self.stats_html = _html(value="")
+        selection_row = [self.show_contours]
+        if self.select_pi:
+            selection_row = [self.selected, self.anchor_theta, self.show_contours]
         self.controls = widgets.VBox(
             [
                 widgets.HBox([self.preset_dropdown, self.n_slider, self.init_radius_slider, self.btn_resample]),
-                widgets.HBox([self.exact_center_html, self.time_mode_toggle, self.step_size, self.max_frames]),
+                widgets.HBox([self.exact_center_html, self.time_mode_toggle, self.target_radius, self.max_frames]),
                 widgets.HBox([self.btn_step, self.play, self.btn_precompute, self.cache_status_html]),
                 widgets.HBox([self.frame_slider, self.frame_counter]),
-                widgets.HBox([self.selected, self.anchor_theta, self.show_contours]),
+                widgets.HBox(selection_row),
             ]
         )
 
@@ -1343,7 +1365,8 @@ class LMSOpticalDiskBaseWidget:
         add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(20,20,20,0.35)", width=2), name=r"$w(t)$", hoverinfo="skip"), "orbit_path", 1, 1)
         add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=11, color="white", line=dict(color="black", width=2)), name=r"$\sum_i a_i p_i^0=0$"), "core_balance", 1, 1)
         add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#244C9A", opacity=0.72), name=r"$p_i^0$"), "anchors", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name=r"$\mathrm{selected}\ p_i^0$"), "selected_anchor", 1, 1)
+        if self.select_pi:
+            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name=r"$\mathrm{selected}\ p_i^0$"), "selected_anchor", 1, 1)
         add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black"), name=r"$w$"), "w", 1, 1)
         add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 9], color="#D72638"), name=r"$R_{p^0}(w)=\sum_i a_i r_i(w)$"), "R_arrow", 1, 1)
         add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#188038", width=3, dash="dash"), marker=dict(size=[0, 7], color="#188038"), name=r"$\dot w$"), "vel_arrow", 1, 1)
@@ -1357,11 +1380,12 @@ class LMSOpticalDiskBaseWidget:
         add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#3B5BDB", width=2), marker=dict(size=5, color="#3B5BDB"), name=r"$\sum_i a_i r_i(w)$"), "polygon", 2, 1)
         add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=9, color="black"), name=r"$0$", showlegend=False, hoverinfo="skip"), "polygon_origin", 2, 1)
 
-        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.3)", width=1), name=r"$S^1$", hoverinfo="skip", showlegend=False), "geom_circle", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#244C9A", width=3), name=r"$p_i^0$"), "geom_incoming", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=3), name=r"$r_i(w)$"), "geom_reflected", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#D72638", width=3), name=r"$p_i^0-w$"), "geom_normal", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.45)", width=2, dash="dash"), name=r"$(p_i^0-w)^\perp$"), "geom_mirror", 2, 2)
+        if self.select_pi:
+            add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.3)", width=1), name=r"$S^1$", hoverinfo="skip", showlegend=False), "geom_circle", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#244C9A", width=3), name=r"$p_i^0$"), "geom_incoming", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=3), name=r"$r_i(w)$"), "geom_reflected", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#D72638", width=3), name=r"$p_i^0-w$"), "geom_normal", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.45)", width=2, dash="dash"), name=r"$(p_i^0-w)^\perp$"), "geom_mirror", 2, 2)
 
         fig.update_layout(
             width=self.width,
@@ -1382,17 +1406,18 @@ class LMSOpticalDiskBaseWidget:
         self._configure_subplot_legends()
 
     def _bind_callbacks(self) -> None:
-        for ctl in [
+        controls = [
             self.preset_dropdown,
             self.n_slider,
             self.init_radius_slider,
-            self.step_size,
+            self.target_radius,
             self.max_frames,
             self.frame_slider,
-            self.selected,
-            self.anchor_theta,
             self.show_contours,
-        ]:
+        ]
+        if self.select_pi:
+            controls.extend([self.selected, self.anchor_theta])
+        for ctl in controls:
             ctl.observe(self._on_control_change, names="value")
         self.time_mode_toggle.observe(self._on_time_mode_toggle, names="value")
         self.btn_resample.on_click(self._on_resample)
@@ -1413,12 +1438,17 @@ class LMSOpticalDiskBaseWidget:
         self._rebuild_orbit()
 
     def _sync_anchor_controls(self) -> None:
-        idx = int(np.clip(int(self.selected.value), 0, self.points.shape[0] - 1))
-        self.selected.max = max(0, self.points.shape[0] - 1)
-        theta = math.atan2(float(self.raw_points[idx, 1]), float(self.raw_points[idx, 0]))
-        self._updating = True
-        self.anchor_theta.value = theta
-        self._updating = False
+        idx = int(np.clip(self._selected_index, 0, self.points.shape[0] - 1))
+        self._selected_index = idx
+        if self.select_pi:
+            self._updating = True
+            try:
+                self.selected.max = max(0, self.points.shape[0] - 1)
+                self.selected.value = idx
+                theta = math.atan2(float(self.raw_points[idx, 1]), float(self.raw_points[idx, 0]))
+                self.anchor_theta.value = theta
+            finally:
+                self._updating = False
         self._sync_exact_center_label()
 
     def _sync_exact_center_label(self) -> None:
@@ -1458,34 +1488,12 @@ class LMSOpticalDiskBaseWidget:
 
     def _integrate_orbit_from_controls(self) -> np.ndarray:
         frames = max(2, int(self.max_frames.value))
-        if self._time_mode() == "euler_sundman":
-            return self._integrate_euler_sundman_orbit_from_controls(frames)
-        pts = [self._initial_w()]
-        w = pts[0].copy()
-        step = float(self.step_size.value)
-        parameter_times = [0.0]
-        physical_times = [0.0]
-        for _ in range(frames - 1):
-            nxt = optical_flow_step(
-                w,
-                self.points,
-                self.weights,
-                step_size=step,
-                radius=0.985,
-            ).detach().cpu().numpy()
-            if not np.isfinite(nxt).all():
-                break
-            pts.append(nxt.copy())
-            parameter_times.append(parameter_times[-1] + step)
-            physical_times.append(physical_times[-1] + step)
-            w = nxt
-            if float(np.linalg.norm(w)) >= 0.984:
-                break
-        self._orbit_parameter_time = np.asarray(parameter_times, dtype=np.float64)
-        self._orbit_physical_time = np.asarray(physical_times, dtype=np.float64)
-        return np.asarray(pts, dtype=np.float64)
+        return self._integrate_target_radius_orbit_from_controls(frames, time_mode=self._time_mode())
 
-    def _es_step_state_signature(self) -> str:
+    def _target_flow_radius(self) -> float:
+        return float(np.clip(float(self.target_radius.value), 0.0, 0.9995))
+
+    def _flow_step_state_signature(self) -> str:
         h = hashlib.blake2b(digest_size=16)
         for values in (self.points, self.weights, self._initial_w()):
             arr = np.ascontiguousarray(values, dtype=np.float64)
@@ -1493,43 +1501,45 @@ class LMSOpticalDiskBaseWidget:
             h.update(arr.tobytes())
         return h.hexdigest()
 
-    def _es_step_fit_cache_key(self, frames: int, radius_stop: float) -> tuple[str, int, float]:
-        return (self._es_step_state_signature(), int(frames), round(float(radius_stop), 12))
+    def _flow_step_fit_cache_key(self, time_mode: str, frames: int, radius_stop: float) -> tuple[str, str, int, float]:
+        return (self._flow_step_state_signature(), str(time_mode), int(frames), round(float(radius_stop), 12))
 
-    def _remember_es_step_fit(
+    def _remember_flow_step_fit(
         self,
-        key: tuple[str, int, float],
+        key: tuple[str, str, int, float],
         *,
-        tau_step: float,
+        step: float,
         final_radius: float,
         boundary_fit: bool,
     ) -> None:
-        self._es_step_fit_cache[key] = {
-            "tau_step": float(tau_step),
+        self._flow_step_fit_cache[key] = {
+            "step": float(step),
             "final_radius": float(final_radius),
             "boundary_fit": bool(boundary_fit),
         }
-        while len(self._es_step_fit_cache) > 64:
-            self._es_step_fit_cache.pop(next(iter(self._es_step_fit_cache)))
-        self._es_step_fit_last = {
+        while len(self._flow_step_fit_cache) > 96:
+            self._flow_step_fit_cache.pop(next(iter(self._flow_step_fit_cache)))
+        self._flow_step_fit_last = {
             "state_signature": key[0],
-            "frames": int(key[1]),
-            "radius_stop": float(key[2]),
-            "tau_step": float(tau_step),
+            "time_mode": str(key[1]),
+            "frames": int(key[2]),
+            "radius_stop": float(key[3]),
+            "step": float(step),
         }
 
-    def _estimate_es_boundary_tau_step(
+    def _estimate_boundary_step(
         self,
         *,
+        time_mode: str,
         frames: int,
         radius_stop: float,
         points: np.ndarray,
         weights: np.ndarray,
     ) -> float:
-        """Return a cold-start ES step prior on the observed useful scale."""
+        """Return a cold-start step prior on the observed useful scale."""
         frame_intervals = max(1, int(frames) - 1)
         horizon_scale = 19.0 / float(frame_intervals)
-        fallback = 0.02 * horizon_scale
+        fallback = (0.02 if time_mode == "euler_sundman" else 0.16) * horizon_scale
         w0 = self._initial_w()
         r0 = float(np.linalg.norm(w0))
         if not (np.isfinite(r0) and r0 < float(radius_stop)):
@@ -1538,33 +1548,36 @@ class LMSOpticalDiskBaseWidget:
         R0 = np.einsum("n,nj->j", weights, q0, optimize=True)
         radial = float(np.dot(R0, w0 / max(r0, 1e-12)))
         if radial <= 1e-12:
-            return 0.05 * horizon_scale
-        numerator = (float(radius_stop) - float(radius_stop) ** 3 / 3.0) - (r0 - r0**3 / 3.0)
-        estimate = 0.42 * numerator / (2.0 * radial * float(frame_intervals))
-        lo = 0.01 * horizon_scale
-        hi = 0.05 * horizon_scale
+            return (0.05 if time_mode == "euler_sundman" else 0.25) * horizon_scale
+        if time_mode == "euler_sundman":
+            numerator = (float(radius_stop) - float(radius_stop) ** 3 / 3.0) - (r0 - r0**3 / 3.0)
+            estimate = 0.42 * numerator / (2.0 * radial * float(frame_intervals))
+            lo = 0.01 * horizon_scale
+            hi = 0.05 * horizon_scale
+        else:
+            speed = 0.5 * max(1.0 - r0 * r0, 1e-8) * radial
+            estimate = 0.42 * (float(radius_stop) - r0) / (speed * float(frame_intervals))
+            lo = 0.005 * horizon_scale
+            hi = 0.5 * horizon_scale
         return float(np.clip(estimate, lo, hi))
 
-    def _integrate_euler_sundman_orbit_from_controls(self, frames: int) -> np.ndarray:
-        """Integrate dw/dtau with one cached frame per selected ES time step.
+    def _integrate_target_radius_orbit_from_controls(self, frames: int, *, time_mode: str) -> np.ndarray:
+        """Fit the parameter step so the requested frame count reaches target radius.
 
-        The user-facing step slider is treated as the nominal ES step.  When
-        that step would cross the display boundary before the requested frame
-        count, bracket the crossing step and bisect to make the final requested
-        frame land on the boundary threshold instead of collapsing the cache to
-        the first few pre-boundary frames.
+        Physical and Euler-Sundman modes use different vector fields, but both
+        cache a fitted uniform parameter step keyed by the current cloud, time
+        mode, requested frame count, and target radius.
         """
         P = np.asarray(self.points, dtype=np.float64)
         a = np.asarray(self.weights, dtype=np.float64)
-        requested_step = float(self.step_size.value)
-        radius_stop = float(self._ES_BOUNDARY_TARGET_RADIUS)
-        fit_tolerance = float(self._ES_BOUNDARY_FIT_TOLERANCE)
-        cache_key = self._es_step_fit_cache_key(frames, radius_stop)
+        radius_stop = self._target_flow_radius()
+        fit_tolerance = float(self._FLOW_TARGET_FIT_TOLERANCE)
+        cache_key = self._flow_step_fit_cache_key(time_mode, frames, radius_stop)
         state_signature = cache_key[0]
         fit_calls = 0
         fit_point_steps = 0
 
-        def integrate_for_step(tau_step: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, float]:
+        def integrate_for_step(step: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, float]:
             nonlocal fit_calls, fit_point_steps
             fit_calls += 1
             pts = [self._initial_w()]
@@ -1577,7 +1590,13 @@ class LMSOpticalDiskBaseWidget:
                 denom = max(1.0 - w2_now, 1e-8)
                 q = _reflected_series_np(w.reshape(1, 2), P)[0]
                 R = np.einsum("n,nj->j", a, q, optimize=True)
-                nxt = w + tau_step * (2.0 * R / denom)
+                if time_mode == "euler_sundman":
+                    velocity = 2.0 * R / denom
+                    physical_dt = step * 4.0 / (denom * denom)
+                else:
+                    velocity = 0.5 * denom * R
+                    physical_dt = step
+                nxt = w + step * velocity
                 nrm = float(np.linalg.norm(nxt))
                 if (not np.isfinite(nxt).all()) or nrm >= radius_stop:
                     return (
@@ -1588,8 +1607,8 @@ class LMSOpticalDiskBaseWidget:
                         nrm,
                     )
                 pts.append(nxt.copy())
-                parameter_times.append(parameter_times[-1] + tau_step)
-                physical_times.append(physical_times[-1] + tau_step * 4.0 / (denom * denom))
+                parameter_times.append(parameter_times[-1] + step)
+                physical_times.append(physical_times[-1] + physical_dt)
                 w = nxt
             orbit = np.asarray(pts, dtype=np.float64)
             tau = np.asarray(parameter_times, dtype=np.float64)
@@ -1597,21 +1616,22 @@ class LMSOpticalDiskBaseWidget:
             final_radius = float(np.linalg.norm(orbit[-1])) if len(orbit) else float("nan")
             return orbit, tau, physical, False, final_radius
 
-        cached_fit = self._es_step_fit_cache.get(cache_key)
+        cached_fit = self._flow_step_fit_cache.get(cache_key)
         if cached_fit is not None:
-            cached_step = float(cached_fit["tau_step"])
+            cached_step = float(cached_fit["step"])
             orbit, tau, physical, crossed, final_radius = integrate_for_step(cached_step)
             if (not crossed) and len(orbit) == frames and abs(final_radius - radius_stop) <= fit_tolerance:
                 self._orbit_parameter_time = tau
                 self._orbit_physical_time = physical
-                self._orbit_es_tau_step = cached_step
-                self._orbit_es_boundary_fit = True
-                self._orbit_es_fit_calls = fit_calls
-                self._orbit_es_fit_point_steps = fit_point_steps
-                self._orbit_es_fit_cache_hit = True
+                self._orbit_fitted_step = cached_step
+                self._orbit_boundary_fit = True
+                self._orbit_fit_calls = fit_calls
+                self._orbit_fit_point_steps = fit_point_steps
+                self._orbit_fit_cache_hit = True
                 return orbit
 
-        initial_step = self._estimate_es_boundary_tau_step(
+        initial_step = self._estimate_boundary_step(
+            time_mode=time_mode,
             frames=frames,
             radius_stop=radius_stop,
             points=P,
@@ -1620,19 +1640,20 @@ class LMSOpticalDiskBaseWidget:
         warm_started = False
         if (
             cached_fit is None
-            and self._es_step_fit_last is not None
-            and self._es_step_fit_last.get("state_signature") == state_signature
-            and np.isfinite(float(self._es_step_fit_last.get("tau_step", requested_step)))
+            and self._flow_step_fit_last is not None
+            and self._flow_step_fit_last.get("state_signature") == state_signature
+            and self._flow_step_fit_last.get("time_mode") == time_mode
+            and np.isfinite(float(self._flow_step_fit_last.get("step", initial_step)))
         ):
-            last_step = float(self._es_step_fit_last["tau_step"])
-            last_frames = int(self._es_step_fit_last.get("frames", frames))
+            last_step = float(self._flow_step_fit_last["step"])
+            last_frames = int(self._flow_step_fit_last.get("frames", frames))
             if frames > 1 and last_frames > 1:
                 initial_step = last_step * float(last_frames - 1) / float(frames - 1)
             else:
                 initial_step = last_step
             warm_started = True
         elif cached_fit is not None:
-            initial_step = float(cached_fit["tau_step"])
+            initial_step = float(cached_fit["step"])
             warm_started = True
 
         orbit, tau, physical, crossed, final_radius = integrate_for_step(initial_step)
@@ -1650,25 +1671,25 @@ class LMSOpticalDiskBaseWidget:
                         break
                 if not upper_found:
                     best = lower
-                    self._orbit_es_boundary_fit = False
-                    self._orbit_es_tau_step = lower_step
+                    self._orbit_boundary_fit = False
+                    self._orbit_fitted_step = lower_step
                     self._orbit_parameter_time = best[1]
                     self._orbit_physical_time = best[2]
-                    self._remember_es_step_fit(cache_key, tau_step=lower_step, final_radius=final_radius, boundary_fit=False)
-                    self._orbit_es_fit_calls = fit_calls
-                    self._orbit_es_fit_point_steps = fit_point_steps
-                    self._orbit_es_fit_cache_hit = False
+                    self._remember_flow_step_fit(cache_key, step=lower_step, final_radius=final_radius, boundary_fit=False)
+                    self._orbit_fit_calls = fit_calls
+                    self._orbit_fit_point_steps = fit_point_steps
+                    self._orbit_fit_cache_hit = False
                     return best[0]
             else:
                 best = lower
-                self._orbit_es_boundary_fit = True
-                self._orbit_es_tau_step = lower_step
+                self._orbit_boundary_fit = True
+                self._orbit_fitted_step = lower_step
                 self._orbit_parameter_time = best[1]
                 self._orbit_physical_time = best[2]
-                self._remember_es_step_fit(cache_key, tau_step=lower_step, final_radius=final_radius, boundary_fit=True)
-                self._orbit_es_fit_calls = fit_calls
-                self._orbit_es_fit_point_steps = fit_point_steps
-                self._orbit_es_fit_cache_hit = False
+                self._remember_flow_step_fit(cache_key, step=lower_step, final_radius=final_radius, boundary_fit=True)
+                self._orbit_fit_calls = fit_calls
+                self._orbit_fit_point_steps = fit_point_steps
+                self._orbit_fit_cache_hit = False
                 return best[0]
         else:
             upper_step = initial_step
@@ -1681,19 +1702,20 @@ class LMSOpticalDiskBaseWidget:
                     lower = (lo_orbit, lo_tau, lo_physical)
                     break
             if lower is None:
-                self._orbit_es_boundary_fit = False
-                self._orbit_es_tau_step = float(tau[1] - tau[0]) if tau.shape[0] > 1 else requested_step
+                fallback_step = float(tau[1] - tau[0]) if tau.shape[0] > 1 else initial_step
+                self._orbit_boundary_fit = False
+                self._orbit_fitted_step = fallback_step
                 self._orbit_parameter_time = tau
                 self._orbit_physical_time = physical
-                self._remember_es_step_fit(
+                self._remember_flow_step_fit(
                     cache_key,
-                    tau_step=float(tau[1] - tau[0]) if tau.shape[0] > 1 else requested_step,
+                    step=fallback_step,
                     final_radius=final_radius,
                     boundary_fit=False,
                 )
-                self._orbit_es_fit_calls = fit_calls
-                self._orbit_es_fit_point_steps = fit_point_steps
-                self._orbit_es_fit_cache_hit = False
+                self._orbit_fit_calls = fit_calls
+                self._orbit_fit_point_steps = fit_point_steps
+                self._orbit_fit_cache_hit = False
                 return orbit
 
         assert lower is not None
@@ -1711,18 +1733,18 @@ class LMSOpticalDiskBaseWidget:
                     break
         self._orbit_parameter_time = best[1]
         self._orbit_physical_time = best[2]
-        self._orbit_es_tau_step = float(best[1][1] - best[1][0]) if best[1].shape[0] > 1 else requested_step
-        self._orbit_es_boundary_fit = True
+        self._orbit_fitted_step = float(best[1][1] - best[1][0]) if best[1].shape[0] > 1 else initial_step
+        self._orbit_boundary_fit = True
         final_radius = float(np.linalg.norm(best[0][-1])) if len(best[0]) else float("nan")
-        self._remember_es_step_fit(
+        self._remember_flow_step_fit(
             cache_key,
-            tau_step=self._orbit_es_tau_step,
+            step=self._orbit_fitted_step,
             final_radius=final_radius,
             boundary_fit=True,
         )
-        self._orbit_es_fit_calls = fit_calls
-        self._orbit_es_fit_point_steps = fit_point_steps
-        self._orbit_es_fit_cache_hit = False
+        self._orbit_fit_calls = fit_calls
+        self._orbit_fit_point_steps = fit_point_steps
+        self._orbit_fit_cache_hit = False
         return best[0]
 
     def _build_preview_frame(self, message: str) -> None:
@@ -1735,6 +1757,7 @@ class LMSOpticalDiskBaseWidget:
         # animation payload and are populated only by Precompute flow.
         self._frame_payloads = self._build_frame_payloads(self._orbit, include_contours=False)
         self._frame_index = 0
+        self._apply_static_payload_to_figure()
         self._apply_cached_frame(0)
         self._mark_cache_stale(message)
 
@@ -1756,6 +1779,7 @@ class LMSOpticalDiskBaseWidget:
         self._orbit_r = np.linalg.norm(self._orbit, axis=1)
         self._frame_payloads = self._build_frame_payloads(self._orbit, include_contours=bool(self.show_contours.value))
         self._frame_index = 0
+        self._apply_static_payload_to_figure()
         self._apply_cached_frame(0)
         self._mark_cache_ready(f"Flow cache ready: {len(self._orbit)} frames.")
 
@@ -1765,26 +1789,44 @@ class LMSOpticalDiskBaseWidget:
         idx = int(np.clip(self._frame_index, 0, len(self._orbit) - 1))
         return self._orbit[idx].copy()
 
-    def _sync_frame_controls(self, idx: int) -> None:
+    def _sync_frame_controls(self, idx: int, *, source: Any | None = None) -> None:
+        """Synchronize the frame UI controls with `idx`.
+
+        `source` is the widget that triggered the update, if any. We skip
+        writing the trait that originated the change to avoid redundant
+        front-end traffic during high-frequency playback (Play already
+        owns its own value, frame_slider owns its own value, etc.).
+        """
         count = int(len(self._orbit)) if self._orbit is not None else 0
         max_idx = max(0, count - 1)
         frame = int(np.clip(int(idx), 0, max_idx)) if count else 0
         self._frame_index = frame
+        slider_disabled = (not self._cache_valid) or count <= 1
         self._updating = True
         try:
-            self.frame_slider.max = max_idx
-            self.frame_slider.disabled = (not self._cache_valid) or count <= 1
-            self.frame_slider.value = frame
-            self.play.max = max_idx
-            self.play.disabled = (not self._cache_valid) or count <= 1
-            self.play.value = frame
-            self.btn_step.disabled = (not self._cache_valid) or count <= 1
-            self.frame_counter.value = f"frame {frame + 1 if count else 0} / {count}"
+            if int(self.frame_slider.max) != max_idx:
+                self.frame_slider.max = max_idx
+            if bool(self.frame_slider.disabled) != slider_disabled:
+                self.frame_slider.disabled = slider_disabled
+            if source is not self.frame_slider and int(self.frame_slider.value) != frame:
+                self.frame_slider.value = frame
+            if int(self.play.max) != max_idx:
+                self.play.max = max_idx
+            if bool(self.play.disabled) != slider_disabled:
+                self.play.disabled = slider_disabled
+            if source is not self.play and int(self.play.value) != frame:
+                self.play.value = frame
+            step_disabled = (not self._cache_valid) or count <= 1
+            if bool(self.btn_step.disabled) != step_disabled:
+                self.btn_step.disabled = step_disabled
+            counter_text = f"frame {frame + 1 if count else 0} / {count}"
+            if self.frame_counter.value != counter_text:
+                self.frame_counter.value = counter_text
         finally:
             self._updating = False
 
-    def _set_frame_index(self, idx: int) -> None:
-        self._sync_frame_controls(idx)
+    def _set_frame_index(self, idx: int, *, source: Any | None = None) -> None:
+        self._sync_frame_controls(idx, source=source)
         self._apply_cached_frame(self._frame_index)
 
     def _build_frame_payloads(self, orbit: np.ndarray, *, include_contours: bool) -> list[dict[str, Any]]:
@@ -1941,12 +1983,34 @@ class LMSOpticalDiskBaseWidget:
         self._frame_payloads = self._build_frame_payloads(self._orbit, include_contours=bool(self.show_contours.value))
 
     def _apply_cached_frame(self, frame_idx: int) -> None:
+        """Render the per-frame and overlay updates for `frame_idx`.
+
+        Static traces and layout are applied once by
+        `_apply_static_payload_to_figure()` after a precompute. This
+        callback path therefore does only the irreducible per-frame work
+        plus the optional lightweight selected-anchor overlay.
+        """
         if not self._frame_payloads:
             return
         payload = self._frame_payloads[int(np.clip(int(frame_idx), 0, len(self._frame_payloads) - 1))]
-        selected = self._selected_payload_geometry(payload)
-        self._apply_payload_to_figure(payload, selected)
+        selected = self._selected_payload_geometry(payload) if self.select_pi else {}
+        with self.fig.batch_update():
+            self._apply_dynamic_payload_to_figure(payload)
+            if self.select_pi:
+                self._apply_overlay_payload_to_figure(payload, selected)
         self.stats_html.value = _sanitize_plot_text(payload["stats"])
+
+    def _apply_selection_only(self) -> None:
+        """Refresh the selected-anchor overlay for the current frame.
+
+        Used by `selected i` callback so the small geometry panel updates
+        without rerunning any per-frame trace work.
+        """
+        if not self.select_pi or not self._frame_payloads:
+            return
+        payload = self._frame_payloads[int(np.clip(self._frame_index, 0, len(self._frame_payloads) - 1))]
+        selected = self._selected_payload_geometry(payload)
+        self._apply_overlay_payload_to_figure(payload, selected)
 
     def _selected_payload_geometry(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Return selected-anchor reflection geometry for the current payload.
@@ -1958,7 +2022,7 @@ class LMSOpticalDiskBaseWidget:
         P = np.asarray(payload["P"], dtype=np.float64)
         Q = np.asarray(payload["Q"], dtype=np.float64)
         w_np = np.asarray(payload["w"], dtype=np.float64)
-        idx = int(np.clip(int(self.selected.value), 0, P.shape[0] - 1))
+        idx = int(np.clip(self._selected_index, 0, P.shape[0] - 1))
         p = P[idx]
         q = Q[idx]
         n = p - w_np
@@ -1973,52 +2037,115 @@ class LMSOpticalDiskBaseWidget:
             "w": w_np,
         }
 
-    def _apply_payload_to_figure(self, payload: dict[str, Any], selected: dict[str, Any]) -> None:
-        """Render one cached payload.
+    def _apply_static_payload_to_figure(self) -> None:
+        """Apply traces and layout that do not change per frame.
 
-        Subclasses that want a different visualization should override this
-        method and can still reuse the precomputed payload fields from the
-        base class.
+        Called once after `_build_frame_payloads()` so playback never
+        mutates the orbit path, the anchor cloud, or contour visibility.
+        Subclasses extend this hook for chart-wide ranges, full-path
+        traces, or any other once-per-cache layout work.
         """
+        if not self._frame_payloads:
+            return
+        payload0 = self._frame_payloads[0]
+        with self.fig.batch_update():
+            if "orbit_path" in self.tr:
+                self.fig.data[self.tr["orbit_path"]].x = self._orbit[:, 0].tolist()
+                self.fig.data[self.tr["orbit_path"]].y = self._orbit[:, 1].tolist()
+            if "anchors" in self.tr:
+                self.fig.data[self.tr["anchors"]].x = _plotly_values(payload0["anchors_x"])
+                self.fig.data[self.tr["anchors"]].y = _plotly_values(payload0["anchors_y"])
+            self._apply_contour_visibility_to_figure()
+
+    def _apply_contour_visibility_to_figure(self) -> None:
+        """Cheap UI-only refresh for the level-set trace visibility."""
+        if "ref_phase" not in self.tr:
+            return
+        show = bool(self.show_contours.value)
+        with self.fig.batch_update():
+            self.fig.data[self.tr["ref_phase"]].visible = show
+            self.fig.data[self.tr["ref_phase"]].opacity = 0.82 if show else 0.0
+
+    def _apply_dynamic_payload_to_figure(self, payload: dict[str, Any]) -> None:
+        """Apply traces that change per frame and do not depend on UI selection.
+
+        Subclasses extend this hook with their own per-frame trace updates
+        but must not perform layout updates here. Layout writes belong in
+        `_apply_static_payload_to_figure`.
+        """
+        with self.fig.batch_update():
+            if "w" in self.tr:
+                w_np = np.asarray(payload["w"], dtype=np.float64).reshape(2)
+                self.fig.data[self.tr["w"]].x = [float(w_np[0])]
+                self.fig.data[self.tr["w"]].y = [float(w_np[1])]
+            if "R_arrow" in self.tr:
+                self.fig.data[self.tr["R_arrow"]].x = _plotly_values(payload["R_arrow_x"])
+                self.fig.data[self.tr["R_arrow"]].y = _plotly_values(payload["R_arrow_y"])
+            if "vel_arrow" in self.tr:
+                self.fig.data[self.tr["vel_arrow"]].x = _plotly_values(payload["vel_arrow_x"])
+                self.fig.data[self.tr["vel_arrow"]].y = _plotly_values(payload["vel_arrow_y"])
+            if "ref_phase" in self.tr:
+                self.fig.data[self.tr["ref_phase"]].x = _plotly_values(payload["ref_phase_x"])
+                self.fig.data[self.tr["ref_phase"]].y = _plotly_values(payload["ref_phase_y"])
+            if "reflected" in self.tr:
+                self.fig.data[self.tr["reflected"]].x = _plotly_values(payload["reflected_x"])
+                self.fig.data[self.tr["reflected"]].y = _plotly_values(payload["reflected_y"])
+            if "ref_w" in self.tr:
+                self.fig.data[self.tr["ref_w"]].x = _plotly_values(payload["ref_w_x"])
+                self.fig.data[self.tr["ref_w"]].y = _plotly_values(payload["ref_w_y"])
+            if "R_circle" in self.tr:
+                self.fig.data[self.tr["R_circle"]].x = _plotly_values(payload["R_circle_x"])
+                self.fig.data[self.tr["R_circle"]].y = _plotly_values(payload["R_circle_y"])
+            if "ellipse" in self.tr:
+                self.fig.data[self.tr["ellipse"]].x = _plotly_values(payload["ellipse_x"])
+                self.fig.data[self.tr["ellipse"]].y = _plotly_values(payload["ellipse_y"])
+            if "polygon" in self.tr:
+                self.fig.data[self.tr["polygon"]].x = _plotly_values(payload["polygon_x"])
+                self.fig.data[self.tr["polygon"]].y = _plotly_values(payload["polygon_y"])
+
+    def _apply_overlay_payload_to_figure(self, payload: dict[str, Any], selected: dict[str, Any]) -> None:
+        """Apply traces tied to the selected anchor (and current frame).
+
+        These depend on both the selected index and the active frame's
+        `w_t`. They are intentionally split out so `selected i` changes can
+        refresh just the overlay without re-running per-frame trace work.
+        """
+        if not self.select_pi:
+            return
         p = np.asarray(selected["p"], dtype=np.float64)
         q = np.asarray(selected["q"], dtype=np.float64)
         w_np = np.asarray(selected["w"], dtype=np.float64)
         tangent = np.asarray(selected["tangent"], dtype=np.float64)
         with self.fig.batch_update():
-            self.fig.data[self.tr["orbit_path"]].x = self._orbit[:, 0].tolist()
-            self.fig.data[self.tr["orbit_path"]].y = self._orbit[:, 1].tolist()
-            self.fig.data[self.tr["anchors"]].x = _plotly_values(payload["anchors_x"])
-            self.fig.data[self.tr["anchors"]].y = _plotly_values(payload["anchors_y"])
-            self.fig.data[self.tr["selected_anchor"]].x = [float(p[0])]
-            self.fig.data[self.tr["selected_anchor"]].y = [float(p[1])]
-            self.fig.data[self.tr["w"]].x = [float(w_np[0])]
-            self.fig.data[self.tr["w"]].y = [float(w_np[1])]
-            self.fig.data[self.tr["R_arrow"]].x = _plotly_values(payload["R_arrow_x"])
-            self.fig.data[self.tr["R_arrow"]].y = _plotly_values(payload["R_arrow_y"])
-            self.fig.data[self.tr["vel_arrow"]].x = _plotly_values(payload["vel_arrow_x"])
-            self.fig.data[self.tr["vel_arrow"]].y = _plotly_values(payload["vel_arrow_y"])
-            self.fig.data[self.tr["ref_phase"]].x = _plotly_values(payload["ref_phase_x"])
-            self.fig.data[self.tr["ref_phase"]].y = _plotly_values(payload["ref_phase_y"])
-            self.fig.data[self.tr["ref_phase"]].visible = bool(self.show_contours.value)
-            self.fig.data[self.tr["ref_phase"]].opacity = 0.82 if bool(self.show_contours.value) else 0.0
-            self.fig.data[self.tr["reflected"]].x = _plotly_values(payload["reflected_x"])
-            self.fig.data[self.tr["reflected"]].y = _plotly_values(payload["reflected_y"])
-            self.fig.data[self.tr["ref_w"]].x = _plotly_values(payload["ref_w_x"])
-            self.fig.data[self.tr["ref_w"]].y = _plotly_values(payload["ref_w_y"])
-            self.fig.data[self.tr["R_circle"]].x = _plotly_values(payload["R_circle_x"])
-            self.fig.data[self.tr["R_circle"]].y = _plotly_values(payload["R_circle_y"])
-            self.fig.data[self.tr["ellipse"]].x = _plotly_values(payload["ellipse_x"])
-            self.fig.data[self.tr["ellipse"]].y = _plotly_values(payload["ellipse_y"])
-            self.fig.data[self.tr["polygon"]].x = _plotly_values(payload["polygon_x"])
-            self.fig.data[self.tr["polygon"]].y = _plotly_values(payload["polygon_y"])
-            self.fig.data[self.tr["geom_incoming"]].x = [0.0, float(p[0])]
-            self.fig.data[self.tr["geom_incoming"]].y = [0.0, float(p[1])]
-            self.fig.data[self.tr["geom_reflected"]].x = [0.0, float(q[0])]
-            self.fig.data[self.tr["geom_reflected"]].y = [0.0, float(q[1])]
-            self.fig.data[self.tr["geom_normal"]].x = [float(w_np[0]), float(p[0])]
-            self.fig.data[self.tr["geom_normal"]].y = [float(w_np[1]), float(p[1])]
-            self.fig.data[self.tr["geom_mirror"]].x = [float(-1.08 * tangent[0]), float(1.08 * tangent[0])]
-            self.fig.data[self.tr["geom_mirror"]].y = [float(-1.08 * tangent[1]), float(1.08 * tangent[1])]
+            if "selected_anchor" in self.tr:
+                self.fig.data[self.tr["selected_anchor"]].x = [float(p[0])]
+                self.fig.data[self.tr["selected_anchor"]].y = [float(p[1])]
+            if "geom_incoming" in self.tr:
+                self.fig.data[self.tr["geom_incoming"]].x = [0.0, float(p[0])]
+                self.fig.data[self.tr["geom_incoming"]].y = [0.0, float(p[1])]
+            if "geom_reflected" in self.tr:
+                self.fig.data[self.tr["geom_reflected"]].x = [0.0, float(q[0])]
+                self.fig.data[self.tr["geom_reflected"]].y = [0.0, float(q[1])]
+            if "geom_normal" in self.tr:
+                self.fig.data[self.tr["geom_normal"]].x = [float(w_np[0]), float(p[0])]
+                self.fig.data[self.tr["geom_normal"]].y = [float(w_np[1]), float(p[1])]
+            if "geom_mirror" in self.tr:
+                self.fig.data[self.tr["geom_mirror"]].x = [float(-1.08 * tangent[0]), float(1.08 * tangent[0])]
+                self.fig.data[self.tr["geom_mirror"]].y = [float(-1.08 * tangent[1]), float(1.08 * tangent[1])]
+
+    def _apply_payload_to_figure(self, payload: dict[str, Any], selected: dict[str, Any]) -> None:
+        """Legacy combined render entry point.
+
+        New code should override `_apply_static_payload_to_figure`,
+        `_apply_dynamic_payload_to_figure`, and
+        `_apply_overlay_payload_to_figure` instead. This composer remains
+        for any legacy notebook caller of `_apply_payload_to_figure`.
+        """
+        with self.fig.batch_update():
+            self._apply_static_payload_to_figure()
+            self._apply_dynamic_payload_to_figure(payload)
+            if self.select_pi:
+                self._apply_overlay_payload_to_figure(payload, selected)
 
     def _on_control_change(self, change: dict[str, Any]) -> None:
         if self._updating:
@@ -2027,12 +2154,13 @@ class LMSOpticalDiskBaseWidget:
         if owner in (self.preset_dropdown, self.n_slider, self.init_radius_slider):
             self._resample_anchors_and_precompute()
             return
-        if owner is self.selected:
+        if self.select_pi and owner is self.selected:
+            self._selected_index = int(self.selected.value)
             self._sync_anchor_controls()
-            self._apply_cached_frame(self._frame_index)
+            self._apply_selection_only()
             return
-        if owner is self.anchor_theta:
-            idx = int(self.selected.value)
+        if self.select_pi and owner is self.anchor_theta:
+            idx = int(self._selected_index)
             self.raw_points[idx] = _angle2(float(self.anchor_theta.value))
             self.points = self._canonicalized_points(self.raw_points)
             self._sync_anchor_controls()
@@ -2040,17 +2168,18 @@ class LMSOpticalDiskBaseWidget:
             return
         if owner is self.frame_slider:
             if self._cache_valid:
-                self._set_frame_index(int(self.frame_slider.value))
+                self._set_frame_index(int(self.frame_slider.value), source=self.frame_slider)
             else:
                 self._sync_frame_controls(0)
             return
-        if owner in (self.step_size, self.max_frames):
-            self._build_preview_frame("Flow parameter changed. Precompute flow before playback.")
+        if owner in (self.target_radius, self.max_frames):
+            self._build_preview_frame("Flow target changed. Precompute flow before playback.")
             return
         if owner is self.show_contours:
             if bool(self.show_contours.value) and self._frame_payloads and not self._frame_payloads[0].get("ref_phase_x"):
                 self._mark_cache_stale("Contours were not cached. Precompute flow to populate level sets.")
-            self._apply_cached_frame(self._frame_index)
+                return
+            self._apply_contour_visibility_to_figure()
             return
         self._apply_cached_frame(self._frame_index)
 
@@ -2064,12 +2193,16 @@ class LMSOpticalDiskBaseWidget:
         )
         self.weights = np.full((self.raw_points.shape[0],), 1.0 / float(self.raw_points.shape[0]), dtype=np.float64)
         self.points = self._canonicalized_points(self.raw_points)
-        self._updating = True
-        try:
-            self.selected.max = max(0, self.points.shape[0] - 1)
-            self.selected.value = min(int(self.selected.value), int(self.selected.max))
-        finally:
-            self._updating = False
+        if self.select_pi:
+            self._updating = True
+            try:
+                self.selected.max = max(0, self.points.shape[0] - 1)
+                self.selected.value = min(int(self.selected.value), int(self.selected.max))
+                self._selected_index = int(self.selected.value)
+            finally:
+                self._updating = False
+        else:
+            self._selected_index = min(int(self._selected_index), max(0, self.points.shape[0] - 1))
         self._sync_anchor_controls()
         self._rebuild_orbit()
 
@@ -2090,7 +2223,7 @@ class LMSOpticalDiskBaseWidget:
         if not self._cache_valid:
             self._sync_frame_controls(0)
             return
-        self._set_frame_index(int(change.get("new", 0)))
+        self._set_frame_index(int(change.get("new", 0)), source=self.play)
 
     def _on_reset(self, _btn: Any) -> None:
         self._set_frame_index(0)
@@ -2134,7 +2267,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
 
     The top row is the standard optical disk view.  The bottom row replaces the
     base diagnostic panels with two moving charts of the first subplot's data:
-    the left chart pushes points to at least unit distance from w_t, and the
+    the left chart applies a unit radial distance chart around w_t, and the
     right chart maps x -> (x+w_t)/|x+w_t|^2.
     """
 
@@ -2152,7 +2285,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
     def _layout_header_html(self) -> str:
         return (
             "<b>LMS optical reflected-ray explorer + dynamic w-relative charts</b><br>"
-            "Bottom left: one-sided unit-distance normalization around $w_t$. "
+            "Bottom left: unit radial distance chart around $w_t$. "
             "Bottom right: pointwise spherical inversion $(x+w_t)/|x+w_t|^2$."
         )
 
@@ -2163,7 +2296,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
             subplot_titles=(
                 r"$p_i^0=M_{-w_\ast}(x_i^0),\quad w(t)$",
                 r"$r_i(w)=H_{p_i^0-w}(p_i^0),\quad S_{r(w)}(u)=\mathrm{const}$",
-                r"$N_{w_t}(x):\ |N_{w_t}(x)-w_t|\ge 1$",
+                r"$U_{w_t}(x):\ |U_{w_t}(x)-w_t|=1$",
                 r"$I_{-w_t}(x)=(x+w_t)/|x+w_t|^2$",
             ),
             horizontal_spacing=0.08,
@@ -2184,7 +2317,8 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(20,20,20,0.35)", width=2), name=r"$w(t)$", hoverinfo="skip"), "orbit_path", 1, 1)
         add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=11, color="white", line=dict(color="black", width=2)), name=r"$\sum_i a_i p_i^0=0$"), "core_balance", 1, 1)
         add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#244C9A", opacity=0.72), name=r"$p_i^0$"), "anchors", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name=r"$\mathrm{selected}\ p_i^0$"), "selected_anchor", 1, 1)
+        if self.select_pi:
+            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name=r"$\mathrm{selected}\ p_i^0$"), "selected_anchor", 1, 1)
         add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black"), name=r"$w$"), "w", 1, 1)
         add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 9], color="#D72638"), name=r"$R_{p^0}(w)=\sum_i a_i r_i(w)$"), "R_arrow", 1, 1)
         add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#188038", width=3, dash="dash"), marker=dict(size=[0, 7], color="#188038"), name=r"$\dot w$"), "vel_arrow", 1, 1)
@@ -2196,7 +2330,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name=r"$R_{p^0}(w)$"), "R_circle", 1, 2)
         add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name=r"$\mathrm{Cov}(r_i(w))$", hoverinfo="skip"), "ellipse", 1, 2)
 
-        self._add_dynamic_inversion_chart_traces("inv_w", 2, 1, transform_name="N")
+        self._add_dynamic_inversion_chart_traces("inv_w", 2, 1, transform_name="U")
         self._add_dynamic_inversion_chart_traces("inv_neg_w", 2, 2, center_name=r"$c=-w_t$")
 
         fig.update_layout(
@@ -2217,8 +2351,8 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         for row, col in ((1, 1), (1, 2)):
             fig.update_xaxes(title_text=r"$e_1$", row=row, col=col)
             fig.update_yaxes(title_text=r"$e_2$", row=row, col=col)
-        fig.update_xaxes(title_text=r"$N_{w_t}(e_1)$", row=2, col=1)
-        fig.update_yaxes(title_text=r"$N_{w_t}(e_2)$", row=2, col=1)
+        fig.update_xaxes(title_text=r"$U_{w_t}(e_1)$", row=2, col=1)
+        fig.update_yaxes(title_text=r"$U_{w_t}(e_2)$", row=2, col=1)
         fig.update_xaxes(title_text=r"$I_{-w_t}(e_1)$", row=2, col=2)
         fig.update_yaxes(title_text=r"$I_{-w_t}(e_2)$", row=2, col=2)
         _sanitize_figure_text(fig)
@@ -2236,7 +2370,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         def add(trace: Any, suffix: str) -> None:
             self._add_trace_to_subplot(self.fig, trace, f"{prefix}_{suffix}", row, col)
 
-        prefix_label = "N_c" if transform_name == "N" else "I_c"
+        prefix_label = f"{transform_name}_c"
 
         add(
             go.Scatter(
@@ -2281,16 +2415,17 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
             ),
             "anchors",
         )
-        add(
-            go.Scatter(
-                x=[],
-                y=[],
-                mode="markers",
-                marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)),
-                name=rf"${prefix_label}(\mathrm{{selected}}\ p_i^0)$",
-            ),
-            "selected_anchor",
-        )
+        if self.select_pi:
+            add(
+                go.Scatter(
+                    x=[],
+                    y=[],
+                    mode="markers",
+                    marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)),
+                    name=rf"${prefix_label}(\mathrm{{selected}}\ p_i^0)$",
+                ),
+                "selected_anchor",
+            )
         _ = center_name
         add(
             go.Scatter(
@@ -2344,7 +2479,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         line_t = np.linspace(0.0, 1.0, 36, dtype=np.float64)[:, None]
         r_curve = w_np[None, :] + line_t * (0.48 * R)[None, :]
         v_curve = w_np[None, :] + line_t * (1.6 * velocity)[None, :]
-        transform = _one_sided_unit_distance_chart_np if prefix == "inv_w" else _spherical_inversion_chart_np
+        transform = _unit_distance_chart_np if prefix == "inv_w" else _spherical_inversion_chart_np
         r_line = transform(r_curve, c)
         v_line = transform(v_curve, c)
         chart_disk = transform(circle, c)
@@ -2420,40 +2555,49 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         payload["stats"] += f"; dynamic inversion centers $|w|={float(np.linalg.norm(w_np)):.6f}$"
         return payload
 
-    def _apply_payload_to_figure(self, payload: dict[str, Any], selected: dict[str, Any]) -> None:
-        p = np.asarray(selected["p"], dtype=np.float64)
-        w_np = np.asarray(selected["w"], dtype=np.float64)
-        selected_anchor = np.asarray(selected["p"], dtype=np.float64).reshape(2)
-        with self.fig.batch_update():
-            self.fig.data[self.tr["orbit_path"]].x = self._orbit[:, 0].tolist()
-            self.fig.data[self.tr["orbit_path"]].y = self._orbit[:, 1].tolist()
-            self.fig.data[self.tr["anchors"]].x = _plotly_values(payload["anchors_x"])
-            self.fig.data[self.tr["anchors"]].y = _plotly_values(payload["anchors_y"])
-            self.fig.data[self.tr["selected_anchor"]].x = [float(p[0])]
-            self.fig.data[self.tr["selected_anchor"]].y = [float(p[1])]
-            self.fig.data[self.tr["w"]].x = [float(w_np[0])]
-            self.fig.data[self.tr["w"]].y = [float(w_np[1])]
-            self.fig.data[self.tr["R_arrow"]].x = _plotly_values(payload["R_arrow_x"])
-            self.fig.data[self.tr["R_arrow"]].y = _plotly_values(payload["R_arrow_y"])
-            self.fig.data[self.tr["vel_arrow"]].x = _plotly_values(payload["vel_arrow_x"])
-            self.fig.data[self.tr["vel_arrow"]].y = _plotly_values(payload["vel_arrow_y"])
-            self.fig.data[self.tr["ref_phase"]].x = _plotly_values(payload["ref_phase_x"])
-            self.fig.data[self.tr["ref_phase"]].y = _plotly_values(payload["ref_phase_y"])
-            self.fig.data[self.tr["ref_phase"]].visible = bool(self.show_contours.value)
-            self.fig.data[self.tr["ref_phase"]].opacity = 0.82 if bool(self.show_contours.value) else 0.0
-            self.fig.data[self.tr["reflected"]].x = _plotly_values(payload["reflected_x"])
-            self.fig.data[self.tr["reflected"]].y = _plotly_values(payload["reflected_y"])
-            self.fig.data[self.tr["ref_w"]].x = _plotly_values(payload["ref_w_x"])
-            self.fig.data[self.tr["ref_w"]].y = _plotly_values(payload["ref_w_y"])
-            self.fig.data[self.tr["R_circle"]].x = _plotly_values(payload["R_circle_x"])
-            self.fig.data[self.tr["R_circle"]].y = _plotly_values(payload["R_circle_y"])
-            self.fig.data[self.tr["ellipse"]].x = _plotly_values(payload["ellipse_x"])
-            self.fig.data[self.tr["ellipse"]].y = _plotly_values(payload["ellipse_y"])
+    def _finalize_frame_payloads(
+        self,
+        payloads: list[dict[str, Any]],
+        *,
+        frame_arrays: dict[str, np.ndarray],
+    ) -> list[dict[str, Any]]:
+        """Replace per-frame chart ranges with a single global range per prefix.
 
+        With static layout we want a stable view as the orbit advances, and
+        we also want to avoid `update_xaxes`/`update_yaxes` calls on every
+        playback tick. The union of all per-frame ranges gives a fixed
+        chart window that contains every cached frame's geometry.
+        """
+        payloads = super()._finalize_frame_payloads(payloads, frame_arrays=frame_arrays)
+        if not payloads:
+            return payloads
+        for prefix in ("inv_w", "inv_neg_w"):
+            x_lo = min(float(p[f"{prefix}_x_range"][0]) for p in payloads)
+            x_hi = max(float(p[f"{prefix}_x_range"][1]) for p in payloads)
+            y_lo = min(float(p[f"{prefix}_y_range"][0]) for p in payloads)
+            y_hi = max(float(p[f"{prefix}_y_range"][1]) for p in payloads)
+            global_x = [x_lo, x_hi]
+            global_y = [y_lo, y_hi]
+            for p in payloads:
+                p[f"{prefix}_x_range"] = global_x
+                p[f"{prefix}_y_range"] = global_y
+        return payloads
+
+    def _apply_static_payload_to_figure(self) -> None:
+        super()._apply_static_payload_to_figure()
+        if not self._frame_payloads:
+            return
+        payload0 = self._frame_payloads[0]
+        with self.fig.batch_update():
             for prefix in ("inv_w", "inv_neg_w"):
-                c = np.asarray(payload[f"{prefix}_center_source"], dtype=np.float64).reshape(2)
-                transform = _one_sided_unit_distance_chart_np if prefix == "inv_w" else _spherical_inversion_chart_np
-                selected_chart = transform(selected_anchor.reshape(1, 2), c)[0]
+                row, col = (2, 1) if prefix == "inv_w" else (2, 2)
+                self.fig.update_xaxes(range=payload0[f"{prefix}_x_range"], row=row, col=col)
+                self.fig.update_yaxes(range=payload0[f"{prefix}_y_range"], row=row, col=col)
+
+    def _apply_dynamic_payload_to_figure(self, payload: dict[str, Any]) -> None:
+        super()._apply_dynamic_payload_to_figure(payload)
+        with self.fig.batch_update():
+            for prefix in ("inv_w", "inv_neg_w"):
                 self.fig.data[self.tr[f"{prefix}_disk"]].x = _plotly_values(payload[f"{prefix}_disk_x"])
                 self.fig.data[self.tr[f"{prefix}_disk"]].y = _plotly_values(payload[f"{prefix}_disk_y"])
                 self.fig.data[self.tr[f"{prefix}_orbit_path"]].x = _plotly_values(payload[f"{prefix}_orbit_path_x"])
@@ -2462,17 +2606,26 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 self.fig.data[self.tr[f"{prefix}_core_balance"]].y = _plotly_values(payload[f"{prefix}_core_balance_y"])
                 self.fig.data[self.tr[f"{prefix}_anchors"]].x = _plotly_values(payload[f"{prefix}_anchors_x"])
                 self.fig.data[self.tr[f"{prefix}_anchors"]].y = _plotly_values(payload[f"{prefix}_anchors_y"])
-                self.fig.data[self.tr[f"{prefix}_selected_anchor"]].x = [float(selected_chart[0])]
-                self.fig.data[self.tr[f"{prefix}_selected_anchor"]].y = [float(selected_chart[1])]
                 self.fig.data[self.tr[f"{prefix}_w"]].x = _plotly_values(payload[f"{prefix}_w_x"])
                 self.fig.data[self.tr[f"{prefix}_w"]].y = _plotly_values(payload[f"{prefix}_w_y"])
                 self.fig.data[self.tr[f"{prefix}_R_arrow"]].x = _plotly_values(payload[f"{prefix}_R_arrow_x"])
                 self.fig.data[self.tr[f"{prefix}_R_arrow"]].y = _plotly_values(payload[f"{prefix}_R_arrow_y"])
                 self.fig.data[self.tr[f"{prefix}_vel_arrow"]].x = _plotly_values(payload[f"{prefix}_vel_arrow_x"])
                 self.fig.data[self.tr[f"{prefix}_vel_arrow"]].y = _plotly_values(payload[f"{prefix}_vel_arrow_y"])
-                row, col = (2, 1) if prefix == "inv_w" else (2, 2)
-                self.fig.update_xaxes(range=payload[f"{prefix}_x_range"], row=row, col=col)
-                self.fig.update_yaxes(range=payload[f"{prefix}_y_range"], row=row, col=col)
+
+    def _apply_overlay_payload_to_figure(self, payload: dict[str, Any], selected: dict[str, Any]) -> None:
+        if not self.select_pi:
+            return
+        super()._apply_overlay_payload_to_figure(payload, selected)
+        idx = int(selected.get("index", self._selected_index))
+        with self.fig.batch_update():
+            for prefix in ("inv_w", "inv_neg_w"):
+                xs = payload[f"{prefix}_anchors_x"]
+                ys = payload[f"{prefix}_anchors_y"]
+                bounded = int(np.clip(idx, 0, len(xs) - 1)) if len(xs) else 0
+                if len(xs) and f"{prefix}_selected_anchor" in self.tr:
+                    self.fig.data[self.tr[f"{prefix}_selected_anchor"]].x = [float(xs[bounded])]
+                    self.fig.data[self.tr[f"{prefix}_selected_anchor"]].y = [float(ys[bounded])]
 
 
 class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
@@ -2521,6 +2674,11 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         if self._updating or change.get("name") != "value":
             return
         self._sync_cayley_chart_label()
+        # Switching prefix changes the static Cayley layer (full path,
+        # axis trace, axis titles, ranges, weighted boundary). Re-apply
+        # static and then refresh the current frame's dynamic Cayley
+        # traces.
+        self._apply_static_payload_to_figure()
         self._apply_cached_frame(self._frame_index)
 
     def _sync_cayley_chart_label(self) -> None:
@@ -2734,9 +2892,12 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
             )
         return payloads
 
-    def _apply_payload_to_figure(self, payload: dict[str, Any], selected: dict[str, Any]) -> None:
-        super()._apply_payload_to_figure(payload, selected)
+    def _apply_static_payload_to_figure(self) -> None:
+        super()._apply_static_payload_to_figure()
+        if not self._frame_payloads:
+            return
         prefix = self._active_cayley_prefix()
+        payload0 = self._frame_payloads[0]
         if prefix == "cayley_regular":
             title_x = r"$u,\quad \xi_t=w_t/|w_t|$"
             title_y = r"$\lambda=\exp(-\mathcal{B}_{\xi_t}(w_t))$"
@@ -2744,18 +2905,31 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
             title_x = r"$u=\exp(-S_{p^0}(w))\,\langle\mathfrak{S}_{\xi}(w),e_\perp\rangle$"
             title_y = r"$\lambda=\exp(-S_{p^0}(w))=\exp(\Phi_{p^0}(w))$"
         with self.fig.batch_update():
-            self.fig.data[self.tr["cayley_axis"]].x = _plotly_values(payload[f"{prefix}_axis_x"])
-            self.fig.data[self.tr["cayley_axis"]].y = _plotly_values(payload[f"{prefix}_axis_y"])
-            self.fig.data[self.tr["cayley_boundary"]].x = _plotly_values(payload[f"{prefix}_boundary_x"])
-            self.fig.data[self.tr["cayley_boundary"]].y = _plotly_values(payload[f"{prefix}_boundary_y"])
-            self.fig.data[self.tr["cayley_path"]].x = _plotly_values(payload[f"{prefix}_path_x"])
-            self.fig.data[self.tr["cayley_path"]].y = _plotly_values(payload[f"{prefix}_path_y"])
+            # The full Cayley path, the axis trace, and the weighted
+            # boundary are constant across frames for a given prefix.
+            self.fig.data[self.tr["cayley_axis"]].x = _plotly_values(payload0[f"{prefix}_axis_x"])
+            self.fig.data[self.tr["cayley_axis"]].y = _plotly_values(payload0[f"{prefix}_axis_y"])
+            self.fig.data[self.tr["cayley_path"]].x = _plotly_values(payload0[f"{prefix}_path_x"])
+            self.fig.data[self.tr["cayley_path"]].y = _plotly_values(payload0[f"{prefix}_path_y"])
+            if prefix == "cayley_weighted":
+                self.fig.data[self.tr["cayley_boundary"]].x = _plotly_values(payload0[f"{prefix}_boundary_x"])
+                self.fig.data[self.tr["cayley_boundary"]].y = _plotly_values(payload0[f"{prefix}_boundary_y"])
+            self.fig.update_xaxes(title_text=_sanitize_plot_text(title_x), range=payload0[f"{prefix}_x_range"], row=3, col=1)
+            self.fig.update_yaxes(title_text=_sanitize_plot_text(title_y), range=payload0[f"{prefix}_y_range"], row=3, col=1)
+
+    def _apply_dynamic_payload_to_figure(self, payload: dict[str, Any]) -> None:
+        super()._apply_dynamic_payload_to_figure(payload)
+        prefix = self._active_cayley_prefix()
+        with self.fig.batch_update():
             self.fig.data[self.tr["cayley_step"]].x = _plotly_values(payload[f"{prefix}_step_x"])
             self.fig.data[self.tr["cayley_step"]].y = _plotly_values(payload[f"{prefix}_step_y"])
             self.fig.data[self.tr["cayley_point"]].x = _plotly_values(payload[f"{prefix}_point_x"])
             self.fig.data[self.tr["cayley_point"]].y = _plotly_values(payload[f"{prefix}_point_y"])
-            self.fig.update_xaxes(title_text=_sanitize_plot_text(title_x), range=payload[f"{prefix}_x_range"], row=3, col=1)
-            self.fig.update_yaxes(title_text=_sanitize_plot_text(title_y), range=payload[f"{prefix}_y_range"], row=3, col=1)
+            if prefix == "cayley_regular":
+                # Regular-mode boundary depends on the current w_t and is
+                # therefore part of the dynamic frame layer.
+                self.fig.data[self.tr["cayley_boundary"]].x = _plotly_values(payload[f"{prefix}_boundary_x"])
+                self.fig.data[self.tr["cayley_boundary"]].y = _plotly_values(payload[f"{prefix}_boundary_y"])
 
 
 class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
@@ -3041,10 +3215,22 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
         self.fig.update_yaxes(range=s["diag_phi_range"], row=2, col=2, secondary_y=True)
         self._hyper_static_applied = True
 
-    def _apply_payload_to_figure(self, payload: dict[str, Any], selected: dict[str, Any]) -> None:
-        _ = selected
+    def _apply_static_payload_to_figure(self) -> None:
+        # Base helper handles `ref_phase` visibility and any `orbit_path`
+        # / `anchors` traces if present. The hyperboloid figure has only
+        # `ref_phase` from that set, but the guards make this safe.
+        super()._apply_static_payload_to_figure()
+        if not self._frame_payloads:
+            return
         with self.fig.batch_update():
             self._apply_hyper_static()
+
+    def _apply_dynamic_payload_to_figure(self, payload: dict[str, Any]) -> None:
+        # Base updates `ref_phase` x/y, `reflected`, `ref_w`, `R_circle`,
+        # `ellipse` (the hyperboloid screen reuses these). Other base
+        # traces are absent and are skipped via `if key in self.tr`.
+        super()._apply_dynamic_payload_to_figure(payload)
+        with self.fig.batch_update():
             self.fig.data[self.tr["hyper_X"]].x = _plotly_values(payload["hyper_X_x"])
             self.fig.data[self.tr["hyper_X"]].y = _plotly_values(payload["hyper_X_y"])
             self.fig.data[self.tr["hyper_X"]].z = _plotly_values(payload["hyper_X_z"])
@@ -3054,19 +3240,6 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
             self.fig.data[self.tr["hyper_U"]].x = _plotly_values(payload["hyper_U_x"])
             self.fig.data[self.tr["hyper_U"]].y = _plotly_values(payload["hyper_U_y"])
             self.fig.data[self.tr["hyper_U"]].z = _plotly_values(payload["hyper_U_z"])
-
-            self.fig.data[self.tr["ref_phase"]].x = _plotly_values(payload["ref_phase_x"])
-            self.fig.data[self.tr["ref_phase"]].y = _plotly_values(payload["ref_phase_y"])
-            self.fig.data[self.tr["ref_phase"]].visible = bool(self.show_contours.value)
-            self.fig.data[self.tr["ref_phase"]].opacity = 0.82 if bool(self.show_contours.value) else 0.0
-            self.fig.data[self.tr["reflected"]].x = _plotly_values(payload["reflected_x"])
-            self.fig.data[self.tr["reflected"]].y = _plotly_values(payload["reflected_y"])
-            self.fig.data[self.tr["ref_w"]].x = _plotly_values(payload["ref_w_x"])
-            self.fig.data[self.tr["ref_w"]].y = _plotly_values(payload["ref_w_y"])
-            self.fig.data[self.tr["R_circle"]].x = _plotly_values(payload["R_circle_x"])
-            self.fig.data[self.tr["R_circle"]].y = _plotly_values(payload["R_circle_y"])
-            self.fig.data[self.tr["ellipse"]].x = _plotly_values(payload["ellipse_x"])
-            self.fig.data[self.tr["ellipse"]].y = _plotly_values(payload["ellipse_y"])
 
             self.fig.data[self.tr["screen_stems"]].x = _plotly_values(payload["screen_stems_x"])
             self.fig.data[self.tr["screen_stems"]].y = _plotly_values(payload["screen_stems_y"])
