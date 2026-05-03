@@ -2,13 +2,13 @@
 
 This module visualizes the Householder/geometric-optics decomposition
 
-    R_{p^0}(w) = sum_i a_i H_{p_i^0-w}(p_i^0)
-               = -sum_i a_i M_w(p_i^0),
+    Rₚ⁰(w) = ∑ᵢ aᵢ H_{pᵢ⁰-w}(pᵢ⁰)
+           = -∑ᵢ aᵢ M_w(pᵢ⁰),
     dw/dt = 0.5 * (1 - |w|^2) * R_{p^0}(w).
 
 The points p_i^0 are frozen canonical shape constants on S^{d-1}.  They are
 computed from an observed cloud x_i^0 by the exact gauge equation
-sum_i a_i M_{-w_*}(x_i^0)=0 and p_i^0=M_{-w_*}(x_i^0).  The reflected cloud
+∑ᵢ aᵢ M_{-w_*}(x_i^0)=0 and p_i^0=M_{-w_*}(x_i^0).  The reflected cloud
 r_i(w)=H_{p_i^0-w}(p_i^0) is the hidden optical object: its
 barycenter R_{p^0}(w) is the direction of the reduced motion, |R_{p^0}(w)| is the
 ray coherence, and its covariance records angular dispersion.
@@ -68,79 +68,15 @@ def _require_widgets() -> None:
 
 
 def _html(value: str = "", **kwargs: Any) -> Any:
-    """Return a plain HTML widget, matching the working LMS 3D widget."""
+    """Return a plain HTML widget without MathJax/LaTeX rendering."""
     if widgets is None:  # pragma: no cover
         raise ImportError("ipywidgets is required.")
     return widgets.HTML(value=value, **kwargs)
 
 
-def _sanitize_plot_text(text: str) -> str:
-    """Sanitize Plotly/HTML math text the same way as the working 3D widget.
-
-    FigureWidget MathJax rendering is environment-dependent in notebooks.  The
-    LMS 3D widget avoids raw `$...$` labels, so the optical widgets do the same:
-    keep labels readable as plain text rather than showing unrendered TeX.
-    """
-    out = str(text)
-    replacements = {
-        "\\partial": "∂",
-        "\\mathbb{B}": "B",
-        "\\mathbb H": "H",
-        "\\ell": "ell",
-        "\\lambda": "lambda",
-        "\\Theta": "Theta",
-        "\\Phi": "Phi",
-        "\\Delta": "Delta",
-        "\\beta": "beta",
-        "\\xi": "xi",
-        "\\ast": "*",
-        "\\dot": "dot",
-        "\\sum": "sum",
-        "\\arg": "arg",
-        "\\perp": "perp",
-        "\\mathrm": "",
-        "\\operatorname": "",
-        "\\langle": "<",
-        "\\rangle": ">",
-        "\\quad": " ",
-        "\\,": " ",
-        "\\|": "|",
-        "\\": "",
-        "$": "",
-        "{": "",
-        "}": "",
-    }
-    for old, new in replacements.items():
-        out = out.replace(old, new)
-    out = out.replace("_perp", "_⊥").replace("_\\perp", "_⊥")
-    out = out.replace("^0", "⁰").replace("^1", "¹").replace("^2", "²").replace("^3", "³")
-    out = out.replace("_i", "ᵢ").replace("_t", "ₜ").replace("_p", "ₚ").replace("_⊥", "⊥")
-    out = out.replace("p_i⁰", "pᵢ⁰").replace("x_i⁰", "xᵢ⁰").replace("r_i", "rᵢ")
-    return " ".join(out.split())
-
-
 def _sanitize_figure_text(fig: Any) -> None:
-    """Apply plain-text Plotly labels after figure construction."""
-    for tr in fig.data:
-        if getattr(tr, "name", None) is not None:
-            tr.name = _sanitize_plot_text(tr.name)
-    for ann in getattr(fig.layout, "annotations", ()):
-        if getattr(ann, "text", None):
-            ann.text = _sanitize_plot_text(ann.text)
-    for key in fig.layout:
-        if key.startswith(("xaxis", "yaxis")):
-            axis = getattr(fig.layout, key)
-            title = getattr(axis, "title", None)
-            if getattr(title, "text", None):
-                title.text = _sanitize_plot_text(title.text)
-    for key in fig.layout:
-        if key.startswith("scene"):
-            scene = getattr(fig.layout, key)
-            for axis_name in ("xaxis", "yaxis", "zaxis"):
-                axis = getattr(scene, axis_name, None)
-                title = getattr(axis, "title", None) if axis is not None else None
-                if getattr(title, "text", None):
-                    title.text = _sanitize_plot_text(title.text)
+    """Compatibility hook for figure text that is now Unicode math text."""
+    _ = fig
 
 
 def _as_tensor(x: Tensor | np.ndarray | list[float], *, dtype: torch.dtype = torch.float64) -> Tensor:
@@ -219,7 +155,7 @@ def reflected_barycenter(
     points: Tensor | np.ndarray,
     weights: Tensor | np.ndarray | None = None,
 ) -> Tensor:
-    """Return R_p(w)=sum_i a_i r_i(w)."""
+    """Return R_p(w)=∑ᵢ aᵢ rᵢ(w)."""
     P, a = _prepare_points_weights(points, weights)
     R = reflected_points(_as_tensor(w, dtype=P.dtype).to(dtype=P.dtype, device=P.device), P)
     return (a[:, None] * R).sum(dim=0)
@@ -230,7 +166,7 @@ def frozen_field(
     points: Tensor | np.ndarray,
     weights: Tensor | np.ndarray | None = None,
 ) -> Tensor:
-    """Return F_p(w)=sum_i a_i M_w(p_i), so F_p(w)=-R_p(w)."""
+    """Return F_p(w)=∑ᵢ aᵢ M_w(pᵢ), so F_p(w)=-R_p(w)."""
     P, a = _prepare_points_weights(points, weights)
     ww = _as_tensor(w, dtype=P.dtype).to(dtype=P.dtype, device=P.device).reshape(P.shape[1])
     return (a[:, None] * mobius_sphere(P, ww)).sum(dim=0)
@@ -255,7 +191,7 @@ def busemann_phase(
     *,
     eps: float = 1e-12,
 ) -> Tensor:
-    """Return S_p(w)=sum_i a_i log(|w-p_i|^2/(1-|w|^2))."""
+    """Return S_p(w)=∑ᵢ aᵢ log(|w-pᵢ|²/(1-|w|²))."""
     P, a = _prepare_points_weights(points, weights)
     ww = _as_tensor(w, dtype=P.dtype).to(dtype=P.dtype, device=P.device).reshape(P.shape[1])
     diff = ww.unsqueeze(0) - P
@@ -269,7 +205,7 @@ def ray_second_moment(
     points: Tensor | np.ndarray,
     weights: Tensor | np.ndarray | None = None,
 ) -> Tensor:
-    """Return A_p(w)=sum_i a_i r_i(w) r_i(w)^T."""
+    """Return A_p(w)=∑ᵢ aᵢ rᵢ(w) rᵢ(w)^T."""
     P, a = _prepare_points_weights(points, weights)
     Rpts = reflected_points(_as_tensor(w, dtype=P.dtype).to(dtype=P.dtype, device=P.device), P)
     return (a[:, None, None] * (Rpts[:, :, None] * Rpts[:, None, :])).sum(dim=0)
@@ -280,7 +216,7 @@ def ray_covariance(
     points: Tensor | np.ndarray,
     weights: Tensor | np.ndarray | None = None,
 ) -> Tensor:
-    """Return C_p(w)=sum_i a_i (r_i-R)(r_i-R)^T."""
+    """Return C_p(w)=∑ᵢ aᵢ (rᵢ-R)(rᵢ-R)^T."""
     P, a = _prepare_points_weights(points, weights)
     Rpts = reflected_points(_as_tensor(w, dtype=P.dtype).to(dtype=P.dtype, device=P.device), P)
     Rbar = (a[:, None] * Rpts).sum(dim=0)
@@ -582,6 +518,45 @@ def _line2(a: np.ndarray, b: np.ndarray) -> tuple[list[float], list[float]]:
     return [float(a[0]), float(b[0])], [float(a[1]), float(b[1])]
 
 
+def _segments_from_origin2(points: np.ndarray) -> tuple[list[float | None], list[float | None]]:
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    xs: list[float | None] = []
+    ys: list[float | None] = []
+    for p in pts:
+        xs.extend([0.0, float(p[0]), None])
+        ys.extend([0.0, float(p[1]), None])
+    return xs, ys
+
+
+def _segments_between2(starts: np.ndarray, stops: np.ndarray) -> tuple[list[float | None], list[float | None]]:
+    A = np.asarray(starts, dtype=np.float64)
+    B = np.asarray(stops, dtype=np.float64).reshape(-1, 2)
+    if A.ndim == 1:
+        A = np.broadcast_to(A.reshape(1, 2), B.shape)
+    else:
+        A = A.reshape(-1, 2)
+    xs: list[float | None] = []
+    ys: list[float | None] = []
+    for a, b in zip(A, B, strict=True):
+        xs.extend([float(a[0]), float(b[0]), None])
+        ys.extend([float(a[1]), float(b[1]), None])
+    return xs, ys
+
+
+def _householder_mirror_lines2(w: np.ndarray, points: np.ndarray, *, scale: float = 1.08) -> tuple[list[float | None], list[float | None]]:
+    P = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    ww = np.asarray(w, dtype=np.float64).reshape(2)
+    normals = P - ww[None, :]
+    norms = np.maximum(np.linalg.norm(normals, axis=1), 1e-12)
+    tangents = np.column_stack([-normals[:, 1] / norms, normals[:, 0] / norms])
+    xs: list[float | None] = []
+    ys: list[float | None] = []
+    for tangent in tangents:
+        xs.extend([float(-scale * tangent[0]), float(scale * tangent[0]), None])
+        ys.extend([float(-scale * tangent[1]), float(scale * tangent[1]), None])
+    return xs, ys
+
+
 def _plotly_values(values: Any) -> Any:
     """Convert cached numeric arrays to widget-safe Python containers.
 
@@ -723,10 +698,10 @@ def _weighted_busemann_phase_series_np(
     *,
     eps: float = 1e-12,
 ) -> np.ndarray:
-    """Return S_{p^0}(w_t)=sum_i a_i log(|w_t-p_i^0|^2/(1-|w_t|^2)).
+    """Return Sₚ⁰(wₜ)=∑ᵢ aᵢ log(|wₜ-pᵢ⁰|²/(1-|wₜ|²)).
 
     The convention in the reconstruction note is
-    Phi_{p^0}(w)=-S_{p^0}(w).
+    Φₚ⁰(w)=-Sₚ⁰(w).
     """
     W = np.asarray(w_series, dtype=np.float64).reshape(-1, 2)
     P = np.asarray(points, dtype=np.float64).reshape(-1, 2)
@@ -758,7 +733,7 @@ def hyperboloid_lift(w: Tensor | np.ndarray, *, eps: float = 1e-12) -> Tensor:
 
 
 def null_lift(points: Tensor | np.ndarray) -> Tensor:
-    """Lift boundary constants p_i^0 in S^1 to null vectors ell_i=(1,p_i^0)."""
+    """Lift boundary constants pᵢ⁰ in S¹ to null vectors ℓᵢ=(1,pᵢ⁰)."""
     P, _ = _prepare_points_weights(points)
     ones = torch.ones((P.shape[0], 1), dtype=P.dtype, device=P.device)
     return torch.cat([ones, P], dim=-1)
@@ -771,7 +746,7 @@ def hyperboloid_ray_fields(
     *,
     eps: float = 1e-12,
 ) -> dict[str, Tensor]:
-    """Return X, ell_i, alpha_i, u_i and U for the hyperboloid optical chart."""
+    """Return X, ℓᵢ, αᵢ, uᵢ and U for the hyperboloid optical chart."""
     P, a = _prepare_points_weights(points, weights)
     W = _as_tensor(w, dtype=P.dtype).to(dtype=P.dtype, device=P.device)
     X = hyperboloid_lift(W, eps=eps)
@@ -933,12 +908,12 @@ def _weighted_cayley_chart_series_2d(
     log_clip: float = 24.0,
     eps: float = 1e-12,
 ) -> dict[str, np.ndarray]:
-    """Modified Cayley chart with lambda=exp(-S_{p^0}(w)).
+    """Modified Cayley chart with λ=exp(-Sₚ⁰(w)).
 
-    For the usual Cayley chart centered at xi, lambda=exp(-B_xi(w)).
-    Here the horizontal direction still uses the xi-tangential normalized
-    action mathfrak{S}_xi(w)=2 P_xi^perp(w)/(1-|w|^2), but lambda is replaced
-    by the weighted total Busemann phase of the frozen constants p_i^0.
+    For the usual Cayley chart centered at ξ, λ=exp(-B_ξ(w)).
+    Here the horizontal direction still uses the ξ-tangential normalized
+    action 𝔖_ξ(w)=2 P_ξ^⊥(w)/(1-|w|²), but λ is replaced
+    by the weighted total Busemann phase of the frozen constants pᵢ⁰.
     """
     W = np.asarray(w_series, dtype=np.float64).reshape(-1, 2)
     xi_arr = np.asarray(xi, dtype=np.float64).reshape(2)
@@ -966,7 +941,7 @@ def _orientation_series_from_w_2d(
     *,
     eps: float = 1e-10,
 ) -> np.ndarray:
-    """Return xi_t=w_t/|w_t| with previous/fallback orientation near zero."""
+    """Return ξₜ=wₜ/|wₜ| with previous/fallback orientation near zero."""
     W = np.asarray(w_series, dtype=np.float64).reshape(-1, 2)
     fb = np.asarray(fallback_xi, dtype=np.float64).reshape(2)
     fb = fb / max(float(np.linalg.norm(fb)), eps)
@@ -988,15 +963,15 @@ def _regular_cayley_chart_series_2d(
     *,
     eps: float = 1e-12,
 ) -> dict[str, np.ndarray]:
-    """Regular moving-puncture Cayley chart with xi_t=w_t/|w_t|.
+    """Regular moving-puncture Cayley chart with ξₜ=wₜ/|wₜ|.
 
     This uses the single Busemann factor B_{xi_t}(w_t):
 
-        lambda_t = exp(-B_{xi_t}(w_t))
-                 = (1-|w_t|^2)/|w_t-xi_t|^2.
+        λₜ = exp(-B_{ξₜ}(wₜ))
+           = (1-|wₜ|²)/|wₜ-ξₜ|².
 
-    Since xi_t is the current w-orientation, the current point usually lies on
-    the vertical axis u=0.  Frozen boundary constants p_i^0 are re-charted at
+    Since ξₜ is the current w-orientation, the current point usually lies on
+    the vertical axis u=0.  Frozen boundary constants pᵢ⁰ are re-charted at
     each frame.
     """
     W = np.asarray(w_series, dtype=np.float64).reshape(-1, 2)
@@ -1033,9 +1008,9 @@ def _cayley_boundary_coordinates_2d(
     cap_quantile: float = 0.95,
     eps: float = 1e-12,
 ) -> np.ndarray:
-    """Boundary Cayley coordinates b_eta projected onto xi^perp.
+    """Boundary Cayley coordinates b_η projected onto ξ^⊥.
 
-    Points too close to the puncture xi are clipped for finite display.
+    Points too close to the puncture ξ are clipped for finite display.
     """
     P = np.asarray(points, dtype=np.float64).reshape(-1, 2)
     xi_arr = np.asarray(xi, dtype=np.float64).reshape(2)
@@ -1069,14 +1044,14 @@ class LMSOpticalDiskBaseWidget:
     `_layout_header_html` / `_augment_frame_payload` /
     `_finalize_frame_payloads`.
 
-    Left panel: the exact constants of motion p_i^0=M_{-w_*}(x_i^0)
+    Left panel: the exact constants of motion pᵢ⁰=M₋w*(xᵢ⁰)
     and the one-dimensional reduced orbit w(t) initialized at w(0)=w_*.
 
-    Right panel: the reflected cloud r_i(w)=H_{p_i^0-w}(p_i^0).  The Busemann
+    Right panel: the reflected cloud rᵢ(w)=H_{pᵢ⁰-w}(pᵢ⁰).  The Busemann
     level sets shown there are the level sets of S_{r(w)}(u), and the current
-    w is the exact Busemann balance of r_i(w) up to numerical centering error.
-    The motion is still driven by the frozen constants p_i^0 through
-    dw/dt=0.5*(1-|w|^2)*sum_i a_i r_i(w), not by the gradient of S_{r(w)} at w.
+    w is the exact Busemann balance of rᵢ(w) up to numerical centering error.
+    The motion is still driven by the frozen constants pᵢ⁰ through
+    dw/dt=0.5*(1-|w|²)*∑ᵢ aᵢ rᵢ(w), not by the gradient of S_{r(w)} at w.
     """
 
     _DEFAULT_FLOW_TARGET_RADIUS = 0.999
@@ -1137,7 +1112,7 @@ class LMSOpticalDiskBaseWidget:
         self._rebuild_orbit()
         self.layout = widgets.VBox(
             [
-                _html(_sanitize_plot_text(self._layout_header_html())),
+                _html(self._layout_header_html()),
                 self.fig,
                 self.controls,
                 self.stats_html,
@@ -1147,8 +1122,8 @@ class LMSOpticalDiskBaseWidget:
     def _layout_header_html(self) -> str:
         return (
             "<b>LMS optical reflected-ray explorer</b><br>"
-            "Input cloud $\\{x_i^0\\}$ is exactly deboosted to constants "
-            "$p_i^0=M_{-w_\\ast}(x_i^0)$, then $w(0)=w_\\ast$ is evolved by the frozen LMS field."
+            "Input cloud {xᵢ⁰} is exactly deboosted to constants "
+            "pᵢ⁰=M₋w*(xᵢ⁰), then w(0)=w* is evolved by the frozen LMS field."
         )
 
     def _canonicalized_points(self, points: np.ndarray) -> np.ndarray:
@@ -1258,10 +1233,10 @@ class LMSOpticalDiskBaseWidget:
             rows=2,
             cols=2,
             subplot_titles=(
-                r"$p_i^0=M_{-w_\ast}(x_i^0),\quad w(t)$",
-                r"$r_i(w)=H_{p_i^0-w}(p_i^0),\quad S_{r(w)}(u)=\mathrm{const}$",
-                r"$R_{p^0}(w)=\sum_i a_i r_i(w)$",
-                r"$p_i^0\mapsto r_i(w)$",
+                "pᵢ⁰=M₋w*(xᵢ⁰), w(t)",
+                "rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰), Sᵣ(w)(u)=const",
+                "Rₚ⁰(w)=Σᵢ aᵢ rᵢ(w)",
+                "pᵢ⁰ → rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰)",
             ),
             horizontal_spacing=0.08,
             vertical_spacing=0.12,
@@ -1361,31 +1336,35 @@ class LMSOpticalDiskBaseWidget:
             self._add_trace_to_subplot(fig, trace, key, row, col)
 
         cx, cy = _circle_xy()
-        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name=r"$\partial\mathbb{B}^2$", hoverinfo="skip"), "disk", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(20,20,20,0.35)", width=2), name=r"$w(t)$", hoverinfo="skip"), "orbit_path", 1, 1)
-        add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=11, color="white", line=dict(color="black", width=2)), name=r"$\sum_i a_i p_i^0=0$"), "core_balance", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#244C9A", opacity=0.72), name=r"$p_i^0$"), "anchors", 1, 1)
+        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name="∂𝔹²", hoverinfo="skip"), "disk", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(20,20,20,0.35)", width=2), name="w(t)", hoverinfo="skip"), "orbit_path", 1, 1)
+        add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=11, color="white", line=dict(color="black", width=2)), name="Σᵢ aᵢ pᵢ⁰=0"), "core_balance", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#244C9A", opacity=0.72), name="pᵢ⁰"), "anchors", 1, 1)
         if self.select_pi:
-            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name=r"$\mathrm{selected}\ p_i^0$"), "selected_anchor", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black"), name=r"$w$"), "w", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 9], color="#D72638"), name=r"$R_{p^0}(w)=\sum_i a_i r_i(w)$"), "R_arrow", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#188038", width=3, dash="dash"), marker=dict(size=[0, 7], color="#188038"), name=r"$\dot w$"), "vel_arrow", 1, 1)
+            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name="selected pᵢ⁰"), "selected_anchor", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black"), name="w"), "w", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 9], color="#D72638"), name="Rₚ⁰(w)=Σᵢ aᵢ rᵢ(w)"), "R_arrow", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#188038", width=3, dash="dash"), marker=dict(size=[0, 7], color="#188038"), name="ẇ"), "vel_arrow", 1, 1)
 
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name=r"$S_{r(w)}(u)=\mathrm{const}$", hoverinfo="skip"), "ref_phase", 1, 2)
-        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name=r"$\partial\mathbb{B}^2$", hoverinfo="skip", showlegend=False), "ref_circle", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name=r"$r_i(w)$"), "reflected", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name=r"$w:\sum_i a_iM_w(r_i(w))=0$"), "ref_w", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name=r"$R_{p^0}(w)$"), "R_circle", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name=r"$\mathrm{Cov}(r_i(w))$", hoverinfo="skip"), "ellipse", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#3B5BDB", width=2), marker=dict(size=5, color="#3B5BDB"), name=r"$\sum_i a_i r_i(w)$"), "polygon", 2, 1)
-        add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=9, color="black"), name=r"$0$", showlegend=False, hoverinfo="skip"), "polygon_origin", 2, 1)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name="Sᵣ(w)(u)=const", hoverinfo="skip"), "ref_phase", 1, 2)
+        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name="∂𝔹²", hoverinfo="skip", showlegend=False), "ref_circle", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name="rᵢ(w)"), "reflected", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name="w: Σᵢ aᵢ M_w(rᵢ(w))=0"), "ref_w", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name="Rₚ⁰(w)"), "R_circle", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name="Cov(rᵢ(w))", hoverinfo="skip"), "ellipse", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#3B5BDB", width=2), marker=dict(size=5, color="#3B5BDB"), name="Σᵢ aᵢ rᵢ(w)"), "polygon", 2, 1)
+        add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=9, color="black"), name="0", showlegend=False, hoverinfo="skip"), "polygon_origin", 2, 1)
 
+        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.3)", width=1), name="S¹", hoverinfo="skip", showlegend=False), "geom_circle", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=7, color="#244C9A", opacity=0.72), name="pᵢ⁰"), "geom_all_incoming", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(91,140,90,0.45)", width=1.7), name="rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰)", hoverinfo="skip"), "geom_all_reflected", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(215,38,56,0.28)", width=1.2), name="pᵢ⁰−w", hoverinfo="skip"), "geom_all_normal", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.24)", width=1.0, dash="dash"), name="(pᵢ⁰−w)⊥", hoverinfo="skip"), "geom_all_mirror", 2, 2)
         if self.select_pi:
-            add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.3)", width=1), name=r"$S^1$", hoverinfo="skip", showlegend=False), "geom_circle", 2, 2)
-            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#244C9A", width=3), name=r"$p_i^0$"), "geom_incoming", 2, 2)
-            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=3), name=r"$r_i(w)$"), "geom_reflected", 2, 2)
-            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#D72638", width=3), name=r"$p_i^0-w$"), "geom_normal", 2, 2)
-            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.45)", width=2, dash="dash"), name=r"$(p_i^0-w)^\perp$"), "geom_mirror", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="#F2A900", line=dict(color="black", width=1.2)), name="selected pᵢ⁰"), "geom_incoming", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=3), name="selected rᵢ(w)"), "geom_reflected", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#D72638", width=3), name="selected pᵢ⁰−w"), "geom_normal", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.45)", width=2, dash="dash"), name="selected (pᵢ⁰−w)⊥"), "geom_mirror", 2, 2)
 
         fig.update_layout(
             width=self.width,
@@ -1399,8 +1378,8 @@ class LMSOpticalDiskBaseWidget:
         for axis, anchor in (("yaxis", "x"), ("yaxis2", "x2"), ("yaxis3", "x3"), ("yaxis4", "x4")):
             fig.layout[axis].update(range=[-1.15, 1.15], zeroline=False, showgrid=False, scaleanchor=anchor, scaleratio=1)
         for row, col in ((1, 1), (1, 2), (2, 1), (2, 2)):
-            fig.update_xaxes(title_text=r"$e_1$", row=row, col=col)
-            fig.update_yaxes(title_text=r"$e_2$", row=row, col=col)
+            fig.update_xaxes(title_text="e₁", row=row, col=col)
+            fig.update_yaxes(title_text="e₂", row=row, col=col)
         self._after_build_figure()
         _sanitize_figure_text(fig)
         self._configure_subplot_legends()
@@ -1936,17 +1915,17 @@ class LMSOpticalDiskBaseWidget:
                 "physical_time": float(physical_time[i]),
                 "stats": (
                     "<b>Optical diagnostics</b> "
-                    f"$\\|\\sum_i a_i p_i^0\\|={self._center_error:.2e}$; "
-                    f"$\\|\\sum_i a_i M_w(r_i)\\|={float(reflected_balance[i]):.2e}$; "
-                    f"$|R_{{p^0}}(w)|={coh:.6f}$; "
-                    f"$1-|R|^2={var:.6f}$; "
-                    f"$\\Phi_{{p^0}}(w)={float(phi_p0[i]):.6f}$; "
-                    f"$S_{{r(w)}}(w)={float(reflected_phase[i]):.6f}$; "
-                    f"$|\\dot w|={float(np.linalg.norm(velocity[i])):.6f}$; "
-                    f"$\\mathrm{{time}}={'ES' if time_mode == 'euler_sundman' else 'physical'}$; "
-                    f"$\\tau={float(parameter_time[i]):.6g}$; "
-                    f"$t={float(physical_time[i]):.6g}$; "
-                    f"$\\lambda(C)=({float(evals[i, 0]):.5f},{float(evals[i, 1]):.5f})$"
+                    f"|Σᵢ aᵢ pᵢ⁰|={self._center_error:.2e}; "
+                    f"|Σᵢ aᵢ M_w(rᵢ)|={float(reflected_balance[i]):.2e}; "
+                    f"|Rₚ⁰(w)|={coh:.6f}; "
+                    f"1-|R|^2={var:.6f}; "
+                    f"Φₚ⁰(w)={float(phi_p0[i]):.6f}; "
+                    f"Sᵣ(w)(w)={float(reflected_phase[i]):.6f}; "
+                    f"|ẇ|={float(np.linalg.norm(velocity[i])):.6f}; "
+                    f"time={'ES' if time_mode == 'euler_sundman' else 'physical'}; "
+                    f"τ={float(parameter_time[i]):.6g}; "
+                    f"t={float(physical_time[i]):.6g}; "
+                    f"λ(C)=({float(evals[i, 0]):.5f},{float(evals[i, 1]):.5f})"
                 ),
             }
             payloads.append(
@@ -1998,7 +1977,7 @@ class LMSOpticalDiskBaseWidget:
             self._apply_dynamic_payload_to_figure(payload)
             if self.select_pi:
                 self._apply_overlay_payload_to_figure(payload, selected)
-        self.stats_html.value = _sanitize_plot_text(payload["stats"])
+        self.stats_html.value = payload["stats"]
 
     def _apply_selection_only(self) -> None:
         """Refresh the selected-anchor overlay for the current frame.
@@ -2102,6 +2081,22 @@ class LMSOpticalDiskBaseWidget:
             if "polygon" in self.tr:
                 self.fig.data[self.tr["polygon"]].x = _plotly_values(payload["polygon_x"])
                 self.fig.data[self.tr["polygon"]].y = _plotly_values(payload["polygon_y"])
+            if "geom_all_incoming" in self.tr:
+                P = np.asarray(payload["P"], dtype=np.float64)
+                self.fig.data[self.tr["geom_all_incoming"]].x = _plotly_values(P[:, 0])
+                self.fig.data[self.tr["geom_all_incoming"]].y = _plotly_values(P[:, 1])
+            if "geom_all_reflected" in self.tr:
+                gx, gy = _segments_from_origin2(np.asarray(payload["Q"], dtype=np.float64))
+                self.fig.data[self.tr["geom_all_reflected"]].x = gx
+                self.fig.data[self.tr["geom_all_reflected"]].y = gy
+            if "geom_all_normal" in self.tr:
+                gx, gy = _segments_between2(np.asarray(payload["w"], dtype=np.float64), np.asarray(payload["P"], dtype=np.float64))
+                self.fig.data[self.tr["geom_all_normal"]].x = gx
+                self.fig.data[self.tr["geom_all_normal"]].y = gy
+            if "geom_all_mirror" in self.tr:
+                gx, gy = _householder_mirror_lines2(np.asarray(payload["w"], dtype=np.float64), np.asarray(payload["P"], dtype=np.float64))
+                self.fig.data[self.tr["geom_all_mirror"]].x = gx
+                self.fig.data[self.tr["geom_all_mirror"]].y = gy
 
     def _apply_overlay_payload_to_figure(self, payload: dict[str, Any], selected: dict[str, Any]) -> None:
         """Apply traces tied to the selected anchor (and current frame).
@@ -2121,8 +2116,8 @@ class LMSOpticalDiskBaseWidget:
                 self.fig.data[self.tr["selected_anchor"]].x = [float(p[0])]
                 self.fig.data[self.tr["selected_anchor"]].y = [float(p[1])]
             if "geom_incoming" in self.tr:
-                self.fig.data[self.tr["geom_incoming"]].x = [0.0, float(p[0])]
-                self.fig.data[self.tr["geom_incoming"]].y = [0.0, float(p[1])]
+                self.fig.data[self.tr["geom_incoming"]].x = [float(p[0])]
+                self.fig.data[self.tr["geom_incoming"]].y = [float(p[1])]
             if "geom_reflected" in self.tr:
                 self.fig.data[self.tr["geom_reflected"]].x = [0.0, float(q[0])]
                 self.fig.data[self.tr["geom_reflected"]].y = [0.0, float(q[1])]
@@ -2233,13 +2228,13 @@ class LMSOpticalDiskBaseWidget:
         evals = state.covariance_evals.detach().cpu().numpy().astype(np.float64)
         return (
             "<b>Optical diagnostics</b> "
-            f"$\\|\\sum_i a_i p_i^0\\|={self._center_error:.2e}$; "
-            f"$\\|\\sum_i a_i M_w(r_i)\\|={reflected_balance_error:.2e}$; "
-            f"$|R_{{p^0}}(w)|={float(state.coherence):.6f}$; "
-            f"$1-|R|^2={float(state.variance):.6f}$; "
-            f"$S_{{r(w)}}(w)={reflected_phase:.6f}$; "
-            f"$|\\dot w|={float(torch.linalg.norm(state.velocity)):.6f}$; "
-            f"$\\lambda(C)=({float(evals[0]):.5f},{float(evals[1]):.5f})$"
+            f"|Σᵢ aᵢ pᵢ⁰|={self._center_error:.2e}; "
+            f"|Σᵢ aᵢ M_w(rᵢ)|={reflected_balance_error:.2e}; "
+            f"|Rₚ⁰(w)|={float(state.coherence):.6f}; "
+            f"1-|R|^2={float(state.variance):.6f}; "
+            f"Sᵣ(w)(w)={reflected_phase:.6f}; "
+            f"|ẇ|={float(torch.linalg.norm(state.velocity)):.6f}; "
+            f"λ(C)=({float(evals[0]):.5f},{float(evals[1]):.5f})"
         )
 
     def _update(self, *, recompute_reflected_grid: bool = True) -> None:
@@ -2285,8 +2280,8 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
     def _layout_header_html(self) -> str:
         return (
             "<b>LMS optical reflected-ray explorer + dynamic w-relative charts</b><br>"
-            "Bottom left: unit radial distance chart around $w_t$. "
-            "Bottom right: pointwise spherical inversion $(x+w_t)/|x+w_t|^2$."
+            "Bottom left: unit radial distance chart around wₜ. "
+            "Bottom right: pointwise spherical inversion (x+wₜ)/|x+wₜ|²."
         )
 
     def _make_subplot_figure(self) -> Any:
@@ -2294,10 +2289,10 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
             rows=2,
             cols=2,
             subplot_titles=(
-                r"$p_i^0=M_{-w_\ast}(x_i^0),\quad w(t)$",
-                r"$r_i(w)=H_{p_i^0-w}(p_i^0),\quad S_{r(w)}(u)=\mathrm{const}$",
-                r"$U_{w_t}(x):\ |U_{w_t}(x)-w_t|=1$",
-                r"$I_{-w_t}(x)=(x+w_t)/|x+w_t|^2$",
+                "pᵢ⁰=M₋w*(xᵢ⁰), w(t)",
+                "rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰), Sᵣ(w)(u)=const",
+                "U_wₜ(x): |U_wₜ(x)−wₜ|=1",
+                "I₋wₜ(x)=(x+wₜ)/|x+wₜ|²",
             ),
             horizontal_spacing=0.08,
             vertical_spacing=0.12,
@@ -2313,25 +2308,25 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
             self._add_trace_to_subplot(fig, trace, key, row, col)
 
         cx, cy = _circle_xy()
-        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name=r"$\partial\mathbb{B}^2$", hoverinfo="skip"), "disk", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(20,20,20,0.35)", width=2), name=r"$w(t)$", hoverinfo="skip"), "orbit_path", 1, 1)
-        add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=11, color="white", line=dict(color="black", width=2)), name=r"$\sum_i a_i p_i^0=0$"), "core_balance", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#244C9A", opacity=0.72), name=r"$p_i^0$"), "anchors", 1, 1)
+        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name="∂𝔹²", hoverinfo="skip"), "disk", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(20,20,20,0.35)", width=2), name="w(t)", hoverinfo="skip"), "orbit_path", 1, 1)
+        add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=11, color="white", line=dict(color="black", width=2)), name="Σᵢ aᵢ pᵢ⁰=0"), "core_balance", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#244C9A", opacity=0.72), name="pᵢ⁰"), "anchors", 1, 1)
         if self.select_pi:
-            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name=r"$\mathrm{selected}\ p_i^0$"), "selected_anchor", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black"), name=r"$w$"), "w", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 9], color="#D72638"), name=r"$R_{p^0}(w)=\sum_i a_i r_i(w)$"), "R_arrow", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#188038", width=3, dash="dash"), marker=dict(size=[0, 7], color="#188038"), name=r"$\dot w$"), "vel_arrow", 1, 1)
+            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name="selected pᵢ⁰"), "selected_anchor", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black"), name="w"), "w", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 9], color="#D72638"), name="Rₚ⁰(w)=Σᵢ aᵢ rᵢ(w)"), "R_arrow", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#188038", width=3, dash="dash"), marker=dict(size=[0, 7], color="#188038"), name="ẇ"), "vel_arrow", 1, 1)
 
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name=r"$S_{r(w)}(u)=\mathrm{const}$", hoverinfo="skip"), "ref_phase", 1, 2)
-        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name=r"$\partial\mathbb{B}^2$", hoverinfo="skip", showlegend=False), "ref_circle", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name=r"$r_i(w)$"), "reflected", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name=r"$w:\sum_i a_iM_w(r_i(w))=0$"), "ref_w", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name=r"$R_{p^0}(w)$"), "R_circle", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name=r"$\mathrm{Cov}(r_i(w))$", hoverinfo="skip"), "ellipse", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name="Sᵣ(w)(u)=const", hoverinfo="skip"), "ref_phase", 1, 2)
+        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name="∂𝔹²", hoverinfo="skip", showlegend=False), "ref_circle", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name="rᵢ(w)"), "reflected", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name="w: Σᵢ aᵢ M_w(rᵢ(w))=0"), "ref_w", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name="Rₚ⁰(w)"), "R_circle", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name="Cov(rᵢ(w))", hoverinfo="skip"), "ellipse", 1, 2)
 
         self._add_dynamic_inversion_chart_traces("inv_w", 2, 1, transform_name="U")
-        self._add_dynamic_inversion_chart_traces("inv_neg_w", 2, 2, center_name=r"$c=-w_t$")
+        self._add_dynamic_inversion_chart_traces("inv_neg_w", 2, 2, center_name="c=-wₜ")
 
         fig.update_layout(
             width=self.width,
@@ -2349,12 +2344,12 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         for axis, anchor in (("yaxis3", "x3"), ("yaxis4", "x4")):
             fig.layout[axis].update(zeroline=True, showgrid=True, scaleanchor=anchor, scaleratio=1)
         for row, col in ((1, 1), (1, 2)):
-            fig.update_xaxes(title_text=r"$e_1$", row=row, col=col)
-            fig.update_yaxes(title_text=r"$e_2$", row=row, col=col)
-        fig.update_xaxes(title_text=r"$U_{w_t}(e_1)$", row=2, col=1)
-        fig.update_yaxes(title_text=r"$U_{w_t}(e_2)$", row=2, col=1)
-        fig.update_xaxes(title_text=r"$I_{-w_t}(e_1)$", row=2, col=2)
-        fig.update_yaxes(title_text=r"$I_{-w_t}(e_2)$", row=2, col=2)
+            fig.update_xaxes(title_text="e₁", row=row, col=col)
+            fig.update_yaxes(title_text="e₂", row=row, col=col)
+        fig.update_xaxes(title_text="U_wₜ(e₁)", row=2, col=1)
+        fig.update_yaxes(title_text="U_wₜ(e₂)", row=2, col=1)
+        fig.update_xaxes(title_text="I₋wₜ(e₁)", row=2, col=2)
+        fig.update_yaxes(title_text="I₋wₜ(e₂)", row=2, col=2)
         _sanitize_figure_text(fig)
         self._configure_subplot_legends()
 
@@ -2378,7 +2373,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="lines",
                 line=dict(color="rgba(20,20,20,0.75)", width=2),
-                name=rf"${prefix_label}(\partial\mathbb{{B}}^2)$",
+                name=f"{prefix_label}(∂𝔹²)",
                 hoverinfo="skip",
                 showlegend=False,
             ),
@@ -2390,7 +2385,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="lines",
                 line=dict(color="rgba(20,20,20,0.35)", width=2),
-                name=rf"${prefix_label}(w(t))$",
+                name=f"{prefix_label}(w(t))",
                 hoverinfo="skip",
             ),
             "orbit_path",
@@ -2401,7 +2396,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="markers",
                 marker=dict(size=11, color="white", line=dict(color="black", width=2)),
-                name=rf"${prefix_label}(0)$",
+                name=f"{prefix_label}(0)",
             ),
             "core_balance",
         )
@@ -2411,7 +2406,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="markers",
                 marker=dict(size=8, color="#244C9A", opacity=0.72),
-                name=rf"${prefix_label}(p_i^0)$",
+                name=f"{prefix_label}(pᵢ⁰)",
             ),
             "anchors",
         )
@@ -2422,7 +2417,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                     y=[],
                     mode="markers",
                     marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)),
-                    name=rf"${prefix_label}(\mathrm{{selected}}\ p_i^0)$",
+                    name=f"{prefix_label}(selected pᵢ⁰)",
                 ),
                 "selected_anchor",
             )
@@ -2433,7 +2428,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="markers",
                 marker=dict(size=13, color="black"),
-                name=rf"${prefix_label}(w_t)$",
+                name=f"{prefix_label}(wₜ)",
             ),
             "w",
         )
@@ -2444,7 +2439,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 mode="lines+markers",
                 line=dict(color="#D72638", width=4),
                 marker=dict(size=[0, 9], color="#D72638"),
-                name=rf"${prefix_label}(w_t+R_{{p^0}}(w))$",
+                name=f"{prefix_label}(wₜ+Rₚ⁰(w))",
             ),
             "R_arrow",
         )
@@ -2455,7 +2450,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 mode="lines+markers",
                 line=dict(color="#188038", width=3, dash="dash"),
                 marker=dict(size=[0, 7], color="#188038"),
-                name=rf"${prefix_label}(w_t+\dot w)$",
+                name=f"{prefix_label}(wₜ+ẇ)",
             ),
             "vel_arrow",
         )
@@ -2552,7 +2547,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 frame_arrays=frame_arrays,
             )
         )
-        payload["stats"] += f"; dynamic inversion centers $|w|={float(np.linalg.norm(w_np)):.6f}$"
+        payload["stats"] += f"; dynamic inversion centers |w|={float(np.linalg.norm(w_np)):.6f}"
         return payload
 
     def _finalize_frame_payloads(
@@ -2633,11 +2628,11 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
 
     The bottom row shows the modified chart
 
-        (u, lambda) = (lambda <S_xi(w), e_perp>, lambda),
-        lambda = exp(-S_{p^0}(w)) = exp(Phi_{p^0}(w)),
+        (u, λ) = (λ <S_ξ(w), e⊥>, λ),
+        λ = exp(-Sₚ⁰(w)) = exp(Φₚ⁰(w)),
 
-    where S_{p^0} is the total weighted Busemann phase of the canonical
-    constants p_i^0 and xi is the normalized exact gauge direction
+    where Sₚ⁰ is the total weighted Busemann phase of the canonical
+    constants pᵢ⁰ and ξ is the normalized exact gauge direction
     w_*/|w_*|.  This keeps the Cayley puncture tied to the canonical orbit,
     not to a free UI angle.
     """
@@ -2693,8 +2688,8 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         return (
             "<b>LMS optical reflected-ray explorer + weighted Cayley chart</b><br>"
             "Bottom: modified Cayley half-plane with "
-            "$\\lambda=\\exp(-S_{p^0}(w))=\\exp(\\Phi_{p^0}(w))$ and puncture "
-            "$\\xi=w_\\ast/|w_\\ast|$ from the exact gauge."
+            "λ=exp(-Sₚ⁰(w))=exp(Φₚ⁰(w)) and puncture "
+            "ξ=w*/|w*| from the exact gauge."
         )
 
     def _make_subplot_figure(self) -> Any:
@@ -2707,11 +2702,11 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 [{"colspan": 2}, None],
             ],
             subplot_titles=(
-                r"$p_i^0=M_{-w_\ast}(x_i^0),\quad w(t)$",
-                r"$r_i(w)=H_{p_i^0-w}(p_i^0),\quad S_{r(w)}(u)=\mathrm{const}$",
-                r"$R_{p^0}(w)=\sum_i a_i r_i(w)$",
-                r"$p_i^0\mapsto r_i(w)$",
-                r"$\operatorname{Cay}_\xi(w)=(u,\lambda)$",
+                "pᵢ⁰=M₋w*(xᵢ⁰), w(t)",
+                "rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰), Sᵣ(w)(u)=const",
+                "Rₚ⁰(w)=Σᵢ aᵢ rᵢ(w)",
+                "pᵢ⁰ → rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰)",
+                "Cay_ξ(w)=(u,λ)",
             ),
             row_heights=[0.30, 0.28, 0.42],
             horizontal_spacing=0.08,
@@ -2728,7 +2723,7 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="lines",
                 line=dict(color="rgba(0,0,0,0.55)", width=1.5),
-                name=r"$\lambda=0$",
+                name="λ=0",
                 hoverinfo="skip",
                 showlegend=False,
             ),
@@ -2740,7 +2735,7 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="markers",
                 marker=dict(size=7, color="#244C9A", opacity=0.65),
-                name=r"$\partial\operatorname{Cay}_\xi(p_i^0)$",
+                name="∂Cay_ξ(pᵢ⁰)",
             ),
             "cayley_boundary",
         )
@@ -2750,7 +2745,7 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="lines",
                 line=dict(color="#6F4CC3", width=3),
-                name=r"$\operatorname{Cay}_\xi(w(t))$",
+                name="Cay_ξ(w(t))",
             ),
             "cayley_path",
         )
@@ -2761,7 +2756,7 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 mode="lines+markers",
                 line=dict(color="#D72638", width=3),
                 marker=dict(size=[0, 9], color="#D72638"),
-                name=r"$\Delta\operatorname{Cay}$",
+                name="ΔCay",
             ),
             "cayley_step",
         )
@@ -2771,19 +2766,19 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="markers",
                 marker=dict(size=13, color="black"),
-                name=r"$\operatorname{Cay}_\xi(w)$",
+                name="Cay_ξ(w)",
             ),
             "cayley_point",
         )
         self.fig.update_xaxes(
-            title_text=r"$u$",
+            title_text="u",
             zeroline=True,
             showgrid=True,
             row=3,
             col=1,
         )
         self.fig.update_yaxes(
-            title_text=r"$\lambda$",
+            title_text="λ",
             rangemode="tozero",
             zeroline=False,
             showgrid=True,
@@ -2885,10 +2880,10 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
             payload["cayley_regular_x_range"] = regular_x_range
             payload["cayley_regular_y_range"] = regular_y_range
             payload["stats"] += (
-                f"; $S_{{p^0}}(w)={float(weighted_chart['phase'][i]):.6f}$; "
-                f"$\\Phi_{{p^0}}(w)={float(-weighted_chart['phase'][i]):.6f}$; "
-                f"$\\lambda_{{\\mathrm{{weighted}}}}={float(weighted_chart['lambda'][i]):.6g}$; "
-                f"$\\lambda_{{\\mathrm{{regular}}}}={float(regular_chart['lambda'][i]):.6g}$"
+                f"; Sₚ⁰(w)={float(weighted_chart['phase'][i]):.6f}; "
+                f"Φₚ⁰(w)={float(-weighted_chart['phase'][i]):.6f}; "
+                f"λ_wtd={float(weighted_chart['lambda'][i]):.6g}; "
+                f"λ_reg={float(regular_chart['lambda'][i]):.6g}"
             )
         return payloads
 
@@ -2899,11 +2894,11 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         prefix = self._active_cayley_prefix()
         payload0 = self._frame_payloads[0]
         if prefix == "cayley_regular":
-            title_x = r"$u,\quad \xi_t=w_t/|w_t|$"
-            title_y = r"$\lambda=\exp(-\mathcal{B}_{\xi_t}(w_t))$"
+            title_x = "u, ξₜ=wₜ/|wₜ|"
+            title_y = "λ=exp(-B_ξₜ(wₜ))"
         else:
-            title_x = r"$u=\exp(-S_{p^0}(w))\,\langle\mathfrak{S}_{\xi}(w),e_\perp\rangle$"
-            title_y = r"$\lambda=\exp(-S_{p^0}(w))=\exp(\Phi_{p^0}(w))$"
+            title_x = "u=exp(-Sₚ⁰(w))·<S_ξ(w),e⊥>"
+            title_y = "λ=exp(-Sₚ⁰(w))=exp(Φₚ⁰(w))"
         with self.fig.batch_update():
             # The full Cayley path, the axis trace, and the weighted
             # boundary are constant across frames for a given prefix.
@@ -2914,8 +2909,8 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
             if prefix == "cayley_weighted":
                 self.fig.data[self.tr["cayley_boundary"]].x = _plotly_values(payload0[f"{prefix}_boundary_x"])
                 self.fig.data[self.tr["cayley_boundary"]].y = _plotly_values(payload0[f"{prefix}_boundary_y"])
-            self.fig.update_xaxes(title_text=_sanitize_plot_text(title_x), range=payload0[f"{prefix}_x_range"], row=3, col=1)
-            self.fig.update_yaxes(title_text=_sanitize_plot_text(title_y), range=payload0[f"{prefix}_y_range"], row=3, col=1)
+            self.fig.update_xaxes(title_text=title_x, range=payload0[f"{prefix}_x_range"], row=3, col=1)
+            self.fig.update_yaxes(title_text=title_y, range=payload0[f"{prefix}_y_range"], row=3, col=1)
 
     def _apply_dynamic_payload_to_figure(self, payload: dict[str, Any]) -> None:
         super()._apply_dynamic_payload_to_figure(payload)
@@ -2950,8 +2945,8 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
         return (
             "<b>LMS hyperboloid + optical screen chart</b><br>"
             "The reflected-cloud panel is the unchanged evolution view. "
-            "The other panels show $X(w)$, null constants $\\ell_i=(1,p_i^0)$, "
-            "ray fields $u_i$, and the transverse spread coefficient $\\Theta_\\perp$."
+            "The other panels show X(w), null constants ℓᵢ=(1,pᵢ⁰), "
+            "ray fields uᵢ, and the transverse spread coefficient Θ⊥."
         )
 
     def _make_subplot_figure(self) -> Any:
@@ -2963,10 +2958,10 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
                 [{"type": "xy"}, {"type": "xy", "secondary_y": True}],
             ],
             subplot_titles=(
-                r"$X(w),\quad \ell_i,\quad u_i,\quad U$",
-                r"$r_i(w)=H_{p_i^0-w}(p_i^0),\quad S_{r(w)}(u)=\mathrm{const}$",
-                r"$\beta_i=\langle u_i,E_\perp\rangle_L,\quad \Theta_\perp$",
-                r"$|R_{p^0}(w)|,\quad \Theta_\perp,\quad \Phi_{p^0}(w)$",
+                "X(w), ℓᵢ, uᵢ, U",
+                "rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰), Sᵣ(w)(u)=const",
+                "βᵢ=<uᵢ,E⊥>_L, Θ⊥",
+                "|Rₚ⁰(w)|, Θ⊥, Φₚ⁰(w)",
             ),
             horizontal_spacing=0.08,
             vertical_spacing=0.12,
@@ -2996,39 +2991,39 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
                     y=dict(show=True, color="rgba(70,110,160,0.32)", width=1),
                     z=dict(show=True, color="rgba(70,110,160,0.38)", width=1),
                 ),
-                name=r"$\mathbb H^2$",
+                name="H²",
                 hoverinfo="skip",
             ),
             "hyper_surface",
             1,
             1,
         )
-        add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="rgba(70,70,70,0.55)", width=3), name=r"$t\ell_i=t(1,p_i^0)$", hoverinfo="skip"), "hyper_null", 1, 1)
-        add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="rgba(36,76,154,0.42)", width=3), name=r"$X(rp_i^0)$", hoverinfo="skip"), "hyper_geodesics", 1, 1)
-        add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="#6F4CC3", width=5), name=r"$X(w(t))$"), "hyper_path", 1, 1)
-        add(go.Scatter3d(x=[], y=[], z=[], mode="markers", marker=dict(size=5, color="black"), name=r"$X(w)$"), "hyper_X", 1, 1)
-        add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="rgba(91,140,90,0.55)", width=3), name=r"$u_i$", hoverinfo="skip"), "hyper_u", 1, 1)
-        add(go.Scatter3d(x=[], y=[], z=[], mode="lines+markers", line=dict(color="#D72638", width=7), marker=dict(size=4, color="#D72638"), name=r"$U=\sum_i a_i u_i$"), "hyper_U", 1, 1)
+        add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="rgba(70,70,70,0.55)", width=3), name="tℓᵢ=t(1,pᵢ⁰)", hoverinfo="skip"), "hyper_null", 1, 1)
+        add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="rgba(36,76,154,0.42)", width=3), name="X(rpᵢ⁰)", hoverinfo="skip"), "hyper_geodesics", 1, 1)
+        add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="#6F4CC3", width=5), name="X(w(t))"), "hyper_path", 1, 1)
+        add(go.Scatter3d(x=[], y=[], z=[], mode="markers", marker=dict(size=5, color="black"), name="X(w)"), "hyper_X", 1, 1)
+        add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="rgba(91,140,90,0.55)", width=3), name="uᵢ", hoverinfo="skip"), "hyper_u", 1, 1)
+        add(go.Scatter3d(x=[], y=[], z=[], mode="lines+markers", line=dict(color="#D72638", width=7), marker=dict(size=4, color="#D72638"), name="U=Σᵢ aᵢ uᵢ"), "hyper_U", 1, 1)
 
         cx, cy = _circle_xy()
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name=r"$S_{r(w)}(u)=\mathrm{const}$", hoverinfo="skip"), "ref_phase", 1, 2)
-        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name=r"$\partial\mathbb{B}^2$", hoverinfo="skip", showlegend=False), "ref_circle", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name=r"$r_i(w)$"), "reflected", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name=r"$w:\sum_i a_iM_w(r_i(w))=0$"), "ref_w", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name=r"$R_{p^0}(w)$"), "R_circle", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name=r"$\mathrm{Cov}(r_i(w))$", hoverinfo="skip"), "ellipse", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name="Sᵣ(w)(u)=const", hoverinfo="skip"), "ref_phase", 1, 2)
+        add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name="∂𝔹²", hoverinfo="skip", showlegend=False), "ref_circle", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name="rᵢ(w)"), "reflected", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name="w: Σᵢ aᵢ M_w(rᵢ(w))=0"), "ref_w", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name="Rₚ⁰(w)"), "R_circle", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name="Cov(rᵢ(w))", hoverinfo="skip"), "ellipse", 1, 2)
 
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.45)", width=2), name=r"$\beta=0$", showlegend=False, hoverinfo="skip"), "screen_axis", 2, 1)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(91,140,90,0.42)", width=1.5), name=r"$a_i\beta_i$", hoverinfo="skip"), "screen_stems", 2, 1)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=9, color="#5B8C5A", opacity=0.82), name=r"$\beta_i$"), "screen_beta", 2, 1)
-        add(go.Scatter(x=[], y=[], mode="text", text=[], textfont=dict(color="#D72638", size=13), name=r"$\Theta_\perp$", hoverinfo="skip"), "screen_theta_text", 2, 1)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.45)", width=2), name="β=0", showlegend=False, hoverinfo="skip"), "screen_axis", 2, 1)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(91,140,90,0.42)", width=1.5), name="aᵢβᵢ", hoverinfo="skip"), "screen_stems", 2, 1)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=9, color="#5B8C5A", opacity=0.82), name="βᵢ"), "screen_beta", 2, 1)
+        add(go.Scatter(x=[], y=[], mode="text", text=[], textfont=dict(color="#D72638", size=13), name="Θ⊥", hoverinfo="skip"), "screen_theta_text", 2, 1)
 
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#D72638", width=2.5), name=r"$|R_{p^0}|$"), "diag_R", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#188038", width=2.5), name=r"$\Theta_\perp$"), "diag_theta", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#6F4CC3", width=2.0, dash="dot"), name=r"$\Phi_{p^0}$"), "diag_phi", 2, 2, secondary_y=True)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=10, color="#D72638"), name=r"$\mathrm{current}$", showlegend=False), "diag_R_point", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=10, color="#188038"), name=r"$\mathrm{current}$", showlegend=False), "diag_theta_point", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=10, color="#6F4CC3"), name=r"$\mathrm{current}$", showlegend=False), "diag_phi_point", 2, 2, secondary_y=True)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#D72638", width=2.5), name="|Rₚ⁰|"), "diag_R", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#188038", width=2.5), name="Θ⊥"), "diag_theta", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#6F4CC3", width=2.0, dash="dot"), name="Φₚ⁰"), "diag_phi", 2, 2, secondary_y=True)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=10, color="#D72638"), name="current", showlegend=False), "diag_R_point", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=10, color="#188038"), name="current", showlegend=False), "diag_theta_point", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=10, color="#6F4CC3"), name="current", showlegend=False), "diag_phi_point", 2, 2, secondary_y=True)
 
         fig.update_layout(
             width=self.width,
@@ -3039,20 +3034,20 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
         )
         fig.update_layout(
             scene=dict(
-                xaxis_title=r"$X_1$",
-                yaxis_title=r"$X_2$",
-                zaxis_title=r"$X_0$",
+                xaxis_title="X₁",
+                yaxis_title="X₂",
+                zaxis_title="X₀",
                 aspectmode="data",
                 camera=dict(eye=dict(x=1.55, y=1.35, z=1.05)),
             )
         )
-        fig.update_xaxes(range=[-1.15, 1.15], zeroline=False, showgrid=False, title_text=r"$e_1$", row=1, col=2)
-        fig.update_yaxes(range=[-1.15, 1.15], zeroline=False, showgrid=False, scaleanchor="x", scaleratio=1, title_text=r"$e_2$", row=1, col=2)
-        fig.update_xaxes(title_text=r"$\beta_i=\langle u_i,E_\perp\rangle_L$", zeroline=True, showgrid=True, row=2, col=1)
-        fig.update_yaxes(title_text=r"$a_i$", rangemode="tozero", showgrid=True, row=2, col=1)
-        fig.update_xaxes(title_text=r"$\mathrm{frame}$", showgrid=True, row=2, col=2)
-        fig.update_yaxes(title_text=r"$|R_{p^0}|,\ \Theta_\perp$", showgrid=True, row=2, col=2, secondary_y=False)
-        fig.update_yaxes(title_text=r"$\Phi_{p^0}(w)$", showgrid=False, row=2, col=2, secondary_y=True)
+        fig.update_xaxes(range=[-1.15, 1.15], zeroline=False, showgrid=False, title_text="e₁", row=1, col=2)
+        fig.update_yaxes(range=[-1.15, 1.15], zeroline=False, showgrid=False, scaleanchor="x", scaleratio=1, title_text="e₂", row=1, col=2)
+        fig.update_xaxes(title_text="βᵢ=<uᵢ,E⊥>_L", zeroline=True, showgrid=True, row=2, col=1)
+        fig.update_yaxes(title_text="aᵢ", rangemode="tozero", showgrid=True, row=2, col=1)
+        fig.update_xaxes(title_text="frame", showgrid=True, row=2, col=2)
+        fig.update_yaxes(title_text="|Rₚ⁰|, Θ⊥", showgrid=True, row=2, col=2, secondary_y=False)
+        fig.update_yaxes(title_text="Φₚ⁰(w)", showgrid=False, row=2, col=2, secondary_y=True)
         self._hyper_static_applied = False
         _sanitize_figure_text(fig)
         self._configure_subplot_legends()
@@ -3167,7 +3162,7 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
                     "screen_stems_y": stems_y,
                     "screen_theta_text_x": [0.0],
                     "screen_theta_text_y": [1.18 * max_weight],
-                    "screen_theta_text": [f"Theta_perp={theta_perp[i]:+.4f}"],
+                    "screen_theta_text": [f"Θ⊥={theta_perp[i]:+.4f}"],
                     "theta_perp": float(theta_perp[i]),
                     "A_perp": float(A_perp[i]),
                     "diag_point_x": [float(frames[i])],
@@ -3177,8 +3172,8 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
                 }
             )
             payload["stats"] += (
-                f"; $A_\\perp={float(A_perp[i]):.6f}$; "
-                f"$\\Theta_\\perp={float(theta_perp[i]):.6f}$"
+                f"; A⊥={float(A_perp[i]):.6f}; "
+                f"Θ⊥={float(theta_perp[i]):.6f}"
             )
         return payloads
 
