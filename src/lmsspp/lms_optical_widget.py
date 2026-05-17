@@ -2,16 +2,19 @@
 
 This module visualizes the Householder/geometric-optics decomposition
 
-    Rₚ⁰(w) = ∑ᵢ aᵢ H_{pᵢ⁰-w}(pᵢ⁰)
-           = -∑ᵢ aᵢ M_w(pᵢ⁰),
-    dw/dt = 0.5 * (1 - |w|^2) * R_{p^0}(w).
+    R_ξ(w) = -∑ᵢ aᵢ xᵢ(w),  xᵢ(w) = -Hξᵢ-w(ξᵢ)
+           = -∑ᵢ aᵢ M_w(ξᵢ),
+    dw/dt = 0.5 * (1 - |w|^2) * R_ξ(w).
 
-The points p_i^0 are frozen canonical shape constants on S^{d-1}.  They are
-computed from an observed cloud x_i^0 by the exact gauge equation
-∑ᵢ aᵢ M_{-w_*}(x_i^0)=0 and p_i^0=M_{-w_*}(x_i^0).  The reflected cloud
-r_i(w)=H_{p_i^0-w}(p_i^0) is the hidden optical object: its
-barycenter R_{p^0}(w) is the direction of the reduced motion, |R_{p^0}(w)| is the
-ray coherence, and its covariance records angular dispersion.
+The points ξ_i are frozen canonical shape constants on S^{d-1}.  When using the
+built-in optical presets (random / balanced / clustered / dipole), those
+patterns are sampled as a reference template on ξ, then lifted to exact
+Busemann gauge if needed before forming the time-zero observed cloud
+x_i=M_{w_*}(ξ_i).  For a user-supplied cloud, ξ_i is computed from the exact
+gauge equation ∑ᵢ aᵢ M_{-w_*}(x_i)=0 and ξ_i=M_{-w_*}(x_i).  The moving optical cloud
+x_i(w)=-Hξ_i-w(ξ_i) is the hidden optical object: -∑ᵢ aᵢ x_i(w)
+is the direction of the reduced motion, |R_ξ(w)| is the ray coherence, and
+its covariance records angular dispersion.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .core.canonical_gauge import canonical_cloud
+from .core.canonical_gauge import CanonicalCloud, canonical_cloud, canonical_residual
 from .core.lms import DEFAULT_EPS, dot, mobius_sphere, normalize
 
 try:  # Optional widget dependency.
@@ -60,6 +63,32 @@ class OpticalState:
     second_moment: Tensor
     covariance_evals: Tensor
     covariance_evecs: Tensor
+
+
+@dataclass(frozen=True)
+class CanonicalInitialization:
+    """Exact canonical-gauge initialization data for one generated cloud."""
+
+    candidate_points: np.ndarray
+    observed_points: np.ndarray
+    reference_points: np.ndarray
+    weights: np.ndarray
+    target_w: np.ndarray
+    candidate_z_star: np.ndarray
+    candidate_w_star: np.ndarray
+    z_star: np.ndarray
+    w_star: np.ndarray
+    candidate_residual_norm: float
+    candidate_center_error: float
+    residual_norm: float
+    center_error: float
+    candidate_converged: bool
+    converged: bool
+    candidate_iterations: int
+    iterations: int
+    candidate_radius: float
+    achieved_radius: float
+    radius_error: float
 
 
 def _require_widgets() -> None:
@@ -116,7 +145,7 @@ def householder_reflected_points(
     *,
     eps: float = DEFAULT_EPS,
 ) -> Tensor:
-    """Return r_i(w)=H_{p_i-w}(p_i) using the Householder formula.
+    """Return Hp_i-w(p_i) using the Householder formula.
 
     The Householder normal is n_i=p_i-w and
 
@@ -133,7 +162,7 @@ def householder_reflected_points(
 
 
 def reflected_points(w: Tensor | np.ndarray, points: Tensor | np.ndarray) -> Tensor:
-    """Return the reflected ray cloud r_i(w).
+    """Return the Householder image cloud Hp_i-w(p_i).
 
     This wrapper uses the Householder implementation, not the Mobius shortcut,
     so the optics construction remains explicit.
@@ -142,7 +171,7 @@ def reflected_points(w: Tensor | np.ndarray, points: Tensor | np.ndarray) -> Ten
 
 
 def mobius_reflection_error(w: Tensor | np.ndarray, points: Tensor | np.ndarray) -> Tensor:
-    """Return max_i |H_{p_i-w}(p_i) + M_w(p_i)| for identity checks."""
+    """Return max_i |Hp_i-w(p_i) + M_w(p_i)| for identity checks."""
     P, _ = _prepare_points_weights(points)
     ww = _as_tensor(w, dtype=P.dtype).to(dtype=P.dtype, device=P.device).reshape(P.shape[1])
     r_house = reflected_points(ww, P)
@@ -155,7 +184,7 @@ def reflected_barycenter(
     points: Tensor | np.ndarray,
     weights: Tensor | np.ndarray | None = None,
 ) -> Tensor:
-    """Return R_p(w)=∑ᵢ aᵢ rᵢ(w)."""
+    """Return R_p(w)=-∑ᵢ aᵢ xᵢ(w), with xᵢ(w)=-Hp_i-w(p_i)."""
     P, a = _prepare_points_weights(points, weights)
     R = reflected_points(_as_tensor(w, dtype=P.dtype).to(dtype=P.dtype, device=P.device), P)
     return (a[:, None] * R).sum(dim=0)
@@ -205,7 +234,7 @@ def ray_second_moment(
     points: Tensor | np.ndarray,
     weights: Tensor | np.ndarray | None = None,
 ) -> Tensor:
-    """Return A_p(w)=∑ᵢ aᵢ rᵢ(w) rᵢ(w)^T."""
+    """Return the sign-invariant second moment of the optical cloud."""
     P, a = _prepare_points_weights(points, weights)
     Rpts = reflected_points(_as_tensor(w, dtype=P.dtype).to(dtype=P.dtype, device=P.device), P)
     return (a[:, None, None] * (Rpts[:, :, None] * Rpts[:, None, :])).sum(dim=0)
@@ -216,7 +245,7 @@ def ray_covariance(
     points: Tensor | np.ndarray,
     weights: Tensor | np.ndarray | None = None,
 ) -> Tensor:
-    """Return C_p(w)=∑ᵢ aᵢ (rᵢ-R)(rᵢ-R)^T."""
+    """Return the sign-invariant covariance of the optical cloud."""
     P, a = _prepare_points_weights(points, weights)
     Rpts = reflected_points(_as_tensor(w, dtype=P.dtype).to(dtype=P.dtype, device=P.device), P)
     Rbar = (a[:, None] * Rpts).sum(dim=0)
@@ -229,7 +258,7 @@ def ray_principal_axes(
     points: Tensor | np.ndarray,
     weights: Tensor | np.ndarray | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Return eigenvalues/eigenvectors of the reflected-ray covariance."""
+    """Return eigenvalues/eigenvectors of the optical cloud covariance."""
     C = ray_covariance(w, points, weights)
     vals, vecs = torch.linalg.eigh(C)
     return vals, vecs
@@ -475,6 +504,174 @@ def _random_sphere_points_np(
     return x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
 
 
+def _normalize_np(x: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+    arr = np.asarray(x, dtype=np.float64)
+    return arr / np.maximum(np.linalg.norm(arr, axis=-1, keepdims=True), float(eps))
+
+
+def _unit_direction_np(direction: np.ndarray | None, d: int, *, eps: float = 1e-12) -> np.ndarray:
+    if direction is None:
+        u = np.zeros(int(d), dtype=np.float64)
+        u[0] = 1.0
+        return u
+    u = np.asarray(direction, dtype=np.float64).reshape(int(d))
+    n = float(np.linalg.norm(u))
+    if not np.isfinite(n) or n <= float(eps):
+        u = np.zeros(int(d), dtype=np.float64)
+        u[0] = 1.0
+        return u
+    return u / n
+
+
+def _householder_map_e0_to(target: np.ndarray) -> np.ndarray:
+    """Return an orthogonal matrix H with H @ e0 == target (both unit vectors in R^d)."""
+    u = np.asarray(target, dtype=np.float64).reshape(-1)
+    d = int(u.size)
+    e0 = np.zeros(d, dtype=np.float64)
+    e0[0] = 1.0
+    v = e0 - u
+    nv = float(np.linalg.norm(v))
+    if nv <= 1e-15:
+        return np.eye(d, dtype=np.float64)
+    wv = v / nv
+    return np.eye(d, dtype=np.float64) - 2.0 * np.outer(wv, wv)
+
+
+def _euclidean_center_unit_sphere_np(
+    pts: np.ndarray,
+    weights: np.ndarray,
+    *,
+    max_iters: int = 48,
+    tol: float = 1e-13,
+) -> np.ndarray:
+    """Subtract the weighted Euclidean mean and renormalize to S^{d-1} until ∑ᵢ aᵢ xᵢ≈0."""
+    x = np.asarray(pts, dtype=np.float64).reshape(-1, pts.shape[-1])
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    w = w / float(np.sum(w))
+    for _ in range(int(max_iters)):
+        mu = np.sum(w[:, None] * x, axis=0)
+        if float(np.linalg.norm(mu)) <= float(tol):
+            break
+        x = _normalize_np(x - mu[None, :])
+    return x
+
+
+def _reference_cloud_from_preset_np(
+    n: int,
+    d: int,
+    rng: np.random.Generator,
+    *,
+    preset: OpticalPreset,
+    direction: np.ndarray,
+) -> np.ndarray:
+    """Sample a canonical reference-cloud template on S^{d-1}, then align its e1-axis with direction."""
+    xi = _random_sphere_points_np(int(n), int(d), rng, preset=preset)
+    h = _householder_map_e0_to(_unit_direction_np(direction, int(d)))
+    return (h @ xi.T).T
+
+
+def _template_to_canonical_reference_np(
+    xi: np.ndarray,
+    weights: np.ndarray,
+    *,
+    max_iters: int = 160,
+    tol: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor, CanonicalCloud | None]:
+    """Return exact Busemann-balanced ξ on S^{d-1} from a preset template.
+
+    If ∑ᵢ aᵢ ξᵢ=0 already (equivalently residual at z=0 is tiny), ``P`` is the
+    template.  Otherwise apply ``canonical_cloud`` once (Stage B) before orbit
+    placement.
+    """
+    P, a = _prepare_points_weights(xi, weights)
+    z0 = torch.zeros(int(P.shape[1]), dtype=P.dtype, device=P.device)
+    if float(torch.linalg.norm(canonical_residual(z0, P, a))) <= float(tol):
+        return P, a, None
+    lifted = canonical_cloud(P, a, max_iters=int(max_iters), tol=float(tol))
+    return lifted.P, a, lifted
+
+
+def _canonical_initialization_np(
+    n: int,
+    rng: np.random.Generator,
+    *,
+    preset: OpticalPreset,
+    target_radius: float,
+    direction: np.ndarray | None = None,
+    dimension: int = 2,
+) -> CanonicalInitialization:
+    """Build x, w_*, and xi by the exact finite-N canonical-gauge pipeline.
+
+    The preset selects the intrinsic shape of the canonical reference cloud ξ on
+    S^{d-1}.  A short Euclidean centering pass improves templates whose ambient
+    mean is not exactly zero; if needed, a single Busemann solve then lifts the
+    template to exact canonical gauge before forming xⁱ=M_{w_target}(ξⁱ).  The
+    final inverse solve on x recovers w_*=w_target up to numerical error.
+    """
+    d = max(2, int(dimension))
+    r = float(np.clip(float(target_radius), 0.0, 0.9995))
+    target_dir = _unit_direction_np(direction, d)
+    target_w_np = r * target_dir
+    n_eff = max(2, int(n))
+    weights = np.full((n_eff,), 1.0 / float(n_eff), dtype=np.float64)
+    xi = _reference_cloud_from_preset_np(n_eff, d, rng, preset=preset, direction=target_dir)
+    xi = _euclidean_center_unit_sphere_np(xi, weights)
+    P_ref, a_t, pre_lift = _template_to_canonical_reference_np(xi, weights)
+    target_w = torch.as_tensor(target_w_np, dtype=P_ref.dtype, device=P_ref.device)
+    observed_t = normalize(mobius_sphere(P_ref, target_w))
+    final_state = canonical_cloud(
+        observed_t,
+        a_t,
+        initial_center=-target_w,
+        max_iters=160,
+        tol=1e-10,
+    )
+
+    def as_np(value: Tensor) -> np.ndarray:
+        return value.detach().cpu().numpy().astype(np.float64)
+
+    w_star = as_np(final_state.w)
+    achieved_radius = float(np.linalg.norm(w_star))
+    z_dim = int(P_ref.shape[1])
+    z_zero = torch.zeros(z_dim, dtype=P_ref.dtype, device=P_ref.device)
+    if pre_lift is None:
+        cand_res = float(torch.linalg.norm(canonical_residual(z_zero, P_ref, a_t)))
+        cand_ce = float(torch.linalg.norm((a_t[:, None] * P_ref).sum(dim=0)))
+        cand_z = np.zeros(z_dim, dtype=np.float64)
+        cand_w = np.zeros(z_dim, dtype=np.float64)
+        cand_iter = 0
+        cand_conv = True
+    else:
+        cand_res = float(pre_lift.residual_norm)
+        cand_ce = float(pre_lift.center_error)
+        cand_z = as_np(pre_lift.z)
+        cand_w = as_np(pre_lift.w)
+        cand_iter = int(pre_lift.iterations)
+        cand_conv = bool(pre_lift.converged)
+    return CanonicalInitialization(
+        candidate_points=np.asarray(xi, dtype=np.float64),
+        observed_points=as_np(observed_t),
+        reference_points=as_np(final_state.P),
+        weights=a_t.detach().cpu().numpy().astype(np.float64),
+        target_w=target_w_np.astype(np.float64),
+        candidate_z_star=cand_z,
+        candidate_w_star=cand_w,
+        z_star=as_np(final_state.z),
+        w_star=w_star,
+        candidate_residual_norm=cand_res,
+        candidate_center_error=cand_ce,
+        residual_norm=float(final_state.residual_norm),
+        center_error=float(final_state.center_error),
+        candidate_converged=cand_conv,
+        converged=bool(final_state.converged),
+        candidate_iterations=cand_iter,
+        iterations=int(final_state.iterations),
+        candidate_radius=float(np.linalg.norm(cand_w)),
+        achieved_radius=achieved_radius,
+        radius_error=abs(achieved_radius - r),
+    )
+
+
 def _initialized_observed_cloud_np(
     n: int,
     rng: np.random.Generator,
@@ -484,37 +681,15 @@ def _initialized_observed_cloud_np(
     direction: np.ndarray | None = None,
     dimension: int = 2,
 ) -> np.ndarray:
-    """Sample x_i^0 with a requested exact-gauge radius before inversion.
-
-    This is the 2D analogue of the 3D widget's radius-driven Poisson/reduced
-    initialization path: sample a base boundary cloud, exact-center it to get
-    constants p_i^0, then generate the observed cloud x_i^0=M_w(p_i^0) for a
-    requested |w|.  The widget still computes displayed w* from x_i^0 by exact
-    Busemann inversion afterward.
-    """
-    d = max(2, int(dimension))
-    base = _random_sphere_points_np(int(n), d, rng, preset=preset)
-    weights = np.full((base.shape[0],), 1.0 / float(base.shape[0]), dtype=np.float64)
-    P_t, a_t = _prepare_points_weights(base, weights)
-    try:
-        centered = canonical_cloud(P_t, a_t, max_iters=120, tol=1e-10).P
-    except Exception:
-        centered = P_t
-    if direction is None:
-        u = np.zeros(d, dtype=np.float64)
-        u[0] = 1.0
-    else:
-        u = np.asarray(direction, dtype=np.float64).reshape(d)
-        u_norm = float(np.linalg.norm(u))
-        if u_norm <= 1e-12:
-            u = np.zeros(d, dtype=np.float64)
-            u[0] = 1.0
-        else:
-            u = u / u_norm
-    r = float(np.clip(float(target_radius), 0.0, 0.985))
-    w = torch.as_tensor(r * u, dtype=centered.dtype, device=centered.device)
-    observed = normalize(mobius_sphere(centered, w))
-    return observed.detach().cpu().numpy().astype(np.float64)
+    """Return only the observed cloud x from the canonical initialization."""
+    return _canonical_initialization_np(
+        int(n),
+        rng,
+        preset=preset,
+        target_radius=float(target_radius),
+        direction=direction,
+        dimension=int(dimension),
+    ).observed_points
 
 
 def _angle2(theta: float) -> np.ndarray:
@@ -584,6 +759,43 @@ def _circle_xy(samples: int = 360) -> tuple[np.ndarray, np.ndarray]:
     return np.cos(t), np.sin(t)
 
 
+def _trajectory_biased_circle_xy(
+    samples: int,
+    w_series: np.ndarray,
+    *,
+    concentration: float,
+    min_grid_size: int = 65536,
+    eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample S^1 densely near the trajectory's closest approach to S^1."""
+    n = int(samples)
+    W = np.asarray(w_series, dtype=np.float64).reshape(-1, 2)
+    finite = np.isfinite(W).all(axis=1)
+    if n <= 1 or not finite.any():
+        return _circle_xy(samples=n)
+    W = W[finite]
+    norms = np.linalg.norm(W, axis=1)
+    if not np.isfinite(norms).any() or float(np.nanmax(norms)) < float(eps):
+        return _circle_xy(samples=n)
+
+    closest = W[int(np.nanargmax(norms))]
+    theta_close = float(np.arctan2(closest[1], closest[0]))
+    grid_size = max(int(min_grid_size), 4 * n)
+    theta = np.linspace(0.0, TAU, grid_size + 1, dtype=np.float64)
+
+    # The unnormalized density is largest near the trajectory side.
+    density = np.exp(float(concentration) * np.cos(theta - theta_close))
+    segment_mass = 0.5 * (density[:-1] + density[1:]) * np.diff(theta)
+    cdf = np.concatenate([[0.0], np.cumsum(segment_mass)])
+    total = float(cdf[-1])
+    if not np.isfinite(total) or total <= float(eps):
+        return _circle_xy(samples=n)
+
+    target = np.linspace(0.0, total, n, dtype=np.float64)
+    biased_theta = np.interp(target, cdf, theta)
+    return np.cos(biased_theta), np.sin(biased_theta)
+
+
 def _disk_click_grid(samples: int = 41, radius: float = 0.985) -> tuple[np.ndarray, np.ndarray]:
     vals = np.linspace(-float(radius), float(radius), int(samples))
     X, Y = np.meshgrid(vals, vals)
@@ -607,7 +819,7 @@ def _covariance_ellipse_2d(
 
 
 def _reflected_series_np(w_series: np.ndarray, points: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
-    """Vectorized r_i(w)=H_{p_i-w}(p_i) for many reduced points."""
+    """Vectorized Hp_i-w(p_i) for many reduced points."""
     P = np.asarray(points, dtype=np.float64)
     if P.ndim != 2:
         raise ValueError("points must have shape [N,d].")
@@ -645,20 +857,6 @@ def _spherical_inversion_chart_np(x: np.ndarray, center: np.ndarray, *, eps: flo
     return out.reshape(original_shape)
 
 
-def _unit_distance_chart_np(x: np.ndarray, center: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
-    """Map every nonzero radial distance from center to 1, preserving direction."""
-    X = np.asarray(x, dtype=np.float64)
-    original_shape = X.shape
-    c = np.asarray(center, dtype=np.float64).reshape(-1)
-    X2 = X.reshape(-1, c.shape[0])
-    diff = X2 - c[None, :]
-    dist = np.linalg.norm(diff, axis=1)
-    out = np.full_like(X2, np.nan)
-    mask = dist >= float(eps)
-    out[mask] = c[None, :] + diff[mask] / dist[mask][:, None]
-    return out.reshape(original_shape)
-
-
 def _phase_grids_for_reflected_series_np(
     reflected_series: np.ndarray,
     weights: np.ndarray,
@@ -668,9 +866,9 @@ def _phase_grids_for_reflected_series_np(
     clip_quantile: float = 0.03,
     max_elements: int = 18_000_000,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Evaluate S_{r(w)}(u) for all frames in chunks.
+    """Evaluate S_x(w)(u) for all frames in chunks.
 
-    The heavy work is batched over frames/grid/reflected points.  Marching-square
+    The heavy work is batched over frames/grid/input points.  Marching-square
     segment extraction is still per frame, but it consumes these cached grids
     and never runs in animation callbacks.
     """
@@ -709,10 +907,10 @@ def _weighted_busemann_phase_series_np(
     *,
     eps: float = 1e-12,
 ) -> np.ndarray:
-    """Return Sₚ⁰(wₜ)=∑ᵢ aᵢ log(|wₜ-pᵢ⁰|²/(1-|wₜ|²)).
+    """Return Sₚ(wₜ)=∑ᵢ aᵢ log(|wₜ-pᵢ|²/(1-|wₜ|²)).
 
     The convention in the reconstruction note is
-    Φₚ⁰(w)=-Sₚ⁰(w).
+    Φₚ(w)=-Sₚ(w).
     """
     W = np.asarray(w_series, dtype=np.float64).reshape(-1, 2)
     P = np.asarray(points, dtype=np.float64).reshape(-1, 2)
@@ -744,7 +942,7 @@ def hyperboloid_lift(w: Tensor | np.ndarray, *, eps: float = 1e-12) -> Tensor:
 
 
 def null_lift(points: Tensor | np.ndarray) -> Tensor:
-    """Lift boundary constants pᵢ⁰ in S¹ to null vectors ℓᵢ=(1,pᵢ⁰)."""
+    """Lift boundary constants pᵢ in S¹ to null vectors ℓᵢ=(1,pᵢ)."""
     P, _ = _prepare_points_weights(points)
     ones = torch.ones((P.shape[0], 1), dtype=P.dtype, device=P.device)
     return torch.cat([ones, P], dim=-1)
@@ -888,7 +1086,7 @@ def _hyperboloid_radial_geodesic_lines_2d(
     top_height: float,
     samples: int = 90,
 ) -> tuple[list[float | None], list[float | None], list[float | None]]:
-    """Return geodesics X(r p_i^0) ending at the chosen hyperboloid height."""
+    """Return geodesics X(r p_i) ending at the chosen hyperboloid height."""
     P = np.asarray(points, dtype=np.float64).reshape(-1, 2)
     height = max(1.02, float(top_height))
     r_max = math.sqrt(max(0.0, (height - 1.0) / (height + 1.0)))
@@ -919,12 +1117,12 @@ def _weighted_cayley_chart_series_2d(
     log_clip: float = 24.0,
     eps: float = 1e-12,
 ) -> dict[str, np.ndarray]:
-    """Modified Cayley chart with λ=exp(-Sₚ⁰(w)).
+    """Modified Cayley chart with λ=exp(-Sₚ(w)).
 
     For the usual Cayley chart centered at ξ, λ=exp(-B_ξ(w)).
     Here the horizontal direction still uses the ξ-tangential normalized
     action 𝔖_ξ(w)=2 P_ξ^⊥(w)/(1-|w|²), but λ is replaced
-    by the weighted total Busemann phase of the frozen constants pᵢ⁰.
+    by the weighted total Busemann phase of the frozen constants pᵢ.
     """
     W = np.asarray(w_series, dtype=np.float64).reshape(-1, 2)
     xi_arr = np.asarray(xi, dtype=np.float64).reshape(2)
@@ -976,13 +1174,13 @@ def _regular_cayley_chart_series_2d(
 ) -> dict[str, np.ndarray]:
     """Regular moving-puncture Cayley chart with ξₜ=wₜ/|wₜ|.
 
-    This uses the single Busemann factor B_{xi_t}(w_t):
+    This uses the single Busemann factor Bxi_t(w_t):
 
-        λₜ = exp(-B_{ξₜ}(wₜ))
+        λₜ = exp(-Bξₜ(wₜ))
            = (1-|wₜ|²)/|wₜ-ξₜ|².
 
     Since ξₜ is the current w-orientation, the current point usually lies on
-    the vertical axis u=0.  Frozen boundary constants pᵢ⁰ are re-charted at
+    the vertical axis u=0.  Frozen boundary constants pᵢ are re-charted at
     each frame.
     """
     W = np.asarray(w_series, dtype=np.float64).reshape(-1, 2)
@@ -1055,18 +1253,20 @@ class LMSOpticalDiskBaseWidget:
     `_layout_header_html` / `_augment_frame_payload` /
     `_finalize_frame_payloads`.
 
-    Left panel: the exact constants of motion pᵢ⁰=M₋w*(xᵢ⁰)
+    Left panel: the exact constants of motion pᵢ=M-w*(xᵢ)
     and the one-dimensional reduced orbit w(t) initialized at w(0)=w_*.
 
-    Right panel: the reflected cloud rᵢ(w)=H_{pᵢ⁰-w}(pᵢ⁰).  The Busemann
-    level sets shown there are the level sets of S_{r(w)}(u), and the current
-    w is the exact Busemann balance of rᵢ(w) up to numerical centering error.
-    The motion is still driven by the frozen constants pᵢ⁰ through
-    dw/dt=0.5*(1-|w|²)*∑ᵢ aᵢ rᵢ(w), not by the gradient of S_{r(w)} at w.
+    Right panel: the moving optical cloud xᵢ(w)=-Hpᵢ-w(pᵢ).  The Busemann
+    level sets shown there are the level sets of S_x(w)(u), and the current
+    w is the exact Busemann balance of -xᵢ(w) up to numerical centering error.
+    The motion is still driven by the frozen constants pᵢ through
+    dw/dt=-0.5*(1-|w|²)*∑ᵢ aᵢ xᵢ(w), not by the gradient of S_x(w) at w.
     """
 
     _DEFAULT_FLOW_TARGET_RADIUS = 0.999
     _FLOW_TARGET_FIT_TOLERANCE = 5e-4
+    _MAX_INTERNAL_PHYSICAL_STEP = 0.25
+    _MAX_INTERNAL_ES_STEP = 0.02
 
     def __init__(
         self,
@@ -1084,7 +1284,7 @@ class LMSOpticalDiskBaseWidget:
     ) -> None:
         _require_widgets()
         self.rng = np.random.default_rng(int(seed))
-        self.init_radius_value = float(np.clip(float(init_radius), 0.0, 0.985))
+        self.init_radius_value = float(np.clip(float(init_radius), 0.0005, 0.9995))
         self.grid_size = int(grid_size)
         # Contours are visual context, not integration data.  Capping their
         # precompute grid keeps notebook interaction responsive even when old
@@ -1097,22 +1297,34 @@ class LMSOpticalDiskBaseWidget:
         self._frame_index = 0
         self._cache_valid = False
         self._frame_payloads: list[dict[str, Any]] = []
-        self._flow_step_fit_cache: dict[tuple[str, str, int, float], dict[str, float | bool]] = {}
+        self._flow_step_fit_cache: dict[tuple[str, str, str, int, float], dict[str, float | bool]] = {}
         self._flow_step_fit_last: dict[str, Any] | None = None
         if points is None:
-            self.raw_points = self._sample_initialized_observed_cloud(
+            init_state = self._sample_canonical_initialization(
                 int(N),
                 preset=preset,
                 target_radius=self.init_radius_value,
             )
+            self._apply_canonical_initialization(init_state)
         else:
             self.raw_points = _prepare_points_weights(points, weights)[0].detach().cpu().numpy()
-        self.weights = (
-            np.full((self.raw_points.shape[0],), 1.0 / float(self.raw_points.shape[0]), dtype=np.float64)
-            if weights is None
-            else _prepare_points_weights(self.raw_points, weights)[1].detach().cpu().numpy()
-        )
-        self.points = self._canonicalized_points(self.raw_points)
+            self.observed_points = self.raw_points
+            self.weights = (
+                np.full((self.raw_points.shape[0],), 1.0 / float(self.raw_points.shape[0]), dtype=np.float64)
+                if weights is None
+                else _prepare_points_weights(self.raw_points, weights)[1].detach().cpu().numpy()
+            )
+            self.points = self._canonicalized_points(self.raw_points)
+            self.reference_points = self.points
+            self.candidate_points = np.empty((0, self.points.shape[1]), dtype=np.float64)
+            self.initialization_target_w = np.full((self.points.shape[1],), np.nan, dtype=np.float64)
+            self._initialization_state = None
+            self._candidate_radius = float("nan")
+            self._candidate_center_error = float("nan")
+            self._candidate_residual_norm = float("nan")
+            self._candidate_converged = False
+            self._candidate_iterations = 0
+            self._init_radius_error = float("nan")
         self._orbit = np.zeros((1, self.points.shape[1]), dtype=np.float64)
         self._orbit_r = np.zeros(1, dtype=np.float64)
         self._build_controls(preset=preset)
@@ -1131,25 +1343,63 @@ class LMSOpticalDiskBaseWidget:
 
     def _layout_header_html(self) -> str:
         return (
-            "<b>LMS optical reflected-ray explorer</b><br>"
-            "Input cloud {xᵢ⁰} is exactly deboosted to constants "
-            "pᵢ⁰=M₋w*(xᵢ⁰), then w(0)=w* is evolved by the frozen LMS field."
+            "<b>LMS optical moving optical x-cloud explorer</b><br>"
+            "Input cloud {xᵢ} is exactly deboosted to constants "
+            "ξᵢ=M-w*(xᵢ), then w(0)=w* is evolved by the frozen LMS field."
         )
+
+    def _initialization_dimension(self) -> int:
+        return 2
+
+    def _sample_canonical_initialization(
+        self,
+        n: int,
+        *,
+        preset: OpticalPreset,
+        target_radius: float,
+    ) -> CanonicalInitialization:
+        return _canonical_initialization_np(
+            int(n),
+            self.rng,
+            preset=preset,
+            target_radius=float(target_radius),
+            dimension=self._initialization_dimension(),
+        )
+
+    def _apply_canonical_initialization(self, state: CanonicalInitialization) -> None:
+        self._initialization_state = state
+        self.candidate_points = np.asarray(state.candidate_points, dtype=np.float64)
+        self.raw_points = np.asarray(state.observed_points, dtype=np.float64)
+        self.observed_points = self.raw_points
+        self.weights = np.asarray(state.weights, dtype=np.float64)
+        self.points = np.asarray(state.reference_points, dtype=np.float64)
+        self.reference_points = self.points
+        self.initialization_target_w = np.asarray(state.target_w, dtype=np.float64)
+        self.z_star = np.asarray(state.z_star, dtype=np.float64)
+        self.w_star = np.asarray(state.w_star, dtype=np.float64)
+        self._center_error = float(state.center_error)
+        self._inverse_residual_norm = float(state.residual_norm)
+        self._gauge_converged = bool(state.converged)
+        self._gauge_iterations = int(state.iterations)
+        self._candidate_radius = float(state.candidate_radius)
+        self._candidate_center_error = float(state.candidate_center_error)
+        self._candidate_residual_norm = float(state.candidate_residual_norm)
+        self._candidate_converged = bool(state.candidate_converged)
+        self._candidate_iterations = int(state.candidate_iterations)
+        self._init_radius_error = float(state.radius_error)
 
     def _canonicalized_points(self, points: np.ndarray) -> np.ndarray:
         P, a = _prepare_points_weights(points, self.weights)
-        try:
-            state = canonical_cloud(P, a, max_iters=120, tol=1e-10)
-            self.z_star = state.z.detach().cpu().numpy().astype(np.float64)
-            self.w_star = state.w.detach().cpu().numpy().astype(np.float64)
-            self._center_error = float(state.center_error)
-            return state.P.detach().cpu().numpy().astype(np.float64)
-        except Exception:
-            centered = P.detach().cpu().numpy().astype(np.float64)
-            self.z_star = np.zeros(centered.shape[1], dtype=np.float64)
-            self.w_star = np.zeros(centered.shape[1], dtype=np.float64)
-            self._center_error = float(np.linalg.norm((self.weights[:, None] * centered).sum(axis=0)))
-            return centered
+        state = canonical_cloud(P, a, max_iters=160, tol=1e-10)
+        self.z_star = state.z.detach().cpu().numpy().astype(np.float64)
+        self.w_star = state.w.detach().cpu().numpy().astype(np.float64)
+        self._center_error = float(state.center_error)
+        self._inverse_residual_norm = float(state.residual_norm)
+        self._gauge_converged = bool(state.converged)
+        self._gauge_iterations = int(state.iterations)
+        reference = state.P.detach().cpu().numpy().astype(np.float64)
+        self.reference_points = reference
+        return reference
 
     def _sample_initialized_observed_cloud(
         self,
@@ -1159,18 +1409,17 @@ class LMSOpticalDiskBaseWidget:
         target_radius: float,
     ) -> np.ndarray:
         """Sample an observed cloud for the current widget geometry."""
-        return _initialized_observed_cloud_np(
+        return self._sample_canonical_initialization(
             int(n),
-            self.rng,
             preset=preset,
             target_radius=float(target_radius),
-        )
+        ).observed_points
 
     def _build_controls(self, *, preset: OpticalPreset) -> None:
         self.preset_dropdown = widgets.Dropdown(
             options=[("Random", "random"), ("Balanced", "balanced"), ("Clustered", "clustered"), ("Dipole", "dipole")],
             value=preset,
-            description="x^0 preset",
+            description="ξ shape preset",
             layout=widgets.Layout(width="210px"),
         )
         self.n_slider = widgets.IntSlider(
@@ -1184,43 +1433,50 @@ class LMSOpticalDiskBaseWidget:
         )
         self.init_radius_slider = widgets.FloatSlider(
             value=float(self.init_radius_value),
-            min=0.0,
-            max=0.985,
-            step=0.005,
+            min=0.0005,
+            max=0.9995,
+            step=0.0005,
             description="init |w*|",
-            readout_format=".3f",
+            readout_format=".4f",
             continuous_update=False,
-            layout=widgets.Layout(width="250px"),
+            layout=widgets.Layout(width="320px"),
         )
-        self.exact_center_html = _html(value="", layout=widgets.Layout(width="460px"))
+        self.exact_center_html = _html(value="", layout=widgets.Layout(width="620px"))
         self.time_mode_toggle = widgets.ToggleButton(
             value=False,
             description="Time: physical",
             tooltip="Switch orbit precompute between physical time and Euler-Sundman time.",
             layout=widgets.Layout(width="150px"),
         )
+        self.time_direction_toggle = widgets.ToggleButton(
+            value=False,
+            description="Time: forward",
+            tooltip="Switch orbit precompute between forward and backward time evolution.",
+            layout=widgets.Layout(width="150px"),
+        )
         self._selected_index = 0
         if self.select_pi:
             self.selected = widgets.IntSlider(value=0, min=0, max=max(0, int(self.points.shape[0]) - 1), step=1, description="selected i", continuous_update=False, layout=widgets.Layout(width="260px"))
-            self.anchor_theta = widgets.FloatSlider(value=0.0, min=-math.pi, max=math.pi, step=0.01, description="edit x_i^0", readout_format=".2f", continuous_update=False, layout=widgets.Layout(width="330px"))
+            self.anchor_theta = widgets.FloatSlider(value=0.0, min=-math.pi, max=math.pi, step=0.01, description="edit x_i", readout_format=".2f", continuous_update=False, layout=widgets.Layout(width="330px"))
         else:
             self.selected = None
             self.anchor_theta = None
-        self.target_radius = widgets.FloatSlider(
+        self.flow_stop_radius = widgets.FloatSlider(
             value=float(self._DEFAULT_FLOW_TARGET_RADIUS),
-            min=0.1,
+            min=0.0005,
             max=0.9995,
             step=0.0005,
-            description="target |w|",
+            description="flow stop |w|",
             readout_format=".4f",
             continuous_update=False,
-            layout=widgets.Layout(width="280px"),
+            layout=widgets.Layout(width="320px"),
         )
+        self.target_radius = self.flow_stop_radius
         self.max_frames = widgets.IntSlider(value=20, min=2, max=300, step=1, description="max frames", continuous_update=False, layout=widgets.Layout(width="300px"))
         self.orbit_frames = self.max_frames
         self.frame_slider = widgets.IntSlider(value=0, min=0, max=0, step=1, description="frame", continuous_update=True, disabled=True, layout=widgets.Layout(width="640px"))
         self.frame_counter = widgets.HTML(value="frame 0 / 0", layout=widgets.Layout(width="110px"))
-        self.show_contours = widgets.Checkbox(value=True, description="reflected S level sets", indent=False)
+        self.show_contours = widgets.Checkbox(value=True, description="moving x S level sets", indent=False)
         self.btn_resample = widgets.Button(description="Resample x^0", layout=widgets.Layout(width="140px"))
         self.btn_precompute = widgets.Button(description="Precompute flow", layout=widgets.Layout(width="140px"))
         self.btn_rebuild = self.btn_precompute
@@ -1245,8 +1501,23 @@ class LMSOpticalDiskBaseWidget:
             selection_row = [self.selected, self.anchor_theta, self.show_contours]
         self.controls = widgets.VBox(
             [
-                widgets.HBox([self.preset_dropdown, self.n_slider, self.init_radius_slider, self.btn_resample]),
-                widgets.HBox([self.exact_center_html, self.time_mode_toggle, self.target_radius, self.max_frames]),
+                widgets.HBox(
+                    [
+                        self.preset_dropdown,
+                        self.n_slider,
+                        self.init_radius_slider,
+                        self.flow_stop_radius,
+                        self.btn_resample,
+                    ]
+                ),
+                widgets.HBox(
+                    [
+                        self.exact_center_html,
+                        self.time_mode_toggle,
+                        self.time_direction_toggle,
+                        self.max_frames,
+                    ]
+                ),
                 widgets.HBox([self.btn_step, self.play, self.btn_precompute, self.cache_status_html]),
                 widgets.HBox([self.frame_slider, self.frame_counter]),
                 widgets.HBox(selection_row),
@@ -1258,10 +1529,10 @@ class LMSOpticalDiskBaseWidget:
             rows=2,
             cols=2,
             subplot_titles=(
-                "pᵢ⁰=M₋w*(xᵢ⁰), w(t)",
-                "rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰), Sᵣ(w)(u)=const",
-                "Rₚ⁰(w)=Σᵢ aᵢ rᵢ(w)",
-                "pᵢ⁰ → rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰)",
+                "ξᵢ=M-w*(xᵢ), w(t)",
+                "xᵢ(w)=-Hξᵢ-w(ξᵢ), Sₓ(w)(u)=const",
+                "R_ξ(w)=-Σᵢ aᵢ xᵢ(w)",
+                "ξᵢ → xᵢ(w)=-Hξᵢ-w(ξᵢ)",
             ),
             horizontal_spacing=0.08,
             vertical_spacing=0.12,
@@ -1363,33 +1634,33 @@ class LMSOpticalDiskBaseWidget:
         cx, cy = _circle_xy()
         add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name="∂𝔹²", hoverinfo="skip"), "disk", 1, 1)
         add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(20,20,20,0.35)", width=2), name="w(t)", hoverinfo="skip"), "orbit_path", 1, 1)
-        add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=11, color="white", line=dict(color="black", width=2)), name="Σᵢ aᵢ pᵢ⁰=0"), "core_balance", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#244C9A", opacity=0.72), name="pᵢ⁰"), "anchors", 1, 1)
+        add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=11, color="white", line=dict(color="black", width=2)), name="Σᵢ aᵢ ξᵢ=0"), "core_balance", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#244C9A", opacity=0.72), name="ξᵢ"), "anchors", 1, 1)
         if self.select_pi:
-            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name="selected pᵢ⁰"), "selected_anchor", 1, 1)
+            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name="selected ξᵢ"), "selected_anchor", 1, 1)
         add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black"), name="w"), "w", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 9], color="#D72638"), name="Rₚ⁰(w)=Σᵢ aᵢ rᵢ(w)"), "R_arrow", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 9], color="#D72638"), name="R_ξ(w)=-Σᵢ aᵢ xᵢ(w)"), "R_arrow", 1, 1)
         add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#188038", width=3, dash="dash"), marker=dict(size=[0, 7], color="#188038"), name="ẇ"), "vel_arrow", 1, 1)
 
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name="Sᵣ(w)(u)=const", hoverinfo="skip"), "ref_phase", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name="Sₓ(w)(u)=const", hoverinfo="skip"), "ref_phase", 1, 2)
         add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name="∂𝔹²", hoverinfo="skip", showlegend=False), "ref_circle", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name="rᵢ(w)"), "reflected", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name="w: Σᵢ aᵢ M_w(rᵢ(w))=0"), "ref_w", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name="Rₚ⁰(w)"), "R_circle", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name="Cov(rᵢ(w))", hoverinfo="skip"), "ellipse", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#3B5BDB", width=2), marker=dict(size=5, color="#3B5BDB"), name="Σᵢ aᵢ rᵢ(w)"), "polygon", 2, 1)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name="xᵢ(w)"), "reflected", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name="w: Σᵢ aᵢ M_{-w}(xᵢ(w))=0"), "ref_w", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name="R_ξ(w)"), "R_circle", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name="Cov(xᵢ(w))", hoverinfo="skip"), "ellipse", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#3B5BDB", width=2), marker=dict(size=5, color="#3B5BDB"), name="-Σᵢ aᵢ xᵢ(w)"), "polygon", 2, 1)
         add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=9, color="black"), name="0", showlegend=False, hoverinfo="skip"), "polygon_origin", 2, 1)
 
         add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.3)", width=1), name="S¹", hoverinfo="skip", showlegend=False), "geom_circle", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=7, color="#244C9A", opacity=0.72), name="pᵢ⁰"), "geom_all_incoming", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(91,140,90,0.45)", width=1.7), name="rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰)", hoverinfo="skip"), "geom_all_reflected", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(215,38,56,0.28)", width=1.2), name="pᵢ⁰−w", hoverinfo="skip"), "geom_all_normal", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.24)", width=1.0, dash="dash"), name="(pᵢ⁰−w)⊥", hoverinfo="skip"), "geom_all_mirror", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=7, color="#244C9A", opacity=0.72), name="ξᵢ"), "geom_all_incoming", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(91,140,90,0.45)", width=1.7), name="xᵢ(w)=-Hξᵢ-w(ξᵢ)", hoverinfo="skip"), "geom_all_reflected", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(215,38,56,0.28)", width=1.2), name="ξᵢ−w", hoverinfo="skip"), "geom_all_normal", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.24)", width=1.0, dash="dash"), name="(ξᵢ−w)⊥", hoverinfo="skip"), "geom_all_mirror", 2, 2)
         if self.select_pi:
-            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="#F2A900", line=dict(color="black", width=1.2)), name="selected pᵢ⁰"), "geom_incoming", 2, 2)
-            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=3), name="selected rᵢ(w)"), "geom_reflected", 2, 2)
-            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#D72638", width=3), name="selected pᵢ⁰−w"), "geom_normal", 2, 2)
-            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.45)", width=2, dash="dash"), name="selected (pᵢ⁰−w)⊥"), "geom_mirror", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="#F2A900", line=dict(color="black", width=1.2)), name="selected ξᵢ"), "geom_incoming", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=3), name="selected xᵢ(w)"), "geom_reflected", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#D72638", width=3), name="selected ξᵢ−w"), "geom_normal", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.45)", width=2, dash="dash"), name="selected (ξᵢ−w)⊥"), "geom_mirror", 2, 2)
 
         fig.update_layout(
             width=self.width,
@@ -1414,7 +1685,7 @@ class LMSOpticalDiskBaseWidget:
             self.preset_dropdown,
             self.n_slider,
             self.init_radius_slider,
-            self.target_radius,
+            self.flow_stop_radius,
             self.max_frames,
             self.frame_slider,
             self.show_contours,
@@ -1424,6 +1695,7 @@ class LMSOpticalDiskBaseWidget:
         for ctl in controls:
             ctl.observe(self._on_control_change, names="value")
         self.time_mode_toggle.observe(self._on_time_mode_toggle, names="value")
+        self.time_direction_toggle.observe(self._on_time_direction_toggle, names="value")
         self.btn_resample.on_click(self._on_resample)
         self.btn_precompute.on_click(self._on_rebuild_orbit_clicked)
         self.btn_step.on_click(self._on_step)
@@ -1439,6 +1711,33 @@ class LMSOpticalDiskBaseWidget:
         if self._updating or change.get("name") != "value":
             return
         self._sync_time_mode_label()
+        self._rebuild_orbit()
+
+    def _time_direction(self) -> Literal["forward", "backward"]:
+        return "backward" if bool(self.time_direction_toggle.value) else "forward"
+
+    def _sync_time_direction_label(self) -> None:
+        self.time_direction_toggle.description = (
+            "Time: backward" if self._time_direction() == "backward" else "Time: forward"
+        )
+
+    def _play_value_for_frame_index(self, frame: int, max_idx: int) -> int:
+        return int(np.clip(int(frame), 0, int(max_idx)))
+
+    def _frame_index_from_play_value(self, value: int, max_idx: int) -> int:
+        return int(np.clip(int(value), 0, int(max_idx)))
+
+    def _on_time_direction_toggle(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self._sync_time_direction_label()
+        target = 1.0 - float(self.flow_stop_radius.value)
+        target = float(np.clip(target, float(self.flow_stop_radius.min), float(self.flow_stop_radius.max)))
+        self._updating = True
+        try:
+            self.flow_stop_radius.value = target
+        finally:
+            self._updating = False
         self._rebuild_orbit()
 
     def _sync_anchor_controls(self) -> None:
@@ -1459,10 +1758,16 @@ class LMSOpticalDiskBaseWidget:
         w = np.asarray(getattr(self, "w_star", np.zeros(2)), dtype=np.float64).reshape(2)
         r = float(np.linalg.norm(w))
         theta = math.atan2(float(w[1]), float(w[0])) if r > 1e-12 else 0.0
+        radius_error = float(getattr(self, "_init_radius_error", float("nan")))
+        radius_text = f", Δr={radius_error:.2e}" if np.isfinite(radius_error) else ""
+        residual = float(getattr(self, "_inverse_residual_norm", float("nan")))
+        residual_text = f", residual={residual:.2e}" if np.isfinite(residual) else ""
+        status = "ok" if bool(getattr(self, "_gauge_converged", False)) else "stopped"
         self.exact_center_html.value = (
             f"<b>Exact gauge:</b> "
             f"w*=({w[0]:+.4f},{w[1]:+.4f}), "
-            f"|w*|={r:.4f}, arg(w*)={theta:+.3f}"
+            f"|w*|={r:.4f}{radius_text}, arg(w*)={theta:+.3f}; "
+            f"solver={status}{residual_text}"
         )
 
     def _mark_cache_stale(self, message: str = "Parameters changed. Precompute flow before playback.") -> None:
@@ -1492,10 +1797,14 @@ class LMSOpticalDiskBaseWidget:
 
     def _integrate_orbit_from_controls(self) -> np.ndarray:
         frames = max(2, int(self.max_frames.value))
-        return self._integrate_target_radius_orbit_from_controls(frames, time_mode=self._time_mode())
+        return self._integrate_target_radius_orbit_from_controls(
+            frames,
+            time_mode=self._time_mode(),
+            time_direction=self._time_direction(),
+        )
 
     def _target_flow_radius(self) -> float:
-        return float(np.clip(float(self.target_radius.value), 0.0, 0.9995))
+        return float(np.clip(float(self.flow_stop_radius.value), 0.0005, 0.9995))
 
     def _flow_step_state_signature(self) -> str:
         h = hashlib.blake2b(digest_size=16)
@@ -1505,12 +1814,24 @@ class LMSOpticalDiskBaseWidget:
             h.update(arr.tobytes())
         return h.hexdigest()
 
-    def _flow_step_fit_cache_key(self, time_mode: str, frames: int, radius_stop: float) -> tuple[str, str, int, float]:
-        return (self._flow_step_state_signature(), str(time_mode), int(frames), round(float(radius_stop), 12))
+    def _flow_step_fit_cache_key(
+        self,
+        time_mode: str,
+        time_direction: str,
+        frames: int,
+        radius_stop: float,
+    ) -> tuple[str, str, str, int, float]:
+        return (
+            self._flow_step_state_signature(),
+            str(time_mode),
+            str(time_direction),
+            int(frames),
+            round(float(radius_stop), 12),
+        )
 
     def _remember_flow_step_fit(
         self,
-        key: tuple[str, str, int, float],
+        key: tuple[str, str, str, int, float],
         *,
         step: float,
         final_radius: float,
@@ -1526,8 +1847,9 @@ class LMSOpticalDiskBaseWidget:
         self._flow_step_fit_last = {
             "state_signature": key[0],
             "time_mode": str(key[1]),
-            "frames": int(key[2]),
-            "radius_stop": float(key[3]),
+            "time_direction": str(key[2]),
+            "frames": int(key[3]),
+            "radius_stop": float(key[4]),
             "step": float(step),
         }
 
@@ -1535,6 +1857,7 @@ class LMSOpticalDiskBaseWidget:
         self,
         *,
         time_mode: str,
+        time_direction: str,
         frames: int,
         radius_stop: float,
         points: np.ndarray,
@@ -1546,40 +1869,65 @@ class LMSOpticalDiskBaseWidget:
         fallback = (0.02 if time_mode == "euler_sundman" else 0.16) * horizon_scale
         w0 = self._initial_w()
         r0 = float(np.linalg.norm(w0))
-        if not (np.isfinite(r0) and r0 < float(radius_stop)):
+        if time_direction == "backward":
+            target_is_reachable = r0 > float(radius_stop)
+        else:
+            target_is_reachable = r0 < float(radius_stop)
+        if not (np.isfinite(r0) and target_is_reachable):
             return fallback
         q0 = _reflected_series_np(w0.reshape(1, points.shape[1]), points)[0]
         R0 = np.einsum("n,nj->j", weights, q0, optimize=True)
         radial = float(np.dot(R0, w0 / max(r0, 1e-12)))
-        if radial <= 1e-12:
+        radial_speed = abs(radial) if time_direction == "backward" else radial
+        if radial_speed <= 1e-12:
             return (0.05 if time_mode == "euler_sundman" else 0.25) * horizon_scale
         if time_mode == "euler_sundman":
-            numerator = (float(radius_stop) - float(radius_stop) ** 3 / 3.0) - (r0 - r0**3 / 3.0)
-            estimate = 0.42 * numerator / (2.0 * radial * float(frame_intervals))
+            if time_direction == "backward":
+                numerator = (r0 - r0**3 / 3.0) - (float(radius_stop) - float(radius_stop) ** 3 / 3.0)
+            else:
+                numerator = (float(radius_stop) - float(radius_stop) ** 3 / 3.0) - (r0 - r0**3 / 3.0)
+            estimate = 0.42 * numerator / (2.0 * radial_speed * float(frame_intervals))
             lo = 0.01 * horizon_scale
             hi = 0.05 * horizon_scale
         else:
-            speed = 0.5 * max(1.0 - r0 * r0, 1e-8) * radial
-            estimate = 0.42 * (float(radius_stop) - r0) / (speed * float(frame_intervals))
+            speed = 0.5 * max(1.0 - r0 * r0, 1e-8) * radial_speed
+            estimate = 0.42 * abs(float(radius_stop) - r0) / (speed * float(frame_intervals))
             lo = 0.005 * horizon_scale
             hi = 0.5 * horizon_scale
         return float(np.clip(estimate, lo, hi))
 
-    def _integrate_target_radius_orbit_from_controls(self, frames: int, *, time_mode: str) -> np.ndarray:
+    def _integrate_target_radius_orbit_from_controls(
+        self,
+        frames: int,
+        *,
+        time_mode: str,
+        time_direction: str,
+    ) -> np.ndarray:
         """Fit the parameter step so the requested frame count reaches target radius.
 
         Physical and Euler-Sundman modes use different vector fields, but both
         cache a fitted uniform parameter step keyed by the current cloud, time
-        mode, requested frame count, and target radius.
+        mode, direction, requested frame count, and target radius.
         """
         P = np.asarray(self.points, dtype=np.float64)
         a = np.asarray(self.weights, dtype=np.float64)
         radius_stop = self._target_flow_radius()
         fit_tolerance = float(self._FLOW_TARGET_FIT_TOLERANCE)
-        cache_key = self._flow_step_fit_cache_key(time_mode, frames, radius_stop)
+        direction_sign = -1.0 if time_direction == "backward" else 1.0
+        cache_key = self._flow_step_fit_cache_key(time_mode, time_direction, frames, radius_stop)
         state_signature = cache_key[0]
         fit_calls = 0
         fit_point_steps = 0
+
+        def crossed_target(radius: float) -> bool:
+            if time_direction == "backward":
+                return radius <= radius_stop
+            return radius >= radius_stop
+
+        def short_of_target(radius: float) -> bool:
+            if time_direction == "backward":
+                return radius > radius_stop + fit_tolerance
+            return radius < radius_stop - fit_tolerance
 
         def integrate_for_step(step: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, float]:
             nonlocal fit_calls, fit_point_steps
@@ -1588,32 +1936,43 @@ class LMSOpticalDiskBaseWidget:
             parameter_times = [0.0]
             physical_times = [0.0]
             w = pts[0].copy()
+            max_internal_step = (
+                self._MAX_INTERNAL_ES_STEP
+                if time_mode == "euler_sundman"
+                else self._MAX_INTERNAL_PHYSICAL_STEP
+            )
             for _ in range(frames - 1):
                 fit_point_steps += 1
-                w2_now = float(np.dot(w, w))
-                denom = max(1.0 - w2_now, 1e-8)
-                q = _reflected_series_np(w.reshape(1, P.shape[1]), P)[0]
-                R = np.einsum("n,nj->j", a, q, optimize=True)
-                if time_mode == "euler_sundman":
-                    velocity = 2.0 * R / denom
-                    physical_dt = step * 4.0 / (denom * denom)
-                else:
-                    velocity = 0.5 * denom * R
-                    physical_dt = step
-                nxt = w + step * velocity
-                nrm = float(np.linalg.norm(nxt))
-                if (not np.isfinite(nxt).all()) or nrm >= radius_stop:
-                    return (
-                        np.asarray(pts, dtype=np.float64),
-                        np.asarray(parameter_times, dtype=np.float64),
-                        np.asarray(physical_times, dtype=np.float64),
-                        True,
-                        nrm,
-                    )
+                substeps = max(1, int(math.ceil(abs(float(step)) / max_internal_step)))
+                substep = float(step) / float(substeps)
+                frame_physical_dt = 0.0
+                nrm = float(np.linalg.norm(w))
+                for _ in range(substeps):
+                    w2_now = float(np.dot(w, w))
+                    denom = max(1.0 - w2_now, 1e-8)
+                    q = _reflected_series_np(w.reshape(1, P.shape[1]), P)[0]
+                    R = np.einsum("n,nj->j", a, q, optimize=True)
+                    if time_mode == "euler_sundman":
+                        velocity = direction_sign * 2.0 * R / denom
+                        physical_dt = substep * 4.0 / (denom * denom)
+                    else:
+                        velocity = direction_sign * 0.5 * denom * R
+                        physical_dt = substep
+                    nxt = w + substep * velocity
+                    nrm = float(np.linalg.norm(nxt))
+                    if (not np.isfinite(nxt).all()) or nrm >= 0.999999 or crossed_target(nrm):
+                        return (
+                            np.asarray(pts, dtype=np.float64),
+                            np.asarray(parameter_times, dtype=np.float64),
+                            np.asarray(physical_times, dtype=np.float64),
+                            True,
+                            nrm,
+                        )
+                    w = nxt
+                    frame_physical_dt += physical_dt
                 pts.append(nxt.copy())
                 parameter_times.append(parameter_times[-1] + step)
-                physical_times.append(physical_times[-1] + physical_dt)
-                w = nxt
+                physical_times.append(physical_times[-1] + frame_physical_dt)
             orbit = np.asarray(pts, dtype=np.float64)
             tau = np.asarray(parameter_times, dtype=np.float64)
             physical = np.asarray(physical_times, dtype=np.float64)
@@ -1636,6 +1995,7 @@ class LMSOpticalDiskBaseWidget:
 
         initial_step = self._estimate_boundary_step(
             time_mode=time_mode,
+            time_direction=time_direction,
             frames=frames,
             radius_stop=radius_stop,
             points=P,
@@ -1647,6 +2007,7 @@ class LMSOpticalDiskBaseWidget:
             and self._flow_step_fit_last is not None
             and self._flow_step_fit_last.get("state_signature") == state_signature
             and self._flow_step_fit_last.get("time_mode") == time_mode
+            and self._flow_step_fit_last.get("time_direction") == time_direction
             and np.isfinite(float(self._flow_step_fit_last.get("step", initial_step)))
         ):
             last_step = float(self._flow_step_fit_last["step"])
@@ -1664,13 +2025,13 @@ class LMSOpticalDiskBaseWidget:
         if (not crossed) and len(orbit) == frames:
             lower_step = initial_step
             lower = (orbit, tau, physical)
-            if final_radius < radius_stop - fit_tolerance:
+            if short_of_target(final_radius):
                 upper_step = initial_step
                 upper_found = False
                 for _ in range(16):
                     upper_step *= 1.15 if warm_started else 2.0
                     _, _, _, upper_crossed, upper_radius = integrate_for_step(upper_step)
-                    if upper_crossed or upper_radius >= radius_stop:
+                    if upper_crossed or crossed_target(upper_radius):
                         upper_found = True
                         break
                 if not upper_found:
@@ -1818,8 +2179,9 @@ class LMSOpticalDiskBaseWidget:
                 self.play.max = max_idx
             if bool(self.play.disabled) != slider_disabled:
                 self.play.disabled = slider_disabled
-            if source is not self.play and int(self.play.value) != frame:
-                self.play.value = frame
+            play_value = self._play_value_for_frame_index(frame, max_idx)
+            if source is not self.play and int(self.play.value) != play_value:
+                self.play.value = play_value
             step_disabled = (not self._cache_valid) or count <= 1
             if bool(self.btn_step.disabled) != step_disabled:
                 self.btn_step.disabled = step_disabled
@@ -1838,6 +2200,7 @@ class LMSOpticalDiskBaseWidget:
         if W.size == 0:
             return []
         time_mode = self._time_mode()
+        time_direction = self._time_direction()
         parameter_time = np.asarray(getattr(self, "_orbit_parameter_time", np.arange(W.shape[0])), dtype=np.float64)
         physical_time = np.asarray(getattr(self, "_orbit_physical_time", np.arange(W.shape[0])), dtype=np.float64)
         if parameter_time.shape[0] != W.shape[0]:
@@ -1847,19 +2210,22 @@ class LMSOpticalDiskBaseWidget:
         P = np.asarray(self.points, dtype=np.float64)
         a = np.asarray(self.weights, dtype=np.float64)
         Q = _reflected_series_np(W, P)
+        X = -Q
         R = np.einsum("n,tnj->tj", a, Q, optimize=True)
+        Xbar = -R
         w2 = np.sum(W * W, axis=1)
-        velocity = 0.5 * (1.0 - w2)[:, None] * R
-        centered = Q - R[:, None, :]
+        velocity_sign = -1.0 if time_direction == "backward" else 1.0
+        velocity = velocity_sign * 0.5 * (1.0 - w2)[:, None] * R
+        centered = X - Xbar[:, None, :]
         covariance = np.einsum("n,tni,tnj->tij", a, centered, centered, optimize=True)
         evals = np.linalg.eigvalsh(0.5 * (covariance + np.swapaxes(covariance, -1, -2)))
-        reflected_balance = np.linalg.norm(
-            np.einsum("n,tnj->tj", a, _mobius_sphere_series_np(W, Q), optimize=True),
+        inverse_balance = np.linalg.norm(
+            np.einsum("n,tnj->tj", a, _mobius_sphere_series_np(-W, X), optimize=True),
             axis=1,
         )
         denom = np.maximum(1.0 - w2, 1e-12)
-        diffw = W[:, None, :] - Q
-        reflected_phase = np.einsum(
+        diffw = W[:, None, :] - X
+        x_phase = np.einsum(
             "n,tn->t",
             a,
             np.log(np.maximum(np.sum(diffw * diffw, axis=-1), 1e-12)) - np.log(denom)[:, None],
@@ -1870,7 +2236,7 @@ class LMSOpticalDiskBaseWidget:
         if include_contours:
             contour_grid_size = min(self.level_grid_size, 64 if len(W) <= 480 else 52)
             xs, ys, grids = _phase_grids_for_reflected_series_np(
-                Q,
+                X,
                 a,
                 grid_size=contour_grid_size,
             )
@@ -1882,11 +2248,19 @@ class LMSOpticalDiskBaseWidget:
             "W": W,
             "P": P,
             "Q": Q,
+            "X": X,
             "R": R,
+            "Xbar": Xbar,
             "velocity": velocity,
             "covariance": covariance,
             "covariance_evals": evals,
         }
+        candidate_radius = float(getattr(self, "_candidate_radius", float("nan")))
+        init_radius_error = float(getattr(self, "_init_radius_error", float("nan")))
+        inverse_residual_norm = float(getattr(self, "_inverse_residual_norm", float("nan")))
+        candidate_radius_text = f"{candidate_radius:.6f}" if np.isfinite(candidate_radius) else "n/a"
+        init_radius_error_text = f"{init_radius_error:.2e}" if np.isfinite(init_radius_error) else "n/a"
+        inverse_residual_text = f"{inverse_residual_norm:.2e}" if np.isfinite(inverse_residual_norm) else "n/a"
         for i, w_np in enumerate(W):
             scale_R = 0.48
             scale_vel = 1.6
@@ -1897,9 +2271,9 @@ class LMSOpticalDiskBaseWidget:
                 level_y: list[float | None] = []
             else:
                 level_x, level_y = potential_level_segments_2d(xs, ys, grids[i], level_count=7 if len(W) <= 480 else 5)
-            ex, ey = _covariance_ellipse_2d(R[i], covariance[i], scale=0.72)
-            order = np.argsort(np.arctan2(Q[i, :, 1], Q[i, :, 0]))
-            increments = a[order, None] * Q[i, order]
+            ex, ey = _covariance_ellipse_2d(Xbar[i], covariance[i], scale=0.72)
+            order = np.argsort(np.arctan2(X[i, :, 1], X[i, :, 0]))
+            increments = -a[order, None] * X[i, order]
             cumulative = np.vstack([np.zeros((1, 2)), np.cumsum(increments, axis=0)])
             coh = float(np.linalg.norm(R[i]))
             var = max(0.0, 1.0 - coh * coh)
@@ -1907,7 +2281,9 @@ class LMSOpticalDiskBaseWidget:
                 "w": w_np.copy(),
                 "P": P,
                 "Q": Q[i].copy(),
+                "X": X[i].copy(),
                 "R": R[i].copy(),
+                "Xbar": Xbar[i].copy(),
                 "velocity": velocity[i].copy(),
                 "covariance": covariance[i].copy(),
                 "covariance_evals": evals[i].copy(),
@@ -1919,8 +2295,8 @@ class LMSOpticalDiskBaseWidget:
                 "vel_arrow_y": vy,
                 "ref_phase_x": level_x,
                 "ref_phase_y": level_y,
-                "reflected_x": Q[i, :, 0],
-                "reflected_y": Q[i, :, 1],
+                "reflected_x": X[i, :, 0],
+                "reflected_y": X[i, :, 1],
                 "ref_w_x": [float(w_np[0])],
                 "ref_w_y": [float(w_np[1])],
                 "R_circle_x": [0.0, float(R[i, 0])],
@@ -1929,8 +2305,9 @@ class LMSOpticalDiskBaseWidget:
                 "ellipse_y": ey,
                 "polygon_x": cumulative[:, 0],
                 "polygon_y": cumulative[:, 1],
-                "reflected_balance": float(reflected_balance[i]),
-                "reflected_phase": float(reflected_phase[i]),
+                "inverse_balance": float(inverse_balance[i]),
+                "reflected_balance": float(inverse_balance[i]),
+                "reflected_phase": float(x_phase[i]),
                 "S_p0": float(s_p0[i]),
                 "Phi_p0": float(phi_p0[i]),
                 "coherence": coh,
@@ -1940,14 +2317,17 @@ class LMSOpticalDiskBaseWidget:
                 "physical_time": float(physical_time[i]),
                 "stats": (
                     "<b>Optical diagnostics</b> "
-                    f"|Σᵢ aᵢ pᵢ⁰|={self._center_error:.2e}; "
-                    f"|Σᵢ aᵢ M_w(rᵢ)|={float(reflected_balance[i]):.2e}; "
-                    f"|Rₚ⁰(w)|={coh:.6f}; "
+                    f"|Σᵢ aᵢ ξᵢ|={self._center_error:.2e}; "
+                    f"init Δr={init_radius_error_text}; "
+                    f"ξ template |w|={candidate_radius_text}; "
+                    f"initial inverse residual={inverse_residual_text}; "
+                    f"|Σᵢ aᵢ M_{{-w}}(xᵢ)|={float(inverse_balance[i]):.2e}; "
+                    f"|R_ξ(w)|={coh:.6f}; "
                     f"1-|R|^2={var:.6f}; "
-                    f"Φₚ⁰(w)={float(phi_p0[i]):.6f}; "
-                    f"Sᵣ(w)(w)={float(reflected_phase[i]):.6f}; "
+                    f"Φ_ξ(w)={float(phi_p0[i]):.6f}; "
+                    f"Sₓ(w)(w)={float(x_phase[i]):.6f}; "
                     f"|ẇ|={float(np.linalg.norm(velocity[i])):.6f}; "
-                    f"time={'ES' if time_mode == 'euler_sundman' else 'physical'}; "
+                    f"time={'ES' if time_mode == 'euler_sundman' else 'physical'} {time_direction}; "
                     f"τ={float(parameter_time[i]):.6g}; "
                     f"t={float(physical_time[i]):.6g}; "
                     f"λ(C)=({float(evals[i, 0]):.5f},{float(evals[i, 1]):.5f})"
@@ -2024,11 +2404,11 @@ class LMSOpticalDiskBaseWidget:
         any expensive frame-cache recompute.
         """
         P = np.asarray(payload["P"], dtype=np.float64)
-        Q = np.asarray(payload["Q"], dtype=np.float64)
+        X = np.asarray(payload["X"], dtype=np.float64)
         w_np = np.asarray(payload["w"], dtype=np.float64)
         idx = int(np.clip(self._selected_index, 0, P.shape[0] - 1))
         p = P[idx]
-        q = Q[idx]
+        q = X[idx]
         n = p - w_np
         n_unit = n / max(float(np.linalg.norm(n)), 1e-12)
         tangent = np.array([-n_unit[1], n_unit[0]])
@@ -2111,7 +2491,7 @@ class LMSOpticalDiskBaseWidget:
                 self.fig.data[self.tr["geom_all_incoming"]].x = _plotly_values(P[:, 0])
                 self.fig.data[self.tr["geom_all_incoming"]].y = _plotly_values(P[:, 1])
             if "geom_all_reflected" in self.tr:
-                gx, gy = _segments_from_origin2(np.asarray(payload["Q"], dtype=np.float64))
+                gx, gy = _segments_from_origin2(np.asarray(payload["X"], dtype=np.float64))
                 self.fig.data[self.tr["geom_all_reflected"]].x = gx
                 self.fig.data[self.tr["geom_all_reflected"]].y = gy
             if "geom_all_normal" in self.tr:
@@ -2182,7 +2562,16 @@ class LMSOpticalDiskBaseWidget:
         if self.select_pi and owner is self.anchor_theta:
             idx = int(self._selected_index)
             self.raw_points[idx] = _angle2(float(self.anchor_theta.value))
+            self.observed_points = self.raw_points
+            self._initialization_state = None
+            self._candidate_radius = float("nan")
+            self._candidate_center_error = float("nan")
+            self._candidate_residual_norm = float("nan")
+            self._candidate_converged = False
+            self._candidate_iterations = 0
+            self._init_radius_error = float("nan")
             self.points = self._canonicalized_points(self.raw_points)
+            self.reference_points = self.points
             self._sync_anchor_controls()
             self._build_preview_frame("Anchor edited. Precompute flow before playback.")
             return
@@ -2192,7 +2581,7 @@ class LMSOpticalDiskBaseWidget:
             else:
                 self._sync_frame_controls(0)
             return
-        if owner in (self.target_radius, self.max_frames):
+        if owner in (self.flow_stop_radius, self.max_frames):
             self._build_preview_frame("Flow target changed. Precompute flow before playback.")
             return
         if owner is self.show_contours:
@@ -2204,14 +2593,13 @@ class LMSOpticalDiskBaseWidget:
         self._apply_cached_frame(self._frame_index)
 
     def _resample_anchors_and_precompute(self) -> None:
-        self.init_radius_value = float(np.clip(float(self.init_radius_slider.value), 0.0, 0.985))
-        self.raw_points = self._sample_initialized_observed_cloud(
+        self.init_radius_value = float(np.clip(float(self.init_radius_slider.value), 0.0005, 0.9995))
+        init_state = self._sample_canonical_initialization(
             int(self.n_slider.value),
             preset=self.preset_dropdown.value,
             target_radius=self.init_radius_value,
         )
-        self.weights = np.full((self.raw_points.shape[0],), 1.0 / float(self.raw_points.shape[0]), dtype=np.float64)
-        self.points = self._canonicalized_points(self.raw_points)
+        self._apply_canonical_initialization(init_state)
         if self.select_pi:
             self._updating = True
             try:
@@ -2242,7 +2630,10 @@ class LMSOpticalDiskBaseWidget:
         if not self._cache_valid:
             self._sync_frame_controls(0)
             return
-        self._set_frame_index(int(change.get("new", 0)), source=self.play)
+        count = int(len(self._orbit))
+        max_idx = max(0, count - 1)
+        frame = self._frame_index_from_play_value(int(change.get("new", 0)), max_idx)
+        self._set_frame_index(frame, source=self.play)
 
     def _on_reset(self, _btn: Any) -> None:
         self._set_frame_index(0)
@@ -2252,11 +2643,11 @@ class LMSOpticalDiskBaseWidget:
         evals = state.covariance_evals.detach().cpu().numpy().astype(np.float64)
         return (
             "<b>Optical diagnostics</b> "
-            f"|Σᵢ aᵢ pᵢ⁰|={self._center_error:.2e}; "
-            f"|Σᵢ aᵢ M_w(rᵢ)|={reflected_balance_error:.2e}; "
-            f"|Rₚ⁰(w)|={float(state.coherence):.6f}; "
+            f"|Σᵢ aᵢ ξᵢ|={self._center_error:.2e}; "
+            f"|Σᵢ aᵢ M_{{-w}}(xᵢ)|={reflected_balance_error:.2e}; "
+            f"|R_ξ(w)|={float(state.coherence):.6f}; "
             f"1-|R|^2={float(state.variance):.6f}; "
-            f"Sᵣ(w)(w)={reflected_phase:.6f}; "
+            f"Sₓ(w)(w)={reflected_phase:.6f}; "
             f"|ẇ|={float(torch.linalg.norm(state.velocity)):.6f}; "
             f"λ(C)=({float(evals[0]):.5f},{float(evals[1]):.5f})"
         )
@@ -2286,11 +2677,15 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
 
     The top row is the standard optical disk view.  The bottom row replaces the
     base diagnostic panels with two moving charts of the first subplot's data:
-    the left chart applies a unit radial distance chart around w_t, and the
-    right chart maps x -> (x+w_t)/|x+w_t|^2.
+    the left chart applies a (1-|w_t|^2)-scaled moving Cayley chart, and the
+    right chart maps x -> (x-w_t)/|x-w_t|^2 = Cw_t(x).  Trajectory overlays
+    are evaluated at negated inputs to keep the current reduced point away
+    from the chart pole.
     """
 
     _DYNAMIC_CHART_CIRCLE_SAMPLES = 4096
+    _DYNAMIC_CHART_SCALED_INVERSION_CIRCLE_SAMPLES = 16384
+    _DYNAMIC_CHART_SCALED_INVERSION_DENSITY_STRENGTH = 2.1608650409857546
 
     def __init__(
         self,
@@ -2303,9 +2698,9 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
 
     def _layout_header_html(self) -> str:
         return (
-            "<b>LMS optical reflected-ray explorer + dynamic w-relative charts</b><br>"
-            "Bottom left: unit radial distance chart around wₜ. "
-            "Bottom right: pointwise spherical inversion (x+wₜ)/|x+wₜ|²."
+            "<b>LMS optical moving optical x-cloud explorer + dynamic w-relative charts</b><br>"
+            "Bottom left: ΩC(x)=(1-|wₜ|²)Cwₜ(x). "
+            "Bottom right: Cwₜ(x)=(x-wₜ)/|x-wₜ|²."
         )
 
     def _make_subplot_figure(self) -> Any:
@@ -2313,10 +2708,10 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
             rows=2,
             cols=2,
             subplot_titles=(
-                "pᵢ⁰=M₋w*(xᵢ⁰), w(t)",
-                "rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰), Sᵣ(w)(u)=const",
-                "U_wₜ(x): |U_wₜ(x)−wₜ|=1",
-                "I₋wₜ(x)=(x+wₜ)/|x+wₜ|²",
+                "ξᵢ=M-w*(xᵢ), w(t)",
+                "xᵢ(w)=-Hξᵢ-w(ξᵢ), Sₓ(w)(u)=const",
+                "ΩC(x)=(1-|wₜ|²)Cwₜ(x)=(1-|wₜ|²)(x-wₜ)/|x-wₜ|²",
+                "Cwₜ(x)=(x-wₜ)/|x-wₜ|²",
             ),
             horizontal_spacing=0.08,
             vertical_spacing=0.12,
@@ -2334,23 +2729,23 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         cx, cy = _circle_xy()
         add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name="∂𝔹²", hoverinfo="skip"), "disk", 1, 1)
         add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(20,20,20,0.35)", width=2), name="w(t)", hoverinfo="skip"), "orbit_path", 1, 1)
-        add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=11, color="white", line=dict(color="black", width=2)), name="Σᵢ aᵢ pᵢ⁰=0"), "core_balance", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#244C9A", opacity=0.72), name="pᵢ⁰"), "anchors", 1, 1)
+        add(go.Scatter(x=[0.0], y=[0.0], mode="markers", marker=dict(size=11, color="white", line=dict(color="black", width=2)), name="Σᵢ aᵢ ξᵢ=0"), "core_balance", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#244C9A", opacity=0.72), name="ξᵢ"), "anchors", 1, 1)
         if self.select_pi:
-            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name="selected pᵢ⁰"), "selected_anchor", 1, 1)
+            add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)), name="selected ξᵢ"), "selected_anchor", 1, 1)
         add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black"), name="w"), "w", 1, 1)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 9], color="#D72638"), name="Rₚ⁰(w)=Σᵢ aᵢ rᵢ(w)"), "R_arrow", 1, 1)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 9], color="#D72638"), name="R_ξ(w)=-Σᵢ aᵢ xᵢ(w)"), "R_arrow", 1, 1)
         add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#188038", width=3, dash="dash"), marker=dict(size=[0, 7], color="#188038"), name="ẇ"), "vel_arrow", 1, 1)
 
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name="Sᵣ(w)(u)=const", hoverinfo="skip"), "ref_phase", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name="Sₓ(w)(u)=const", hoverinfo="skip"), "ref_phase", 1, 2)
         add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name="∂𝔹²", hoverinfo="skip", showlegend=False), "ref_circle", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name="rᵢ(w)"), "reflected", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name="w: Σᵢ aᵢ M_w(rᵢ(w))=0"), "ref_w", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name="Rₚ⁰(w)"), "R_circle", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name="Cov(rᵢ(w))", hoverinfo="skip"), "ellipse", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name="xᵢ(w)"), "reflected", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name="w: Σᵢ aᵢ M_{-w}(xᵢ(w))=0"), "ref_w", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name="R_ξ(w)"), "R_circle", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name="Cov(xᵢ(w))", hoverinfo="skip"), "ellipse", 1, 2)
 
-        self._add_dynamic_inversion_chart_traces("inv_w", 2, 1, transform_name="U")
-        self._add_dynamic_inversion_chart_traces("inv_neg_w", 2, 2, center_name="c=-wₜ")
+        self._add_dynamic_inversion_chart_traces("inv_w", 2, 1, transform_name="ΩC")
+        self._add_dynamic_inversion_chart_traces("inv_neg_w", 2, 2, transform_name="Cwₜ", center_name="c=wₜ")
 
         fig.update_layout(
             width=self.width,
@@ -2370,10 +2765,10 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         for row, col in ((1, 1), (1, 2)):
             fig.update_xaxes(title_text="e₁", row=row, col=col)
             fig.update_yaxes(title_text="e₂", row=row, col=col)
-        fig.update_xaxes(title_text="U_wₜ(e₁)", row=2, col=1)
-        fig.update_yaxes(title_text="U_wₜ(e₂)", row=2, col=1)
-        fig.update_xaxes(title_text="I₋wₜ(e₁)", row=2, col=2)
-        fig.update_yaxes(title_text="I₋wₜ(e₂)", row=2, col=2)
+        fig.update_xaxes(title_text="ΩC(e₁)", row=2, col=1)
+        fig.update_yaxes(title_text="ΩC(e₂)", row=2, col=1)
+        fig.update_xaxes(title_text="Cwₜ(e₁)", row=2, col=2)
+        fig.update_yaxes(title_text="Cwₜ(e₂)", row=2, col=2)
         _sanitize_figure_text(fig)
         self._configure_subplot_legends()
 
@@ -2389,7 +2784,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         def add(trace: Any, suffix: str) -> None:
             self._add_trace_to_subplot(self.fig, trace, f"{prefix}_{suffix}", row, col)
 
-        prefix_label = f"{transform_name}_c"
+        prefix_label = transform_name
 
         add(
             go.Scatter(
@@ -2409,7 +2804,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="lines",
                 line=dict(color="rgba(20,20,20,0.35)", width=2),
-                name=f"{prefix_label}(w(t))",
+                name=f"{prefix_label}(-w(t))",
                 hoverinfo="skip",
             ),
             "orbit_path",
@@ -2430,7 +2825,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="markers",
                 marker=dict(size=8, color="#244C9A", opacity=0.72),
-                name=f"{prefix_label}(pᵢ⁰)",
+                name=f"{prefix_label}(ξᵢ)",
             ),
             "anchors",
         )
@@ -2441,7 +2836,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                     y=[],
                     mode="markers",
                     marker=dict(size=14, color="#F2A900", line=dict(color="black", width=1.4)),
-                    name=f"{prefix_label}(selected pᵢ⁰)",
+                    name=f"{prefix_label}(selected ξᵢ)",
                 ),
                 "selected_anchor",
             )
@@ -2452,7 +2847,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="markers",
                 marker=dict(size=13, color="black"),
-                name=f"{prefix_label}(wₜ)",
+                name=f"{prefix_label}(-wₜ)",
             ),
             "w",
         )
@@ -2463,7 +2858,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 mode="lines+markers",
                 line=dict(color="#D72638", width=4),
                 marker=dict(size=[0, 9], color="#D72638"),
-                name=f"{prefix_label}(wₜ+Rₚ⁰(w))",
+                name=f"{prefix_label}(-(wₜ+R_ξ(w)))",
             ),
             "R_arrow",
         )
@@ -2474,7 +2869,7 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 mode="lines+markers",
                 line=dict(color="#188038", width=3, dash="dash"),
                 marker=dict(size=[0, 7], color="#188038"),
-                name=f"{prefix_label}(wₜ+ẇ)",
+                name=f"{prefix_label}(-(wₜ+ẇ))",
             ),
             "vel_arrow",
         )
@@ -2493,19 +2888,35 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         R = np.asarray(payload["R"], dtype=np.float64).reshape(2)
         velocity = np.asarray(payload["velocity"], dtype=np.float64).reshape(2)
         c = np.asarray(center, dtype=np.float64).reshape(2)
-        cx, cy = _circle_xy(samples=self._DYNAMIC_CHART_CIRCLE_SAMPLES)
+        circle_samples = (
+            self._DYNAMIC_CHART_SCALED_INVERSION_CIRCLE_SAMPLES
+            if prefix == "inv_w"
+            else self._DYNAMIC_CHART_CIRCLE_SAMPLES
+        )
+        if prefix == "inv_w":
+            cx, cy = _trajectory_biased_circle_xy(
+                samples=circle_samples,
+                w_series=W,
+                concentration=self._DYNAMIC_CHART_SCALED_INVERSION_DENSITY_STRENGTH,
+            )
+        else:
+            cx, cy = _circle_xy(samples=circle_samples)
         circle = np.column_stack([cx, cy])
         line_t = np.linspace(0.0, 1.0, 36, dtype=np.float64)[:, None]
         r_curve = w_np[None, :] + line_t * (0.48 * R)[None, :]
         v_curve = w_np[None, :] + line_t * (1.6 * velocity)[None, :]
-        transform = _unit_distance_chart_np if prefix == "inv_w" else _spherical_inversion_chart_np
-        r_line = transform(r_curve, c)
-        v_line = transform(v_curve, c)
-        chart_disk = transform(circle, c)
-        chart_orbit = transform(W, c)
-        chart_anchors = transform(P, c)
-        chart_core = transform(np.array([[0.0, 0.0]], dtype=np.float64), c)[0]
-        chart_w = transform(w_np.reshape(1, 2), c)[0]
+        scale = 1.0 - float(np.dot(w_np, w_np)) if prefix == "inv_w" else 1.0
+
+        def transform(x: np.ndarray) -> np.ndarray:
+            return scale * _spherical_inversion_chart_np(x, c)
+
+        r_line = transform(-r_curve)
+        v_line = transform(-v_curve)
+        chart_disk = transform(circle)
+        chart_orbit = transform(-W)
+        chart_anchors = transform(P)
+        chart_core = transform(np.array([[0.0, 0.0]], dtype=np.float64))[0]
+        chart_w = transform((-w_np).reshape(1, 2))[0]
         finite = np.concatenate(
             [
                 chart_disk[np.isfinite(chart_disk).all(axis=1)],
@@ -2566,12 +2977,12 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
         payload.update(
             self._dynamic_inversion_payload(
                 prefix="inv_neg_w",
-                center=-w_np,
+                center=w_np,
                 payload=payload,
                 frame_arrays=frame_arrays,
             )
         )
-        payload["stats"] += f"; dynamic inversion centers |w|={float(np.linalg.norm(w_np)):.6f}"
+        payload["stats"] += f"; dynamic Cayley centers |w|={float(np.linalg.norm(w_np)):.6f}"
         return payload
 
     def _finalize_frame_payloads(
@@ -2648,24 +3059,25 @@ class LMSOpticalDynamicInversionCayleyDiskWidget(LMSOpticalDiskBaseWidget):
 
 
 class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
-    """Single-panel 3D dynamic inversion view of the frozen LMS constants.
+    """Single-panel 3D dynamic Cayley-style view of the frozen LMS constants.
 
     This reuses the base widget's exact-gauge preprocessing, target-radius
     orbit precompute, playback, and physical/ES time mode.  The rendered scene
-    is only the 3D analogue of the lower-right dynamic inversion chart:
+    is only the 3D analogue of the lower-right dynamic Cayley-style chart:
 
-        I_{-w_t}(x) = (x + w_t) / |x + w_t|^2.
+        Cw_t(x) = (x - w_t) / |x - w_t|^2.
     """
 
     _SPHERE_WIREFRAME_LATITUDES = 25
     _SPHERE_WIREFRAME_LONGITUDES = 36
     _SPHERE_WIREFRAME_SAMPLES = 72
-    _SPHERE_WIREFRAME_OPPOSITE_POLE_LATITUDES = 8
-    _SPHERE_WIREFRAME_OPPOSITE_POLE_MERIDIAN_SAMPLES = 96
-    _SPHERE_WIREFRAME_OPPOSITE_POLE_CAP_ANGLE = 0.42
+    _SPHERE_WIREFRAME_TRAJECTORY_POLE_LATITUDES = 8
+    _SPHERE_WIREFRAME_TRAJECTORY_POLE_MERIDIAN_SAMPLES = 96
+    _SPHERE_WIREFRAME_TRAJECTORY_POLE_CAP_ANGLE = 0.42
     _SCENE_RANGE_PAD = 1.035
     _SCENE_TRANSVERSE_PAD = 1.16
-    _SCENE_CAMERA_EYE = dict(x=1.85, y=1.05, z=0.82)
+    _SCENE_CAMERA_EYE = dict(x=-1.85, y=-1.05, z=-0.82)
+    _CELESTIAL_CAMERA_EYE_RADIUS = 0.06
     _INVERSION_PAYLOAD_KEYS = (
         "inv_wire",
         "inv_path",
@@ -2705,10 +3117,13 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
 
     def _layout_header_html(self) -> str:
         return (
-            "<b>LMS 3D dynamic inversion chart</b><br>"
-            "Single scene: frozen constants pᵢ⁰, the reduced orbit w(t), and S² are shown through "
-            "I₋wₜ(x)=(x+wₜ)/|x+wₜ|². The orbit uses the shared physical/ES target-radius precompute."
+            "<b>LMS 3D dynamic Cayley chart</b><br>"
+            "Single scene: frozen constants ξᵢ, the reduced orbit w(t), and S² are shown through "
+            "Cwₜ(x)=(x-wₜ)/|x-wₜ|². The orbit uses the shared physical/ES target-radius precompute."
         )
+
+    def _initialization_dimension(self) -> int:
+        return 3
 
     def _build_controls(self, *, preset: OpticalPreset) -> None:
         super()._build_controls(preset=preset)
@@ -2719,25 +3134,54 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
             tooltip="Scale inverted distances by (1-|w|^2)^-1.",
             layout=widgets.Layout(width="165px"),
         )
+        self.comoving_frame_toggle = widgets.ToggleButton(
+            value=False,
+            description="Co-moving frame",
+            tooltip="Recompute cached frames so the current plotted w position is at the center of the 3D axes.",
+            layout=widgets.Layout(width="155px"),
+        )
+        self.celestial_sphere_toggle = widgets.ToggleButton(
+            value=False,
+            description="Celestial sphere",
+            tooltip="Set the 3D camera near the origin and face the smoothed forward trajectory direction.",
+            layout=widgets.Layout(width="155px"),
+        )
         children = list(self.controls.children)
-        row = list(children[1].children)
-        row.append(self.length_contraction_toggle)
-        children[1] = widgets.HBox(row)
-        self.controls.children = tuple(children[:4])
+        frame_mode_row = widgets.HBox(
+            [self.length_contraction_toggle, self.comoving_frame_toggle, self.celestial_sphere_toggle]
+        )
+        self.controls.children = tuple(children[:3] + [frame_mode_row] + children[3:4])
 
     def _bind_callbacks(self) -> None:
         super()._bind_callbacks()
         self.length_contraction_toggle.observe(self._on_length_contraction_toggle, names="value")
+        self.comoving_frame_toggle.observe(self._on_comoving_frame_toggle, names="value")
+        self.celestial_sphere_toggle.observe(self._on_celestial_sphere_toggle, names="value")
 
-    def _on_length_contraction_toggle(self, change: dict[str, Any]) -> None:
-        if self._updating or change.get("name") != "value":
-            return
-        self.length_contraction_toggle.button_style = "info" if bool(self.length_contraction_toggle.value) else ""
+    def _rebuild_cached_3d_payloads_for_view_mode(self) -> None:
         if self._orbit is None or len(self._orbit) == 0:
             return
         self._frame_payloads = self._build_frame_payloads(self._orbit, include_contours=False)
         self._apply_static_payload_to_figure()
         self._apply_cached_frame(self._frame_index)
+
+    def _on_length_contraction_toggle(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self.length_contraction_toggle.button_style = "info" if bool(self.length_contraction_toggle.value) else ""
+        self._rebuild_cached_3d_payloads_for_view_mode()
+
+    def _on_comoving_frame_toggle(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self.comoving_frame_toggle.button_style = "info" if bool(self.comoving_frame_toggle.value) else ""
+        self._rebuild_cached_3d_payloads_for_view_mode()
+
+    def _on_celestial_sphere_toggle(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self.celestial_sphere_toggle.button_style = "info" if bool(self.celestial_sphere_toggle.value) else ""
+        self._apply_static_payload_to_figure()
 
     def _sample_initialized_observed_cloud(
         self,
@@ -2760,10 +3204,15 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
     def _sync_exact_center_label(self) -> None:
         w = np.asarray(getattr(self, "w_star", np.zeros(3)), dtype=np.float64).reshape(3)
         r = float(np.linalg.norm(w))
+        radius_error = float(getattr(self, "_init_radius_error", float("nan")))
+        radius_text = f", Δr={radius_error:.2e}" if np.isfinite(radius_error) else ""
+        residual = float(getattr(self, "_inverse_residual_norm", float("nan")))
+        residual_text = f", residual={residual:.2e}" if np.isfinite(residual) else ""
+        status = "ok" if bool(getattr(self, "_gauge_converged", False)) else "stopped"
         self.exact_center_html.value = (
             f"<b>Exact gauge:</b> "
             f"w*=({w[0]:+.4f},{w[1]:+.4f},{w[2]:+.4f}), "
-            f"|w*|={r:.4f}"
+            f"|w*|={r:.4f}{radius_text}; solver={status}{residual_text}"
         )
 
     def _build_figure(self) -> None:
@@ -2782,7 +3231,7 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
                 z=[],
                 mode="lines",
                 line=dict(color="rgba(20,20,20,0.38)", width=2),
-                name="I₋wₜ(S²)",
+                name="Cwₜ(S²)",
                 hoverinfo="skip",
                 showlegend=False,
             ),
@@ -2795,7 +3244,7 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
                 z=[],
                 mode="lines",
                 line=dict(color="rgba(20,20,20,0.42)", width=4),
-                name="I₋wₜ(w(t))",
+                name="Cwₜ(-w(t))",
                 hoverinfo="skip",
             ),
             "inv_path",
@@ -2807,7 +3256,7 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
                 z=[],
                 mode="markers",
                 marker=dict(size=4, color="#244C9A", opacity=0.78),
-                name="I₋wₜ(pᵢ⁰)",
+                name="Cwₜ(ξᵢ)",
             ),
             "inv_anchors",
         )
@@ -2818,7 +3267,7 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
                 z=[],
                 mode="markers",
                 marker=dict(size=6, color="white", line=dict(color="black", width=2)),
-                name="I₋wₜ(0)",
+                name="Cwₜ(0)",
             ),
             "inv_origin",
         )
@@ -2829,7 +3278,7 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
                 z=[],
                 mode="markers",
                 marker=dict(size=6, color="black"),
-                name="I₋wₜ(w)",
+                name="Cwₜ(-w)",
             ),
             "inv_w",
         )
@@ -2841,7 +3290,7 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
                 mode="lines+markers",
                 line=dict(color="#D72638", width=6),
                 marker=dict(size=3, color="#D72638"),
-                name="I₋wₜ(w+R)",
+                name="Cwₜ(-(w+R))",
             ),
             "inv_R",
         )
@@ -2853,7 +3302,7 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
                 mode="lines+markers",
                 line=dict(color="#188038", width=5, dash="dash"),
                 marker=dict(size=3, color="#188038"),
-                name="I₋wₜ(w+ẇ)",
+                name="Cwₜ(-(w+ẇ))",
             ),
             "inv_velocity",
         )
@@ -2878,9 +3327,9 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
                 domain=dict(x=[0.0, 1.0], y=[0.0, 1.0]),
                 aspectmode="manual",
                 aspectratio=dict(x=1.0, y=1.0, z=1.0),
-                xaxis=dict(title="I₋wₜ(e₁)", showgrid=True, zeroline=True),
-                yaxis=dict(title="I₋wₜ(e₂)", showgrid=True, zeroline=True),
-                zaxis=dict(title="I₋wₜ(e₃)", showgrid=True, zeroline=True),
+                xaxis=dict(title="Cwₜ(e₁)", showgrid=True, zeroline=True),
+                yaxis=dict(title="Cwₜ(e₂)", showgrid=True, zeroline=True),
+                zaxis=dict(title="Cwₜ(e₃)", showgrid=True, zeroline=True),
                 camera=dict(eye=dict(self._SCENE_CAMERA_EYE)),
             ),
         )
@@ -2923,16 +3372,16 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
         cls,
         pole_axis: np.ndarray | None = None,
         *,
-        dense_opposite_pole: bool = True,
+        dense_trajectory_pole: bool = True,
     ) -> np.ndarray:
         theta = np.linspace(0.0, TAU, int(cls._SPHERE_WIREFRAME_SAMPLES), dtype=np.float64)
         rows: list[np.ndarray] = []
         base_z = np.linspace(-0.95, 0.95, int(cls._SPHERE_WIREFRAME_LATITUDES), dtype=np.float64)
         latitudes = base_z
-        if dense_opposite_pole:
-            cap_angle = float(cls._SPHERE_WIREFRAME_OPPOSITE_POLE_CAP_ANGLE)
-            cap_alpha = np.geomspace(2e-4, cap_angle, int(cls._SPHERE_WIREFRAME_OPPOSITE_POLE_LATITUDES))
-            dense_z = -np.cos(cap_alpha)
+        if dense_trajectory_pole:
+            cap_angle = float(cls._SPHERE_WIREFRAME_TRAJECTORY_POLE_CAP_ANGLE)
+            cap_alpha = np.geomspace(2e-4, cap_angle, int(cls._SPHERE_WIREFRAME_TRAJECTORY_POLE_LATITUDES))
+            dense_z = np.cos(cap_alpha)
             latitudes = np.unique(np.concatenate([base_z, dense_z]))
         for z in latitudes:
             r = math.sqrt(max(0.0, 1.0 - float(z) * float(z)))
@@ -2941,9 +3390,9 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
         phi_vals = np.linspace(0.0, TAU, int(cls._SPHERE_WIREFRAME_LONGITUDES), endpoint=False, dtype=np.float64)
         base_alpha = np.linspace(0.0, math.pi, int(cls._SPHERE_WIREFRAME_SAMPLES), dtype=np.float64)
         meridian_alpha = base_alpha
-        if dense_opposite_pole:
-            cap_angle = float(cls._SPHERE_WIREFRAME_OPPOSITE_POLE_CAP_ANGLE)
-            dense_alpha = np.geomspace(2e-5, cap_angle, int(cls._SPHERE_WIREFRAME_OPPOSITE_POLE_MERIDIAN_SAMPLES))
+        if dense_trajectory_pole:
+            cap_angle = float(cls._SPHERE_WIREFRAME_TRAJECTORY_POLE_CAP_ANGLE)
+            dense_alpha = np.geomspace(2e-5, cap_angle, int(cls._SPHERE_WIREFRAME_TRAJECTORY_POLE_MERIDIAN_SAMPLES))
             meridian_alpha = np.unique(np.concatenate([base_alpha, dense_alpha]))
         for phi in phi_vals:
             r = np.sin(meridian_alpha)
@@ -2952,7 +3401,7 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
                     [
                         r * math.cos(float(phi)),
                         r * math.sin(float(phi)),
-                        -np.cos(meridian_alpha),
+                        np.cos(meridian_alpha),
                     ]
                 )
             )
@@ -2988,30 +3437,49 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
         q_hi = np.nanquantile(quantile_source, 0.97, axis=0)
         finite = np.vstack(important_chunks if important_chunks else all_chunks)
         transverse_finite = np.vstack(transverse_chunks) if transverse_chunks else finite
-        yz_lo = q_lo[1:3]
-        yz_hi = q_hi[1:3]
-        yz_center = 0.5 * (yz_lo + yz_hi)
-        yz_radius = max(1.0, float(np.max(0.5 * (yz_hi - yz_lo))))
-        yz_pad = float(cls._SCENE_TRANSVERSE_PAD)
-        y_range = [float(yz_center[0] - yz_pad * yz_radius), float(yz_center[0] + yz_pad * yz_radius)]
-        z_range = [float(yz_center[1] - yz_pad * yz_radius), float(yz_center[1] + yz_pad * yz_radius)]
-        transverse_width = max(y_range[1] - y_range[0], z_range[1] - z_range[0])
-        transverse_floor = min(y_range[0], z_range[0])
-        x_lo = max(float(q_lo[0]), float(transverse_floor))
-        x_hi_quantile = float(q_hi[0])
-        x_hi_trajectory = float(np.nanmax(transverse_finite[:, 0]))
-        desired_x_hi = max(x_hi_quantile, x_hi_trajectory) + 0.35 * transverse_width
-        x_hi = min(desired_x_hi, x_lo + 2.0 * transverse_width)
-        x_hi = max(x_hi, x_lo + transverse_width)
+        transverse_source = np.vstack(transverse_chunks) if transverse_chunks else quantile_source
+        yz_abs = np.nanquantile(np.abs(transverse_source[:, 1:3]), 0.97, axis=0)
+        transverse_radius = max(1.0, float(np.nanmax(yz_abs))) * float(cls._SCENE_TRANSVERSE_PAD)
+        y_range = [-float(transverse_radius), float(transverse_radius)]
+        z_range = [-float(transverse_radius), float(transverse_radius)]
+        x_hi = float(transverse_radius)
+        x_lo_quantile = float(q_lo[0])
+        x_lo_trajectory = float(np.nanmin(transverse_finite[:, 0]))
+        desired_x_lo = min(x_lo_quantile, x_lo_trajectory) - 0.35 * (2.0 * transverse_radius)
+        x_width = max(2.0 * transverse_radius, x_hi - desired_x_lo)
+        x_lo = x_hi - x_width
         x_range = [float(x_lo), float(x_hi)]
-        if x_range[0] < 0.0 < x_range[1]:
-            shift = 0.5 * abs(float(x_range[0]))
-            x_range = [float(x_range[0] - shift), float(x_range[1] - shift)]
         return [
             x_range,
             y_range,
             z_range,
         ]
+
+    @classmethod
+    def _origin_centered_chart_range_from_payloads(cls, payloads: list[dict[str, Any]]) -> list[list[float]]:
+        all_chunks: list[np.ndarray] = []
+        important_chunks: list[np.ndarray] = []
+        for payload in payloads:
+            for key in cls._INVERSION_PAYLOAD_KEYS:
+                arr = np.asarray(payload[key], dtype=np.float64).reshape(-1, 3)
+                arr = arr[np.isfinite(arr).all(axis=1)]
+                if arr.size:
+                    all_chunks.append(arr)
+                    if key != "inv_wire":
+                        important_chunks.append(arr)
+        if not all_chunks:
+            return [[-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0]]
+        base_ranges = cls._chart_range_from_payloads(payloads)
+        base_half_widths = np.array(
+            [0.5 * max(float(hi) - float(lo), 1e-9) for lo, hi in base_ranges],
+            dtype=np.float64,
+        )
+        quantile_source = np.vstack(important_chunks if important_chunks else all_chunks)
+        q = np.nanquantile(np.abs(quantile_source), 0.97, axis=0)
+        required_half_widths = np.maximum(base_half_widths, q * float(cls._SCENE_RANGE_PAD))
+        transverse_radius = max(1.0, float(required_half_widths[1]), float(required_half_widths[2]))
+        x_radius = max(transverse_radius, float(required_half_widths[0]))
+        return [[-x_radius, x_radius], [-transverse_radius, transverse_radius], [-transverse_radius, transverse_radius]]
 
     @staticmethod
     def _scene_aspect_ratio_from_ranges(ranges: list[list[float]]) -> dict[str, float]:
@@ -3019,6 +3487,139 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
         scale = max(float(np.min(widths)), 1e-9)
         ratio = widths / scale
         return {"x": float(ratio[0]), "y": float(ratio[1]), "z": float(ratio[2])}
+
+    @staticmethod
+    def _unit_vector_or_fallback(vector: np.ndarray, fallback: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+        v = np.asarray(vector, dtype=np.float64).reshape(3)
+        n = float(np.linalg.norm(v))
+        if np.isfinite(n) and n > float(eps):
+            return v / n
+        f = np.asarray(fallback, dtype=np.float64).reshape(3)
+        f_norm = float(np.linalg.norm(f))
+        if np.isfinite(f_norm) and f_norm > float(eps):
+            return f / f_norm
+        return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+    @classmethod
+    def _camera_up_for_direction(cls, direction: np.ndarray) -> np.ndarray:
+        view = cls._unit_vector_or_fallback(direction, np.array([1.0, 0.0, 0.0], dtype=np.float64))
+        reference_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        if abs(float(np.dot(reference_up, view))) > 0.92:
+            reference_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        up = reference_up - float(np.dot(reference_up, view)) * view
+        return cls._unit_vector_or_fallback(up, reference_up)
+
+    @classmethod
+    def _gaussian_weighted_path_velocity(cls, path: np.ndarray, frame_index: int) -> np.ndarray:
+        directions = cls._gaussian_weighted_path_direction_sequence(path)
+        idx = int(np.clip(int(frame_index), 0, directions.shape[0] - 1))
+        return directions[idx]
+
+    @classmethod
+    def _gaussian_weighted_path_direction_sequence(cls, path: np.ndarray) -> np.ndarray:
+        P = np.asarray(path, dtype=np.float64).reshape(-1, 3)
+        if P.shape[0] <= 1:
+            return np.array([[1.0, 0.0, 0.0]], dtype=np.float64)
+        displacements = P[1:] - P[:-1]
+        valid = np.isfinite(displacements).all(axis=1)
+        norms = np.linalg.norm(displacements, axis=1)
+        valid &= norms > 1e-12
+        if not bool(valid.any()):
+            finite = P[np.isfinite(P).all(axis=1)]
+            if finite.size:
+                fallback = cls._unit_vector_or_fallback(finite[-1] - finite[0], finite.mean(axis=0))
+            else:
+                fallback = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            return np.broadcast_to(fallback.reshape(1, 3), (P.shape[0], 3)).copy()
+        segment_count = displacements.shape[0]
+        sigma = float(np.clip(0.04 * float(segment_count), 0.75, 1.5))
+        segment_index = np.arange(segment_count, dtype=np.float64)
+        modes = np.clip(np.arange(P.shape[0], dtype=np.float64) + 1.0, 0.0, float(segment_count - 1))
+        weights = np.exp(-0.5 * ((segment_index[None, :] - modes[:, None]) / sigma) ** 2)
+        weights[:, ~valid] = 0.0
+        totals = weights.sum(axis=1)
+        velocities = np.empty((P.shape[0], 3), dtype=np.float64)
+        good_rows = totals > 1e-12
+        velocities[good_rows] = (weights[good_rows] @ displacements) / totals[good_rows, None]
+        valid_indices = np.flatnonzero(valid)
+        for row in np.flatnonzero(~good_rows):
+            nearest = int(np.argmin(np.abs(segment_index[valid] - modes[row])))
+            velocities[row] = displacements[valid_indices[nearest]]
+        velocity_norms = np.linalg.norm(velocities, axis=1)
+        fallback = cls._unit_vector_or_fallback(
+            displacements[valid_indices[-1]],
+            np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        )
+        directions = np.broadcast_to(fallback.reshape(1, 3), velocities.shape).copy()
+        nonzero = np.isfinite(velocity_norms) & (velocity_norms > 1e-12) & np.isfinite(velocities).all(axis=1)
+        directions[nonzero] = velocities[nonzero] / velocity_norms[nonzero, None]
+        return directions
+
+    @classmethod
+    def _transported_camera_up_for_directions(cls, directions: np.ndarray, frame_index: int) -> np.ndarray:
+        D = np.asarray(directions, dtype=np.float64).reshape(-1, 3)
+        if D.shape[0] == 0:
+            return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        norms = np.linalg.norm(D, axis=1)
+        valid = np.isfinite(norms) & (norms > 1e-12) & np.isfinite(D).all(axis=1)
+        if not bool(valid.any()):
+            return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        fallback_direction = D[np.flatnonzero(valid)[0]]
+        fallback_direction = fallback_direction / max(float(np.linalg.norm(fallback_direction)), 1e-12)
+        D = D.copy()
+        D[valid] = D[valid] / norms[valid, None]
+        D[~valid] = fallback_direction
+        target = int(np.clip(int(frame_index), 0, D.shape[0] - 1))
+        first = D[0]
+        reference_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        if abs(float(np.dot(reference_up, first))) > 0.92:
+            reference_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        up = reference_up - float(np.dot(reference_up, first)) * first
+        up = cls._unit_vector_or_fallback(up, reference_up)
+        for i in range(1, target + 1):
+            prev = D[i - 1]
+            curr = D[i]
+            axis = np.cross(prev, curr)
+            s = float(np.linalg.norm(axis))
+            c = float(np.clip(np.dot(prev, curr), -1.0, 1.0))
+            if s > 1e-12:
+                axis /= s
+                up = c * up + s * np.cross(axis, up) + (1.0 - c) * float(np.dot(axis, up)) * axis
+            up = up - float(np.dot(up, curr)) * curr
+            up = cls._unit_vector_or_fallback(up, cls._camera_up_for_direction(curr))
+        return up
+
+    def _celestial_camera_from_payload(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        idx = int(np.clip(self._frame_index, 0, max(0, len(self._frame_payloads) - 1)))
+        if payload is None and self._frame_payloads:
+            payload = self._frame_payloads[idx]
+        if payload is None:
+            direction = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            up = self._camera_up_for_direction(direction)
+        else:
+            path = np.asarray(payload.get("inv_path", []), dtype=np.float64).reshape(-1, 3)
+            directions = self._gaussian_weighted_path_direction_sequence(path)
+            path_idx = int(np.clip(idx, 0, directions.shape[0] - 1))
+            direction = self._unit_vector_or_fallback(directions[path_idx], np.array([1.0, 0.0, 0.0], dtype=np.float64))
+            up = self._transported_camera_up_for_directions(directions, path_idx)
+        eye = -float(self._CELESTIAL_CAMERA_EYE_RADIUS) * direction
+        return {
+            "eye": {"x": float(eye[0]), "y": float(eye[1]), "z": float(eye[2])},
+            "center": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "up": {"x": float(up[0]), "y": float(up[1]), "z": float(up[2])},
+            "projection": {"type": "perspective"},
+        }
+
+    def _current_scene_camera(self) -> dict[str, Any]:
+        celestial_toggle = getattr(self, "celestial_sphere_toggle", None)
+        if celestial_toggle is not None and bool(celestial_toggle.value):
+            return self._celestial_camera_from_payload()
+        return {
+            "eye": dict(self._SCENE_CAMERA_EYE),
+            "center": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "up": {"x": 0.0, "y": 0.0, "z": 1.0},
+            "projection": {"type": "perspective"},
+        }
 
     def _dynamic_inversion_payload(
         self,
@@ -3034,7 +3635,7 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
         w_np = np.asarray(payload["w"], dtype=np.float64).reshape(3)
         R = np.asarray(payload["R"], dtype=np.float64).reshape(3)
         velocity = np.asarray(payload["velocity"], dtype=np.float64).reshape(3)
-        center = -w_np
+        center = w_np
         r_curve = w_np[None, :] + line_t * (0.48 * R)[None, :]
         v_curve = w_np[None, :] + line_t * (1.6 * velocity)[None, :]
         display_rotation = np.asarray(frame_arrays["display_rotation"], dtype=np.float64).reshape(3, 3)
@@ -3049,12 +3650,12 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
 
         baseline = {
             "inv_wire": base_chart(wire),
-            "inv_path": base_chart(W),
+            "inv_path": base_chart(-W),
             "inv_anchors": base_chart(P),
             "inv_origin": base_chart(np.zeros((1, 3), dtype=np.float64)),
-            "inv_w": base_chart(w_np.reshape(1, 3)),
-            "inv_R": base_chart(r_curve),
-            "inv_velocity": base_chart(v_curve),
+            "inv_w": base_chart((-w_np).reshape(1, 3)),
+            "inv_R": base_chart(-r_curve),
+            "inv_velocity": base_chart(-v_curve),
         }
         range_baseline = dict(baseline)
         range_baseline["inv_wire"] = base_chart(range_wire)
@@ -3062,7 +3663,15 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
             key: (contraction_scale * value if contraction_scale != 1.0 else value)
             for key, value in baseline.items()
         }
-        out.update({f"range_{key}": value for key, value in range_baseline.items()})
+        range_out = {
+            key: (contraction_scale * value if contraction_scale != 1.0 else value)
+            for key, value in range_baseline.items()
+        }
+        comoving_toggle = getattr(self, "comoving_frame_toggle", None)
+        if comoving_toggle is not None and bool(comoving_toggle.value):
+            current_w_center = np.asarray(out["inv_w"], dtype=np.float64).reshape(1, 3)
+            out = {key: value - current_w_center for key, value in out.items()}
+        out.update({f"range_{key}": value for key, value in range_out.items()})
         return out
 
     def _build_frame_payloads(self, orbit: np.ndarray, *, include_contours: bool) -> list[dict[str, Any]]:
@@ -3084,8 +3693,8 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
         physical_velocity = 0.5 * (1.0 - w2)[:, None] * R
         terminal_direction = self._trajectory_terminal_direction(W)
         display_rotation = self._rotation_matrix_between(terminal_direction, np.array([1.0, 0.0, 0.0], dtype=np.float64))
-        wire = self._sphere_wireframe_points(pole_axis=terminal_direction, dense_opposite_pole=True)
-        range_wire = self._sphere_wireframe_points(pole_axis=terminal_direction, dense_opposite_pole=False)
+        wire = self._sphere_wireframe_points(pole_axis=terminal_direction, dense_trajectory_pole=True)
+        range_wire = self._sphere_wireframe_points(pole_axis=terminal_direction, dense_trajectory_pole=False)
         line_t = np.linspace(0.0, 1.0, 48, dtype=np.float64)[:, None]
         time_mode = self._time_mode()
         frame_arrays = {
@@ -3112,9 +3721,9 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
                 "parameter_time": float(parameter_time[i]),
                 "physical_time": float(physical_time[i]),
                 "stats": (
-                    "<b>3D inversion diagnostics</b> "
+                    "<b>3D Cayley diagnostics</b> "
                     f"|w|={float(np.linalg.norm(w_np)):.6f}; "
-                    f"|Rₚ⁰(w)|={coh:.6f}; "
+                    f"|R_ξ(w)|={coh:.6f}; "
                     f"|ẇ|={speed:.6f}; "
                     f"time={'ES' if time_mode == 'euler_sundman' else 'physical'}; "
                     f"τ={float(parameter_time[i]):.6g}; "
@@ -3151,7 +3760,11 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
         payloads = super()._finalize_frame_payloads(payloads, frame_arrays=frame_arrays)
         if not payloads:
             return payloads
-        scene_ranges = self._chart_range_from_payloads(payloads)
+        comoving_toggle = getattr(self, "comoving_frame_toggle", None)
+        if comoving_toggle is not None and bool(comoving_toggle.value):
+            scene_ranges = self._origin_centered_chart_range_from_payloads(payloads)
+        else:
+            scene_ranges = self._chart_range_from_payloads(payloads)
         for payload in payloads:
             payload["scene_ranges"] = scene_ranges
             for key in self._INVERSION_PAYLOAD_KEYS:
@@ -3172,7 +3785,7 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
                     aspectmode="manual",
                     aspectratio=aspect_ratio,
                     domain=dict(x=[0.0, 1.0], y=[0.0, 1.0]),
-                    camera=dict(eye=dict(self._SCENE_CAMERA_EYE)),
+                    camera=self._current_scene_camera(),
                 )
             )
 
@@ -3191,6 +3804,9 @@ class LMSOpticalDynamicInversionBall3DWidget(LMSOpticalDiskBaseWidget):
             set_xyz("inv_w", "inv_w")
             set_xyz("inv_R", "inv_R")
             set_xyz("inv_velocity", "inv_velocity")
+            celestial_toggle = getattr(self, "celestial_sphere_toggle", None)
+            if celestial_toggle is not None and bool(celestial_toggle.value):
+                self.fig.update_layout(scene=dict(camera=self._celestial_camera_from_payload(payload)))
 
 
 class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
@@ -3199,10 +3815,10 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
     The bottom row shows the modified chart
 
         (u, λ) = (λ <S_ξ(w), e⊥>, λ),
-        λ = exp(-Sₚ⁰(w)) = exp(Φₚ⁰(w)),
+        λ = exp(-Sₚ(w)) = exp(Φₚ(w)),
 
-    where Sₚ⁰ is the total weighted Busemann phase of the canonical
-    constants pᵢ⁰ and ξ is the normalized exact gauge direction
+    where Sₚ is the total weighted Busemann phase of the canonical
+    constants ξᵢ and ξ is the normalized exact gauge direction
     w_*/|w_*|.  This keeps the Cayley puncture tied to the canonical orbit,
     not to a free UI angle.
     """
@@ -3256,9 +3872,9 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
 
     def _layout_header_html(self) -> str:
         return (
-            "<b>LMS optical reflected-ray explorer + weighted Cayley chart</b><br>"
+            "<b>LMS optical moving optical x-cloud explorer + weighted Cayley chart</b><br>"
             "Bottom: modified Cayley half-plane with "
-            "λ=exp(-Sₚ⁰(w))=exp(Φₚ⁰(w)) and puncture "
+            "λ=exp(-S_ξ(w))=exp(Φ_ξ(w)) and puncture "
             "ξ=w*/|w*| from the exact gauge."
         )
 
@@ -3272,10 +3888,10 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 [{"colspan": 2}, None],
             ],
             subplot_titles=(
-                "pᵢ⁰=M₋w*(xᵢ⁰), w(t)",
-                "rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰), Sᵣ(w)(u)=const",
-                "Rₚ⁰(w)=Σᵢ aᵢ rᵢ(w)",
-                "pᵢ⁰ → rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰)",
+                "ξᵢ=M-w*(xᵢ), w(t)",
+                "xᵢ(w)=-Hξᵢ-w(ξᵢ), Sₓ(w)(u)=const",
+                "R_ξ(w)=-Σᵢ aᵢ xᵢ(w)",
+                "ξᵢ → xᵢ(w)=-Hξᵢ-w(ξᵢ)",
                 "Cay_ξ(w)=(u,λ)",
             ),
             row_heights=[0.30, 0.28, 0.42],
@@ -3305,7 +3921,7 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
                 y=[],
                 mode="markers",
                 marker=dict(size=7, color="#244C9A", opacity=0.65),
-                name="∂Cay_ξ(pᵢ⁰)",
+                name="∂Cay_ξ(ξᵢ)",
             ),
             "cayley_boundary",
         )
@@ -3450,8 +4066,8 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
             payload["cayley_regular_x_range"] = regular_x_range
             payload["cayley_regular_y_range"] = regular_y_range
             payload["stats"] += (
-                f"; Sₚ⁰(w)={float(weighted_chart['phase'][i]):.6f}; "
-                f"Φₚ⁰(w)={float(-weighted_chart['phase'][i]):.6f}; "
+                f"; S_ξ(w)={float(weighted_chart['phase'][i]):.6f}; "
+                f"Φ_ξ(w)={float(-weighted_chart['phase'][i]):.6f}; "
                 f"λ_wtd={float(weighted_chart['lambda'][i]):.6g}; "
                 f"λ_reg={float(regular_chart['lambda'][i]):.6g}"
             )
@@ -3467,8 +4083,8 @@ class LMSOpticalWeightedCayleyDiskWidget(LMSOpticalDiskBaseWidget):
             title_x = "u, ξₜ=wₜ/|wₜ|"
             title_y = "λ=exp(-B_ξₜ(wₜ))"
         else:
-            title_x = "u=exp(-Sₚ⁰(w))·<S_ξ(w),e⊥>"
-            title_y = "λ=exp(-Sₚ⁰(w))=exp(Φₚ⁰(w))"
+            title_x = "u=exp(-S_ξ(w))·<S_ξ(w),e⊥>"
+            title_y = "λ=exp(-S_ξ(w))=exp(Φ_ξ(w))"
         with self.fig.batch_update():
             # The full Cayley path, the axis trace, and the weighted
             # boundary are constant across frames for a given prefix.
@@ -3514,8 +4130,8 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
     def _layout_header_html(self) -> str:
         return (
             "<b>LMS hyperboloid + optical screen chart</b><br>"
-            "The reflected-cloud panel is the unchanged evolution view. "
-            "The other panels show X(w), null constants ℓᵢ=(1,pᵢ⁰), "
+            "The moving x-cloud panel is the unchanged evolution view. "
+            "The other panels show X(w), null constants ℓᵢ=(1,ξᵢ), "
             "ray fields uᵢ, and the transverse spread coefficient Θ⊥."
         )
 
@@ -3529,9 +4145,9 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
             ],
             subplot_titles=(
                 "X(w), ℓᵢ, uᵢ, U",
-                "rᵢ(w)=Hₚᵢ⁰−w(pᵢ⁰), Sᵣ(w)(u)=const",
+                "xᵢ(w)=-Hξᵢ-w(ξᵢ), Sₓ(w)(u)=const",
                 "βᵢ=<uᵢ,E⊥>_L, Θ⊥",
-                "|Rₚ⁰(w)|, Θ⊥, Φₚ⁰(w)",
+                "|R_ξ(w)|, Θ⊥, Φ_ξ(w)",
             ),
             horizontal_spacing=0.08,
             vertical_spacing=0.12,
@@ -3568,29 +4184,29 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
             1,
             1,
         )
-        add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="rgba(70,70,70,0.55)", width=3), name="tℓᵢ=t(1,pᵢ⁰)", hoverinfo="skip"), "hyper_null", 1, 1)
-        add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="rgba(36,76,154,0.42)", width=3), name="X(rpᵢ⁰)", hoverinfo="skip"), "hyper_geodesics", 1, 1)
+        add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="rgba(70,70,70,0.55)", width=3), name="tℓᵢ=t(1,ξᵢ)", hoverinfo="skip"), "hyper_null", 1, 1)
+        add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="rgba(36,76,154,0.42)", width=3), name="X(rξᵢ)", hoverinfo="skip"), "hyper_geodesics", 1, 1)
         add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="#6F4CC3", width=5), name="X(w(t))"), "hyper_path", 1, 1)
         add(go.Scatter3d(x=[], y=[], z=[], mode="markers", marker=dict(size=5, color="black"), name="X(w)"), "hyper_X", 1, 1)
         add(go.Scatter3d(x=[], y=[], z=[], mode="lines", line=dict(color="rgba(91,140,90,0.55)", width=3), name="uᵢ", hoverinfo="skip"), "hyper_u", 1, 1)
         add(go.Scatter3d(x=[], y=[], z=[], mode="lines+markers", line=dict(color="#D72638", width=7), marker=dict(size=4, color="#D72638"), name="U=Σᵢ aᵢ uᵢ"), "hyper_U", 1, 1)
 
         cx, cy = _circle_xy()
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name="Sᵣ(w)(u)=const", hoverinfo="skip"), "ref_phase", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(78,60,150,0.82)", width=1.45), opacity=0.82, name="Sₓ(w)(u)=const", hoverinfo="skip"), "ref_phase", 1, 2)
         add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.75)", width=2), name="∂𝔹²", hoverinfo="skip", showlegend=False), "ref_circle", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name="rᵢ(w)"), "reflected", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name="w: Σᵢ aᵢ M_w(rᵢ(w))=0"), "ref_w", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name="Rₚ⁰(w)"), "R_circle", 1, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name="Cov(rᵢ(w))", hoverinfo="skip"), "ellipse", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=8, color="#5B8C5A", opacity=0.78), name="xᵢ(w)"), "reflected", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="black", symbol="x"), name="w: Σᵢ aᵢ M_{-w}(xᵢ(w))=0"), "ref_w", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines+markers", line=dict(color="#D72638", width=4), marker=dict(size=[0, 10], color="#D72638"), name="R_ξ(w)"), "R_circle", 1, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=2), name="Cov(xᵢ(w))", hoverinfo="skip"), "ellipse", 1, 2)
 
         add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.45)", width=2), name="β=0", showlegend=False, hoverinfo="skip"), "screen_axis", 2, 1)
         add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(91,140,90,0.42)", width=1.5), name="aᵢβᵢ", hoverinfo="skip"), "screen_stems", 2, 1)
         add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=9, color="#5B8C5A", opacity=0.82), name="βᵢ"), "screen_beta", 2, 1)
         add(go.Scatter(x=[], y=[], mode="text", text=[], textfont=dict(color="#D72638", size=13), name="Θ⊥", hoverinfo="skip"), "screen_theta_text", 2, 1)
 
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#D72638", width=2.5), name="|Rₚ⁰|"), "diag_R", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#D72638", width=2.5), name="|R_ξ|"), "diag_R", 2, 2)
         add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#188038", width=2.5), name="Θ⊥"), "diag_theta", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#6F4CC3", width=2.0, dash="dot"), name="Φₚ⁰"), "diag_phi", 2, 2, secondary_y=True)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#6F4CC3", width=2.0, dash="dot"), name="Φ_ξ"), "diag_phi", 2, 2, secondary_y=True)
         add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=10, color="#D72638"), name="current", showlegend=False), "diag_R_point", 2, 2)
         add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=10, color="#188038"), name="current", showlegend=False), "diag_theta_point", 2, 2)
         add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=10, color="#6F4CC3"), name="current", showlegend=False), "diag_phi_point", 2, 2, secondary_y=True)
@@ -3616,8 +4232,8 @@ class LMSOpticalHyperboloidScreenWidget(LMSOpticalDiskBaseWidget):
         fig.update_xaxes(title_text="βᵢ=<uᵢ,E⊥>_L", zeroline=True, showgrid=True, row=2, col=1)
         fig.update_yaxes(title_text="aᵢ", rangemode="tozero", showgrid=True, row=2, col=1)
         fig.update_xaxes(title_text="frame", showgrid=True, row=2, col=2)
-        fig.update_yaxes(title_text="|Rₚ⁰|, Θ⊥", showgrid=True, row=2, col=2, secondary_y=False)
-        fig.update_yaxes(title_text="Φₚ⁰(w)", showgrid=False, row=2, col=2, secondary_y=True)
+        fig.update_yaxes(title_text="|R_ξ|, Θ⊥", showgrid=True, row=2, col=2, secondary_y=False)
+        fig.update_yaxes(title_text="Φ_ξ(w)", showgrid=False, row=2, col=2, secondary_y=True)
         self._hyper_static_applied = False
         _sanitize_figure_text(fig)
         self._configure_subplot_legends()
