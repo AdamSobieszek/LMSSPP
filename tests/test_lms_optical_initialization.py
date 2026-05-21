@@ -57,6 +57,22 @@ class LMSOpticalCanonicalInitializationTests(unittest.TestCase):
                     )
                     self.assertGreater(pointwise_delta, 1e-4)
 
+    def test_reference_shape_axis_is_opposite_recovered_w_star(self) -> None:
+        for preset in ("clustered", "dipole"):
+            with self.subTest(preset=preset):
+                state = _canonical_initialization_np(
+                    30,
+                    np.random.default_rng(1),
+                    preset=preset,
+                    target_radius=0.4,
+                    dimension=2,
+                )
+                w_dir = state.w_star / np.linalg.norm(state.w_star)
+                reference_projection = state.candidate_points @ w_dir
+
+                self.assertLess(float(np.median(reference_projection)), 0.0)
+                np.testing.assert_allclose(w_dir, np.array([1.0, 0.0]), atol=1e-7)
+
     def test_initial_velocity_uses_recovered_w_star_and_reference_cloud(self) -> None:
         state = _canonical_initialization_np(
             12,

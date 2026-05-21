@@ -1,0 +1,1248 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{xcolor}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=blue!60!black,
+    urlcolor=blue!60!black
+}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{example}[theorem]{Example}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\B}{\mathbb{B}}
+\newcommand{\Sph}{{S}}
+\newcommand{\ip}[2]{\left\langle #1,#2\right\rangle}
+\newcommand{\norm}[1]{\left|#1\right|}
+\newcommand{\dd}{\,\mathrm d}
+\newcommand{\push}{\#}
+\newcommand{\cs}{c_{\mathfrak S}}
+\newcommand{\grad}{\nabla}
+\newcommand{\Hh}{ H}
+\newcommand{\UU}{\mho}
+\newcommand{\Mob}{M}
+\newcommand{\Sbr}[2]{\mathfrak S[#1,#2]}
+\newcommand{\kap}[2]{\kappa[#1,#2]}
+\newcommand{\Om}{\Omega}
+\newcommand{\Xlift}{\mathbf X}
+\newcommand{\Ylift}{\mathbf Y}
+\newcommand{\calB}{\mathcal B}
+
+\title{Inversive Logarithmic Transport\\
+\large Spherical Cayley Brackets, Canonical Inversive Cost, and Brenier Regularity}
+\author{Draft manuscript from the inversive framework notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This manuscript develops an inversive calculus for logarithmic optimal-transport-like flows.  The basic operation is spherical inversion, $v\mapsto v^+=v/\norm v^2$, but the central object is not the bare inversion.  It is the two-slot Cayley bracket
+\[
+    \Sbr{a}{b}:=(a^+-b)^+,
+\]
+whose apparent singularity at $a=0$ cancels after the second inversion and whose rational extension is
+\[
+    \Sbr{a}{b}=\frac{a-\norm a^2 b}{1-2\ip a b+\norm a^2\norm b^2}.
+\]
+The bracket is the concrete inversive realization of the canonical symmetric cost
+\[
+    \cs(a,b):=-\frac12\log\kap{a}{b},
+    \qquad
+    \kap{a}{b}:=1-2\ip a b+\norm a^2\norm b^2,
+\]
+because its two gradients are exactly
+\[
+    \grad_b\cs(a,b)=\Sbr{a}{b},
+    \qquad
+    \grad_a\cs(a,b)=\Sbr{b}{a}.
+\]
+
+The manuscript organizes the framework in three layers.  First, the bracket calculus packages Busemann gradients, Cayley heights, reflected rays, and the low-dimensional Lipton--Mirollo--Strogatz spherical Kuramoto reduction into one projective score flow on the ball.  Second, a renormalized Peszek--Poyato power kernel $W^\alpha$ admits a logarithmic limit $W^{(2)}=-\log\norm{\cdot}$ and an inversive conjugacy
+\[
+    \grad W^{(2)}\circ \grad W^\alpha=(1-\alpha)^2\grad W^{2-\alpha},
+\]
+showing that the logarithmic kernel is better understood as a chart-conjugator than as the primitive cost.  Third, the quadratic denominator
+\[
+    \kap{a}{b}=1+\Xlift(a)\cdot \Ylift(b),
+    \qquad
+    \Xlift(a)=(a,\norm a^2),\quad \Ylift(b)=(-2b,\norm b^2),
+\]
+connects the inversive cost to Wong's logarithmic projective geometry and to Khan--Zhang's K\"ahler treatment of logarithmic optimal transport.
+
+The final results prove the global twist condition and the smooth non-degeneracy of the mixed cross-Hessian, including $D^2_{a,b}\cs(0,b)=I$.  They also give the closed inversive Brenier map
+\[
+    T(a)=\Sbr{\grad\phi(a)}{-a},
+\]
+with the zero-momentum case interpreted through the smooth bracket extension.  When $\grad\phi(a)\neq0$, this is $T(a)=(a+v)^+$ with inverted-chart displacement $v=(\grad\phi(a))^+$.  The same formula gives an explicit transport Jacobian and an inversive Monge--Ampere equation, so the nonlinear Monge problem becomes a three-step geometric pipeline: pass to the inverted displacement, translate in the dual chart, and invert back.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction: the logarithmic kernel is a chart, not the whole cost}
+
+A recurring temptation in logarithmic transport problems is to identify the fundamental cost with the radial kernel
+\[
+    W^{(2)}(z)=-\log\norm z.
+\]
+This kernel is certainly present: its gradient is inversion,
+\[
+    \grad W^{(2)}(z)=-\frac{z}{\norm z^2}=-z^+,
+\]
+and its Hessian is the Householder-weighted differential of inversion,
+\[
+    D^2W^{(2)}_z=-\norm z^{-2}\Hh_z,
+    \qquad
+    \Hh_z:=I-2\hat z\otimes \hat z.
+\]
+However, the framework developed here argues that $W^{(2)}$ should usually not be read as the primitive transport cost.  Rather, it is the fixed inversive chart derivative of a larger projective logarithmic geometry.  The guiding principle is a dual-chart principle: the curved hyperbolic and projective effects seen in the physical variables become affine translations after inversion.  What looks like a nonlinear transport geometry in the original chart is ordinary Euclidean displacement in the inverted chart, and the canonical inversive cost is the generating function that intertwines the two descriptions.
+
+The central object is the shared Cayley-inversion bracket
+\[
+    \Sbr{a}{b}:=(a^+-b)^+.
+\]
+In boundary calculations this reduces to the familiar inverse displacement $(\xi-w)^+$, but the two-slot notation is not decorative.  It keeps track of a source slot and a target/gauge slot, and it reveals the projective denominator
+\[
+    \kap{a}{b}:=1-2\ip a b+\norm a^2\norm b^2.
+\]
+This denominator has three simultaneous meanings:
+\begin{enumerate}[label=(\roman*)]
+    \item it regularizes the double inversion at $a=0$;
+    \item on the diagonal, it becomes the squared ball curvature gauge,
+    \[
+        \kap{w}{w}=(1-\norm w^2)^2=\Om(w)^2;
+    \]
+    \item after the lift $\Xlift(a)=(a,\norm a^2)$ and $\Ylift(b)=(-2b,\norm b^2)$, it is exactly a Wong-type projective denominator,
+    \[
+        \kap{a}{b}=1+\Xlift(a)\cdot \Ylift(b).
+    \]
+\end{enumerate}
+Thus the logarithm of the denominator is not radial but projective.  The optimal-transport normalization used below is the symmetric canonical cost
+\[
+    \cs(a,b):=-\frac12\log\kap{a}{b}
+    =-\frac12\log(1+\Xlift(a)\cdot \Ylift(b)).
+\]
+The bracket is its target-gradient, while the slot-reversed bracket is its source-gradient:
+\[
+    \grad_b\cs(a,b)=\Sbr{a}{b},
+    \qquad
+    \grad_a\cs(a,b)=\Sbr{b}{a}.
+\]
+This is the manuscript's main organizing principle.
+
+The point is not merely notational.  For a general cost, the Monge map is only implicitly determined by
+\[
+    \grad\phi(a)=\grad_a c(a,b),
+\]
+and recovering $b=T(a)$ usually requires solving a nonlinear inverse problem.  For $\cs$, the gradient has its own geometric inverse.  On the nonzero-gradient locus, inversion turns
+\[
+    \grad\phi(a)=\Sbr{b}{a}
+\]
+into
+\[
+    v:=(\grad\phi(a))^+=b^+-a.
+\]
+Thus the transport map is recovered by the global smooth-bracket formula
+\[
+    T(a)=\Sbr{\grad\phi(a)}{-a},
+\]
+or, when $\grad\phi(a)\neq0$, by the inverted-chart translation $T(a)=(a+v)^+$.
+In this sense the $\Sbr{\cdot}{\cdot}$-bracket is the gauge transformation between the curved physical chart and the flat inverted chart.
+
+The framework is motivated by three related sources.  First, the Lipton--Mirollo--Strogatz reduction of the Kuramoto model on a sphere shows that the identical-frequency spherical Kuramoto dynamics is governed by the action of ball-preserving Möbius transformations and by the hyperbolic geometry of the ball \cite{LMS2021}.  Second, Peszek and Poyato identify a fibered Wasserstein structure behind a Cucker--Smale-type model with weakly singular matrix communication, and the change of variables
+\[
+    \omega=v+\grad W*\rho
+\]
+turns a velocity-alignment equation into a family of position equations with a conserved fiber label \cite{PeszekPoyato2022Fibered,PeszekPoyato2022CS}.  Third, Wong's $L^{(\pm\alpha)}$-divergences replace the bilinear Legendre pairing by the logarithmic projective cost
+\[
+    c^{(\eta)}(x,y)=\frac1\eta\log(1+\eta x\cdot y),
+\]
+and the associated $\eta$-gradient
+\[
+    D^{(\eta)}\varphi(x)=\frac{\grad\varphi(x)}{1-\eta\,\grad\varphi(x)\cdot x}
+\]
+obeys an inverse-duality theorem analogous to Legendre duality \cite{Wong2018}.  Khan and Zhang's K\"ahler treatment of logarithmic optimal transport on the probability simplex reinforces the same lesson: logarithmic costs come with their own cost geometry, convexity, and curvature, rather than being merely degenerate Euclidean power costs \cite{KhanZhang2020}.
+
+The manuscript develops an interpretation that unifies these phenomena.  The low-dimensional spherical Kuramoto parameter $w\in\B^d$ evolves by a projective score flow: the diagonal dual coordinate
+\[
+    \UU(w)=\Sbr{w}{w}=\frac{w}{1-\norm w^2}
+\]
+is matched against the cloud-averaged coordinate
+\[
+    \int\Sbr{\xi}{w}\,d\nu(\xi).
+\]
+The physical-time flow carries the conformal factor $\Om(w)^2$; after Euler--Sundman time, the same dynamics is simply the gradient of a Busemann/free-energy potential.  Meanwhile, the Peszek--Poyato kernel family
+\[
+    W^\alpha(z)=\frac{\norm z^{2-\alpha}-1}{(2-\alpha)(1-\alpha)}
+\]
+possesses a renormalized logarithmic limit at $\alpha=2$ and a complementary inversive pairing $\alpha\leftrightarrow 2-\alpha$.  This allows the same bracket ray to be written either as a fixed $W^{(2)}$ inversive ray with moving curvature gauge or as a time-dependent $W^{\alpha_t}$ or $W^{2-\alpha_t}$ force in a fixed gauge.
+
+The claim is not that all of these models are the same differential equation.  The claim is structural: they are written in different gauges of the same logarithmic-projective calculus, with $\cs$ providing the canonical transport cost and $\log\kap{a}{b}=-2\cs(a,b)$ providing the associated projective denominator.
+
+\section{Spherical inversion and the Cayley bracket}
+
+\subsection{Spherical inversion}
+
+For $v\in\R^d\setminus\{0\}$ define
+\[
+    v^+:=\frac{v}{\norm v^2}.
+\]
+The map $v\mapsto v^+$ is involutive on the punctured space:
+\[
+    (v^+)^+=v.
+\]
+It is conformal and orientation reversing when $d$ is odd.  Its derivative is the Householder-scaled map
+\[
+    D(v^+)[h]=\norm v^{-2}\Hh_v h,
+    \qquad
+    \Hh_v:=I-2\hat v\otimes\hat v,
+    \qquad
+    \hat v=\frac{v}{\norm v}.
+\]
+The centered Cayley inversion around $a$ is
+\[
+    C_a(x):=(x-a)^+.
+\]
+Unlike a Möbius boost, whose inverse is usually obtained by changing the sign of the parameter, the inverse map $C_a^{-1}\circ C_a=\operatorname{Id}$ has the following affine form
+\[
+    C_a^{-1}(u)=u^+ + a.
+\]
+
+\subsection{The shared source-target bracket}
+
+\begin{definition}[Spherical inversion S-bracket]
+For $a\neq0$ define
+\[
+    \Sbr{a}{b}:=(a^+-b)^+.
+\]
+We will show that with a smooth extension the operator is also defined at $a=0$.
+\end{definition}
+
+The bracket is a source-target chart.  The first entry is inverted before the target/gauge parameter is subtracted; the result is inverted again.  This keeps all force and Hessian terms in a single inversive chart.
+
+It also records noncommutativity of centered Cayley inversion.  Since
+\[
+    C_{-b}^{-1}(a)=a^+-b,
+\]
+we have
+\[
+    \Sbr{a}{b}=(C_0\circ C_{-b}^{-1})(a).
+\]
+Equivalently,
+\[
+    C_b^{-1}(a)=a^++b=\Sbr{a}{-b}^+.
+\]
+
+\begin{proposition}[Smooth rational extension]
+On the projective bracket domain $\kap{a}{b}>0$, the expression
+\[
+    \Sbr{a}{b}=\frac{a-\norm a^2 b}{\kap{a}{b}},
+    \qquad
+    \kap{a}{b}:=1-2\ip a b+\norm a^2\norm b^2.
+\]
+is a smooth rational extension of $(a^+-b)^+$.  In particular,
+\[
+    \Sbr{0}{b}=0.
+\]
+From this point onward, $\Sbr{a}{b}$ always denotes this smooth extension.  Thus any formula using a zero first slot is interpreted by the rational bracket, not by the punctured inversion expression.
+\end{proposition}
+
+\begin{proof}
+For $a\neq0$,
+\[
+    a^+-b=\frac{a}{\norm a^2}-b=\frac{a-\norm a^2b}{\norm a^2}.
+\]
+Inverting gives
+\[
+    (a^+-b)^+
+    =\frac{(a-\norm a^2b)/\norm a^2}{\norm{a-\norm a^2b}^2/\norm a^4}
+    =\frac{\norm a^2(a-\norm a^2b)}{\norm{a-\norm a^2b}^2}.
+\]
+Since
+\[
+    \norm{a-\norm a^2b}^2
+    =\norm a^2\bigl(1-2\ip a b+\norm a^2\norm b^2\bigr),
+\]
+the formula follows.  The numerator $a-\norm a^2b$ and denominator $\kap{a}{b}$ are smooth in $(a,b)$, and $\kap{0}{b}=1$.  Hence the rational expression is smooth at $a=0$ and takes the value $0$ there.
+\end{proof}
+
+\begin{corollary}[Local expansion at the source origin]
+As $a\to0$,
+\[
+    \Sbr{a}{b}=a+2\ip a b a-\norm a^2 b+O(\norm a^3).
+\]
+Hence
+\[
+    D_a\Sbr{0}{b}=I,
+    \qquad
+    D_b\Sbr{0}{b}=0.
+\]
+The target slot $b$ appears only at quadratic order through the special-conformal vector field
+\[
+    K_b(a)=2\ip a b a-\norm a^2b.
+\]
+\end{corollary}
+
+This expansion explains why the bracket is a useful coordinate: the target entry acts as a curvature/gauge deformation rather than as an ordinary first-order translation.
+
+\subsection{The diagonal coordinate}
+
+On the diagonal define
+\[
+    \Om(w):=1-\norm w^2,
+    \qquad
+    K(w):=\Om(w)^2,
+    \qquad
+    V(w):=\log\Om(w).
+\]
+Then
+\[
+    \kap{w}{w}=(1-\norm w^2)^2=K(w).
+\]
+The diagonal of the $\mathfrak{S}$-bracket is
+\[
+    \boxed{
+\begin{aligned}
+    &\UU(w):=\Sbr{w}{w}\\[6pt]
+    &\UU(w)=(w^+-w)^+=\frac{w}{1-\norm w^2}=\frac{w}{\Om(w)}.
+\end{aligned}
+    }
+\]
+This coordinate will be the shared drift, hyperboloid, Bakry--Emery, and Wong-dual coordinate.
+
+Its inverse is
+\[
+    \boxed{
+    \UU^{-1}(u)=\frac{2u}{1+\sqrt{1+4\norm u^2}}.
+    }
+\]
+Indeed, if
+\[
+    \gamma(u):=\sqrt{1+4\norm u^2},
+\]
+then
+\[
+    \Om(\UU^{-1}(u))=\frac{2}{1+\gamma(u)}.
+\]
+The diagonal coordinate also satisfies
+\[
+    \boxed{
+    \UU(w)=-\frac12\grad V(w)=-\frac14\grad\log K(w).
+    }
+\]
+Thus the self-bracket is simultaneously a curvature-gauge drift and an inversive self-ray.
+
+\section{The projective logarithmic cost and inverted-space decoupling}
+
+\subsection{Canonical inversive cost}
+
+To align the inversive calculus with the classical optimal transport framework of Brenier and Villani, we use the symmetric cost obtained from the projective denominator.  Define the lifts
+\[
+    \Xlift(a):=(a,\norm a^2)\in\R^{d+1},
+    \qquad
+    \Ylift(b):=(-2b,\norm b^2)\in\R^{d+1}.
+\]
+Then
+\[
+    1+\Xlift(a)\cdot\Ylift(b)
+    =1-2\ip a b+\norm a^2\norm b^2
+    =\kap{a}{b}.
+\]
+
+\begin{definition}[Canonical inversive cost]
+On the projective domain $\kap{a}{b}>0$, define
+\[
+    \boxed{
+    \cs(a,b):=-\frac12\log\kap{a}{b}
+    =-\frac12\log(1+\Xlift(a)\cdot\Ylift(b)).
+    }
+\]
+\end{definition}
+
+The boundary
+\[
+    \partial\Gamma:=\{(a,b):\kap{a}{b}=0\}
+\]
+is the projective absolute of the two-chart geometry.  For $a\neq0$,
+\[
+    \kap{a}{b}=\norm a^2\norm{a^+-b}^2,
+\]
+so $\partial\Gamma$ is the incidence locus where the target reaches the inverted source, $b=a^+$.  Along the diagonal ball chart,
+\[
+    \kap{w}{w}=(1-\norm w^2)^2,
+\]
+and the same boundary becomes the conformal infinity $\norm w=1$ of the Poincar\'e ball.  As $(a,b)$ approaches $\partial\Gamma$ from $\Gamma$, the canonical cost satisfies $\cs(a,b)\to+\infty$; this is the transport-cost analogue of the Busemann blow-up at the absolute.
+
+The prefactor $-\frac12$ is structurally essential: it distributes the source and target roles symmetrically and gives the two bracket slots directly by differentiation.
+
+\begin{proposition}[Symmetric cost gradients]
+The source and target gradients of the canonical cost are
+\[
+    \boxed{
+    \grad_b\cs(a,b)=\Sbr{a}{b}
+    =\frac{a-\norm a^2b}{\kap{a}{b}},
+    \qquad
+    \grad_a\cs(a,b)=\Sbr{b}{a}
+    =\frac{b-\norm b^2a}{\kap{a}{b}}.
+    }
+\]
+\end{proposition}
+
+\begin{proof}
+Direct differentiation gives
+\[
+    \grad_b\kap{a}{b}=-2a+2\norm a^2b.
+\]
+Therefore
+\[
+    \grad_b\cs(a,b)
+    =-\frac12\frac{\grad_b\kap{a}{b}}{\kap{a}{b}}
+    =\frac{a-\norm a^2b}{\kap{a}{b}}
+    =\Sbr{a}{b}.
+\]
+The source-gradient identity follows by symmetry.
+\end{proof}
+
+\begin{theorem}[Inverted-space linearization]
+Under spatial inversion, the nonlinear cost gradients decouple into affine translations:
+\[
+    \boxed{
+    \bigl(\grad_b\cs(a,b)\bigr)^+=a^+-b,
+    \qquad
+    \bigl(\grad_a\cs(a,b)\bigr)^+=b^+-a.
+    }
+\]
+\end{theorem}
+
+\begin{proof}
+The first identity is the defining bracket identity
+\[
+    \grad_b\cs(a,b)=\Sbr{a}{b}=(a^+-b)^+.
+\]
+Since inversion is an involution on the punctured chart,
+\[
+    \bigl(\grad_b\cs(a,b)\bigr)^+
+    =\left((a^+-b)^+\right)^+
+    =a^+-b.
+\]
+The source-side expression follows analogously from $\grad_a\cs(a,b)=\Sbr{b}{a}$.
+\end{proof}
+
+This linearization is a cornerstone of the framework: nonlinear distortions in the physical coordinates become translation vectors in the inverted coordinates.  The lifted logarithmic denominator still identifies $\log\kap{a}{b}$ with Wong's $\eta=1$ projective pairing after the quadratic lift, but the transport cost used below is the canonical symmetric normalization $\cs(a,b)=-\frac12\log\kap{a}{b}$.
+
+\subsection{Boundary atoms and Busemann phase}
+
+For $\xi\in\Sph^{d-1}$, one has $\xi^+=\xi$, hence
+\[
+    \Sbr{\xi}{w}=(\xi-w)^+.
+\]
+Moreover,
+\[
+    \kap{\xi}{w}=1-2\ip\xi w+\norm w^2=\norm{\xi-w}^2.
+\]
+The Busemann function is
+\[
+    \calB_\xi(w)=\log\frac{\norm{\xi-w}^2}{1-\norm w^2}.
+\]
+Therefore
+\[
+    \boxed{
+    \calB_\xi(w)=\log\kap{\xi}{w}-V(w)=-2\cs(\xi,w)-V(w).
+    }
+\]
+The Cayley height is
+\[
+    \lambda_\xi(w):=e^{-\calB_\xi(w)}=\frac{\Om(w)}{\norm{\xi-w}^2}
+    =\Om(w)\norm{\Sbr{\xi}{w}}^2.
+\]
+So the Busemann phase is a gauge-corrected projective logarithmic cost:
+\[
+    \boxed{
+    \calB_\xi(w)=-\log\lambda_\xi(w)=-V(w)-2\log\norm{\Sbr{\xi}{w}}.
+    }
+\]
+
+Differentiating gives
+\[
+    \boxed{
+    \grad\calB_\xi(w)=2\UU(w)-2\Sbr{\xi}{w}.
+    }
+\]
+Indeed,
+\[
+    \grad_w\log\kap{\xi}{w}=-2\Sbr{\xi}{w},
+    \qquad
+    -\grad V(w)=2\UU(w).
+\]
+Thus the Busemann gradient is a projective score residual: the self-dual coordinate $\UU(w)$ minus the source-induced dual coordinate $\Sbr{\xi}{w}$.  Equivalently, $\grad_w\cs(\xi,w)=\Sbr{\xi}{w}$ and the Busemann phase is a gauge-corrected multiple of the canonical cost.
+
+For a boundary cloud $\nu\in\mathcal P(\Sph^{d-1})$, define
+\[
+    S_\nu(w):=\int_{\Sph^{d-1}}\calB_\xi(w)\,d\nu(\xi).
+\]
+Then
+\[
+    \boxed{
+    \grad S_\nu(w)=2\UU(w)-2\int_{\Sph^{d-1}}\Sbr{\xi}{w}\,d\nu(\xi).
+    }
+\]
+Equivalently, if
+\[
+    \lambda_w:=\delta_w-\nu,
+\]
+then
+\[
+    \boxed{
+    \grad S_\nu(w)=2\int\Sbr{a}{w}\,d\lambda_w(a).
+    }
+\]
+The atom $a=w$ is not an artificial insertion.  It is the diagonal source whose bracket ray is the curvature-gauge drift $\UU(w)$.
+
+\subsection{Möbius transforms in bracket form}
+
+The boost transformations induced by the Möbius transform $\Mob_w(x)$, where $w$ and $x$ are vectors, have a notoriously complicated expression
+\begin{equation}
+M_w(x)
+=
+\frac{(1-|w|^2)x-(1-2\ip{w}{x}+|x|^2)w}
+{1-2\ip{w}{x}+|w|^2|x|^2}.
+\label{eq:mobius}
+\end{equation}
+Which simplifies when restricting the input domain to unit norm vectors $\xi\in \Sph^{d-1}, |\xi|=1$
+\[
+    \Mob_w(\xi)=\frac{(1-|w|^2)(\xi-w)}{|\xi-w|^2} -w.
+\]
+Since we define $\Om(w)=1-|w|^2$, the remaining term can be expressed as a $(\xi-w)^+$ inversion
+\[
+    \Mob_w(\xi)=\Om(w)(\xi-w)^+-w.
+\]
+Given how unit norm vectors $|\xi|=1$ satisfy $\xi^+= \xi$, this can equivalently be written as
+\[
+    \Mob_w(\xi)=\Om(w)(\xi^+-w)^+-w.
+\]
+With this we not only find the expression can be written with an $\mathfrak{S}$-bracket, this form turns out to be equivalent to the full expression in \eqref{eq:mobius} and so hold for all $x$:
+\[
+    \boxed{
+    \begin{aligned}
+    \Mob_w(x)&=\Om(w)\Sbr{x}{w}-w,\\[6pt]
+    w+\Mob_w(x)&=\Om(w)\Sbr{x}{w}.
+    \end{aligned}
+    }
+\]
+Since  $\Om(w)\UU(w)=w$ and $\Mob_w(\xi)=-\Hh_{\xi-w}(\xi)$ we obtain the following "reflected-ray" identity 
+\[
+    \boxed{
+    \Hh_{\xi-w}(\xi)=-\Mob_w(\xi)=\Om(w)\bigl(\UU(w)-\Sbr{\xi}{w}\bigr)
+    =\frac12\Om(w)\grad\calB_\xi(w).
+    }
+\]
+Thus the reflected ray is a gauged Busemann score.  The gauge is the diagonal projective section $\Om(w)$.
+
+\section{The spherical Kuramoto reduction as a projective score flow}
+
+The Lipton--Mirollo--Strogatz (2021) spherical Kuramoto model shows that, after factoring out a common natural rotation, the continuum dynamics on the sphere can be represented by pushing a fixed boundary cloud $\nu$ forward by Möbius boosts:
+\[
+    \rho_t=(\Mob_{w_t})_{\push}\nu,
+    \qquad
+    w_t\in\B^d.
+\]
+The reduced parameter $w_t$ evolves on the ball.  
+
+The critical point equation is
+\[
+    \UU(w)=\int\Sbr{\xi}{w}\,d\nu(\xi).
+\]
+This is a moment-matching condition in the inversive dual coordinate.  It is the same algebraic pattern as the gradient equation of a logarithmic divergence: a self coordinate is adjusted until it equals a cloud-averaged source coordinate.
+
+
+In the bracket calculus the vector field becomes a projective score residual.
+Define the cloud-reflected ray
+\[
+    R_\nu(w):=-\int\Mob_w(\xi)\,d\nu(\xi).
+\]
+Using the bracket form of the boost,
+\[
+    R_\nu(w)=\Om(w)\left(\UU(w)-\int\Sbr{\xi}{w}\,d\nu(\xi)\right).
+\]
+Equivalently,
+\[
+    \boxed{
+    R_\nu(w)=\Om(w)\int\Sbr{a}{w}\,d\lambda_w(a)
+    =\frac12\Om(w)\grad S_\nu(w).
+    }
+\]
+The reduced LMS equation has the form
+\[
+    \dot w=\frac12\Om(w)R_\nu(w),
+\]
+so
+\[
+    \boxed{
+    \dot w=\frac12\Om(w)^2\int\Sbr{a}{w}\,d\lambda_w(a)
+    =\frac14\Om(w)^2\grad S_\nu(w).
+    }
+\]
+After the Euler--Sundman time change
+\[
+    \frac{d\tau}{dt}=\frac14\Om(w_t)^2,
+\]
+the equation becomes the pure score flow
+\[
+    \boxed{
+    \frac{dw}{d\tau}=\grad S_\nu(w)=2\int\Sbr{a}{w}\,d\lambda_w(a).
+    }
+\]
+
+\begin{remark}[Sign convention]
+Depending on whether one writes the flow as descent of $-S_\nu$ or ascent of $S_\nu$, the sign of the gradient can be reversed.  The structural point is invariant: the vector field is the projective score residual $\UU(w)-\int\Sbr{\xi}{w}\,d\nu(\xi)$.
+\end{remark}
+
+
+
+\section{Renormalized Peszek--Poyato kernels and inversive conjugacy}
+
+\subsection{Power kernels and their logarithmic limit}
+
+Peszek and Poyato use weakly singular matrix-valued communication kernels arising from potentials of the form
+\[
+    W(x)=\frac{1}{2-\alpha}\frac{1}{1-\alpha}\norm x^{2-\alpha},
+    \qquad \alpha\in(0,1),
+\]
+for Cucker--Smale-type alignment and for the associated fibered Wasserstein gradient-flow representation \cite{PeszekPoyato2022Fibered,PeszekPoyato2022CS}.  For the inversive formalism we will show extending the definition of $W^\alpha$ to $(1,2]$ can be done through a renormalization constant. The constant does not change the $\nabla W$ force or Hessian for fixed $\alpha$, but it produces a finite analytic limit as $\alpha\to2^-$. With $\hat x=x/|x|$ and $x\neq0$, we define the renormalized $W^\alpha$ kernel as:
+\[
+\begin{cases}
+\displaystyle W^\alpha(x):=\frac{\norm x^{2-\alpha}-1}{(2-\alpha)(1-\alpha)},\\[10pt] 
+    \displaystyle\grad W^\alpha(x)=\frac{1}{1-\alpha}\norm x^{1-\alpha}\hat x,\\[10pt] \displaystyle
+    D^2W^\alpha_x
+    =\frac{1}{1-\alpha}\norm x^{-\alpha}\left(I-\alpha\hat x\otimes\hat x\right)
+    .
+ \end{cases}
+\]
+When $\alpha\in(0,1)$, the Hessian is positive definite away from $0$ and the kernel is strictly convex. Extending the formula analytically toward $\alpha=2$ gives
+\[
+    \begin{cases}
+    \displaystyle\lim_{\alpha\to2^-}W^\alpha(x)=-\log\norm x,\\[10pt] \displaystyle
+    \lim_{\alpha\to2^-}\grad W^\alpha(x)=-\frac{x}{\norm x^2}=-x^+,\\[10pt] \displaystyle
+    \lim_{\alpha\to2^-}D^2W^\alpha_x
+    =-\norm x^{-2}\left(I-2\hat x\otimes\hat x\right)
+    =-|x|^{-2}\Hh_x.
+ \end{cases}
+\]
+Thus the logarithmic Householder kernel is the endpoint of the renormalized power family.
+
+\subsection{The logarithmic inversive conjugator}
+
+Observe that
+\[
+    \grad W^{(2)}(|z|^{\alpha}\hat z)=-(|z|^{\alpha}\hat z)^+=-|z|^{-\alpha}\hat z,\qquad \hat z=z/|z|.
+\]
+This anti-symmetric flip of the exponent in the action of $\grad W^{(2)}$ on any input leads to the following role of $\alpha{=}2$ as a conjugator of the Peszek--Poyato $W^\alpha$ interaction forces.
+
+\begin{proposition}[Power-kernel conjugacy]
+For $\alpha\in(0,1)$ and $x\neq0$,
+\[
+    \boxed{
+    \grad W^{(2)}\bigl(\grad W^\alpha(x)\bigr)
+    =(1-\alpha)^2\grad W^{2-\alpha}(x).
+    }
+\]
+Consequently,
+\[
+    \boxed{
+    D^2W^{(2)}_{\grad W^\alpha(x)}\circ D^2W^\alpha_x
+    =(1-\alpha)^2D^2W^{2-\alpha}_x.
+    }
+\]
+\end{proposition}
+
+\begin{proof}
+Let
+\[
+    y=\grad W^\alpha(x)=\frac{1}{1-\alpha}\norm x^{-\alpha}x.
+\]
+Then
+\[
+    \norm y=\frac{1}{1-\alpha}\norm x^{1-\alpha}.
+\]
+Thus
+\[
+    \grad W^{(2)}(y)
+    =-\frac{y}{\norm y^2}
+    =-(1-\alpha)\norm x^{\alpha-2}x.
+\]
+On the other hand,
+\[
+    \grad W^{2-\alpha}(x)
+    =\frac{1}{1-(2-\alpha)}\norm x^{-(2-\alpha)}x
+    =-\frac{1}{1-\alpha}\norm x^{\alpha-2}x.
+\]
+Multiplying by $(1-\alpha)^2$ gives the first identity.  Differentiating gives the Hessian identity.
+\end{proof}
+
+This is an inversive duality, not the ordinary Legendre duality of $W^\alpha$.  Ordinary Legendre conjugacy uses the exponent map $r\mapsto r/(r-1)$, whereas bracket conjugacy sends $\alpha\mapsto2-\alpha$.  The logarithmic kernel $W^{(2)}$ acts as the inversive conjugator.
+
+
+\subsection{Derivative and Householder kernel}
+
+For fixed source $a$, differentiation in the target variable gives
+\[
+    D_b\Sbr{a}{b}[y]
+    =2s\otimes s\,y-\norm s^2 y=-\norm s^2\Hh_s y,
+    \qquad \text{where }s=\Sbr{a}{b}.
+\]
+
+The above equation reveals the $\mathfrak{S}$-bracket differentiates in the $b$ variable like $\nabla W^{(2)}(s)$, making $D^2W^{(2)}$ the right-input backpropagation operator for the bracket:
+\begin{equation}
+    \boxed{
+    D_b\Sbr{a}{b}[y]=D^2W^{(2)}_{\Sbr{a}{b}}[y].
+    }
+    \label{eq:fixed-source-hessian}
+\end{equation}
+
+\subsection{Deformed bracket rays}
+
+
+Let
+\[
+    z:=\Sbr{a}{w}^+=a^+-w,
+    \qquad
+    \Sbr{a}{w}=z^+.
+\]
+Since
+\[
+    \grad W^\alpha(z)=\frac{1}{1-\alpha}\norm z^{-\alpha}z,
+\]
+we have, for any $\alpha\in [0,1)\cup(1,2]$,
+\[
+    \boxed{
+    \Sbr{a}{w}=z^+=(1-\alpha)\norm z^{\alpha-2}\grad W^\alpha(z).
+    }
+\]
+The complementary form is
+\[
+    \grad W^{2-\alpha}(z)=-\frac{1}{1-\alpha}\norm z^{\alpha-2}z,
+\]
+so
+\[
+    \boxed{
+    \Sbr{a}{w}=-(1-\alpha)\norm z^{-\alpha}\grad W^{2-\alpha}(z).
+    }
+\]
+Thus one and the same inversive ray can be represented in two power-kernel gauges.  The $W^\alpha$ and $W^{2-\alpha}$ descriptions are affine gauges of a fixed projective direction.
+
+
+
+\subsection{Peszek--Poyato fiber transforms as flat dual gauges}
+
+At the measure level, Peszek and Poyato introduce transformations between a Cucker--Smale-type velocity alignment system and a Kuramoto-type position system.  Given a spatial law $\rho$, the fiber variables are related by
+\[
+    u[\rho](x,\omega)=\omega-\grad W*\rho(x),
+    \qquad
+    \omega[\rho](x,v)=v+\grad W*\rho(x).
+\]
+Thus
+\[
+    (x,\omega)\longleftrightarrow (x,v)
+\]
+is a fiber gauge transform.  The new variable $\omega$ is conserved along the transformed flow, and the associated space of measures has fixed $\omega$-marginal $\nu$ under the fibered Wasserstein distance $W_{2,\nu}$ \cite{PeszekPoyato2022Fibered}.
+
+The Cucker--Smale Hessian kernel is the derivative of the gauge field:
+\[
+    D_x\bigl(\grad W*\rho(x)\bigr)=D^2W*\rho(x).
+\]
+At the particle level,
+\[
+    \omega_i=v_i+\frac1N\sum_j\grad W(x_i-x_j)
+\]
+and the Cucker--Smale equation with communication matrix $D^2W$ makes $\dot\omega_i=0$.  The inversive reading is therefore:
+\[
+    \boxed{
+    \omega=\text{conserved flat dual fiber coordinate},
+    \qquad
+    D^2W=\text{backpropagation of the force chart}.
+    }
+\]
+The projective bracket calculus suggests a logarithmic deformation of this flat pairing, obtained by replacing the flat bilinear term $\omega\cdot x$ with a Wong-type logarithmic pairing.  This is not asserted here as Peszek--Poyato's theorem; it is the proposed reinterpretation and future extension of their fibered transform.
+
+\section{Dynamic kernel order versus moving curvature gauge}
+
+The spherical bracket flow admits two equivalent descriptions.  One keeps the inversive kernel fixed and lets the ball curvature gauge move.  The other keeps the projective ray fixed but rewrites it through a time-dependent power kernel.
+
+Let
+\[
+    \Om_t:=1-\norm{w_t}^2.
+\]
+Define a dynamic exponent $\alpha_t$ by
+\[
+    \boxed{
+    \Om_t=\frac{2\sqrt{1-\alpha_t}}{2-\alpha_t}.
+    }
+\]
+And
+\[
+    \boxed{
+    \alpha_t=\frac{2\norm{w_t}\sqrt{2-\norm{w_t}^2}}{1+\norm{w_t}\sqrt{2-\norm{w_t}^2}}.
+    }
+\]
+It is useful to introduce the Wong-normalized parameter
+\[
+    \boxed{
+    \eta_t:=\frac{\alpha_t}{2-\alpha_t}.
+    }
+\]
+Then
+\[
+    \eta_t=\norm{w_t}\sqrt{2-\norm{w_t}^2},
+\]
+and therefore
+\[
+    \boxed{
+    \Om_t^2=1-\eta_t^2.
+    }
+\]
+This is the clean bridge to Wong's curvature parameter.  Wong's $L^{(\pm\eta)}$ geometries are dually projectively flat with constant curvature controlled by the logarithmic deformation parameter \cite{Wong2018}.  Here $\eta_t$ measures how far the moving ball section has traveled from the flat center toward the projective boundary.
+
+\subsection{Fixed logarithmic kernel, moving gauge}
+
+The Euler--Sundman flow is
+\[
+    w_\tau=2\int\Sbr{a}{w}\,d\lambda_w(a).
+\]
+Since $\Sbr{a}{w}=(a^+-w)^+$ and $v^+=-\grad W^{(2)}(v)$, this is a fixed inversive logarithmic kernel.  Physical time adds the moving diagonal gauge:
+\[
+    \dot w=\frac14\Om(w)^2\grad S_\nu(w).
+\]
+Thus the physical model is
+\[
+    \boxed{
+    \text{fixed logarithmic inversive chart} + \text{moving diagonal projective gauge }\Om(w)^2.
+    }
+\]
+
+\subsection{Fixed projective ray, moving power-kernel gauge}
+
+For the same ray,
+\[
+    \Sbr{a}{w}=(1-\alpha_t)\norm{a^+-w}^{\alpha_t-2}\grad W^{\alpha_t}(a^+-w),
+\]
+so the Euler--Sundman equation can be written as
+\[
+    \boxed{
+    w_\tau=2(1-\alpha_t)\int
+    \norm{a^+-w}^{\alpha_t-2}\grad W^{\alpha_t}(a^+-w)\,d\lambda_w(a).
+    }
+\]
+Equivalently,
+\[
+    \boxed{
+    w_\tau=-2(1-\alpha_t)\int
+    \norm{a^+-w}^{-\alpha_t}\grad W^{2-\alpha_t}(a^+-w)\,d\lambda_w(a).
+    }
+\]
+The same geometric vector field is therefore expressible in three gauges:
+\[
+    \boxed{
+    \text{inversive }W^{(2)}\text{ gauge}
+    \quad\Longleftrightarrow\quad
+    W^{\alpha_t}\text{ gauge}
+    \quad\Longleftrightarrow\quad
+    W^{2-\alpha_t}\text{ gauge}.
+    }
+\]
+This is the power-kernel analogue of Wong's $L^{(+\eta)}$/$L^{(-\eta)}$ pairing.  It is not the same construction, but it has the same role: two dual affine descriptions of one projective logarithmic geometry.
+
+\subsection{Hessian identities along the bracket flow}
+
+For fixed source $a$,
+\[
+    D_w\Sbr{a}{w}[y]=D^2W^{(2)}_{a^+-w}[y].
+\]
+For the self-source term, both entries move.  The moving input can be written with the existing diagonal bracket:
+\[
+    w^+-w=\UU(w)^+,
+    \qquad
+    D_w(w^+-w)[y]=-\left(D^2W^{(2)}_w+I\right)y,
+\]
+and therefore
+\[
+    \boxed{
+    D_w\Sbr{w}{w}[y]
+    =
+    D^2W^{(2)}_{\UU(w)^+}\left(D^2W^{(2)}_w+I\right)y.
+    }
+\]
+Consequently,
+\[
+    \boxed{
+    \nabla^2S_\nu(w)[y]
+    =-2\int_{\Sph^{d-1}}D^2W^{(2)}_{\xi-w}[y]d\nu(\xi)
+    +2D^2W^{(2)}_{\UU(w)^+}\left(D^2W^{(2)}_w+I\right)y.
+    }
+\]
+The first term is the fixed-source cost Hessian.  The second is the diagonal pullback of the same projective Hessian through the moving self-source map $w\mapsto w^+$.  This distinction is the geometric reason the self-term is not merely another cloud atom.
+
+\section{Inversive logarithmic duality and Monge map regularity}
+
+We now analyze the canonical cost
+\[
+    \cs(a,b)=-\frac12\log\kap{a}{b},
+    \qquad
+    \kap{a}{b}=1-2\ip a b+\norm a^2\norm b^2,
+\]
+on the projective domain
+\[
+    \Gamma:=\{(a,b)\in\R^d\times\R^d:\kap{a}{b}>0\}.
+\]
+On compact subsets separated from $\partial\Gamma$, the cost is smooth.  The explicit bracket identities give Villani's twist and non-degeneracy conditions directly, and the diagonal mixed Hessian recovers the hyperbolic metric of the ball.
+
+\subsection{The global twist condition (A1)}
+
+Villani's twist condition requires that, for fixed source point $a$, the map
+\[
+    b\longmapsto \grad_a\cs(a,b)
+\]
+is globally injective on the target domain.
+
+\begin{theorem}[Global twist validity]
+For any fixed $a$, the target mapping is globally injective on $\Gamma$.  Given
+\[
+    \grad_a\cs(a,b)=\Sbr{b}{a},
+\]
+the target point is reconstructed globally by the smooth bracket formula
+\[
+    \boxed{
+    b=\Sbr{\grad_a\cs(a,b)}{-a}.
+    }
+\]
+In particular, if $\grad_a\cs(a,b)=0$, then the smooth bracket extension gives $b=\Sbr{0}{-a}=0$.
+\end{theorem}
+
+\begin{proof}
+It suffices to prove the algebraic identity
+\[
+    \Sbr{\Sbr{b}{a}}{-a}=b
+\]
+with the smooth rational bracket.  Write
+\[
+    r=\Sbr{b}{a}=\frac{b-\norm b^2a}{\kap{b}{a}}.
+\]
+Then
+\[
+    \norm r^2=\frac{\norm b^2}{\kap{b}{a}},
+    \qquad
+    r+\norm r^2a=\frac{b}{\kap{b}{a}},
+    \qquad
+    \kap{r}{-a}=\frac{1}{\kap{b}{a}}.
+\]
+Therefore
+\[
+    \Sbr{r}{-a}
+    =
+    \frac{r+\norm r^2a}{\kap{r}{-a}}
+    =
+    b.
+\]
+Substituting $r=\grad_a\cs(a,b)$ gives the displayed reconstruction formula.  Hence two targets with the same source-gradient have the same value $\Sbr{\grad_a\cs(a,b)}{-a}$, so the map $b\mapsto\grad_a\cs(a,b)$ is injective.  The zero-gradient case is included because the identity uses the smooth extension; explicitly, $\Sbr{0}{-a}=0$.
+\end{proof}
+
+\subsection{Non-degeneracy and origin smoothness (A2)}
+
+The non-degeneracy condition requires that the mixed cross-Hessian $D^2_{a,b}\cs(a,b)$ be invertible.  The inversive form shows that the origin is not a singularity; it is the point where the geometry recovers the Euclidean identity matrix.
+
+\begin{theorem}[Mixed Hessian and origin regularity]
+The mixed cross-Hessian of the canonical cost is
+\[
+    \boxed{
+    D^2_{a,b}\cs(a,b)
+    =
+    \frac{1}{\kap{a}{b}}
+    \left[
+        \left(I-2b\otimes a\right)
+        -2\Sbr{a}{b}\otimes\left(\norm b^2a-b\right)
+    \right].
+    }
+\]
+At the coordinate origin $a=0$ this tensor simplifies exactly to
+\[
+    \boxed{
+    D^2_{a,b}\cs(0,b)=I.
+    }
+\]
+Consequently $\det(D^2_{a,b}\cs(0,b))=1\neq0$.  For $a\neq0$, the same tensor is invertible throughout $\Gamma$ because it is the differential of a composition of inversions and translations.
+\end{theorem}
+
+\begin{proof}
+Since $\grad_b\cs(a,b)=\Sbr{a}{b}$, it is enough to differentiate
+\[
+    \Sbr{a}{b}=\frac{a-\norm a^2b}{\kap{a}{b}},
+\]
+with respect to $a$.  The differentials are
+\[
+    D_a(a-\norm a^2b)=I-2b\otimes a,
+    \qquad
+    \grad_a\kap{a}{b}=-2b+2\norm b^2a=2(\norm b^2a-b).
+\]
+The quotient rule gives
+\[
+    D^2_{a,b}\cs(a,b)
+    =
+    \frac{I-2b\otimes a}{\kap{a}{b}}
+    -
+    \frac{a-\norm a^2b}{\kap{a}{b}^2}
+    \otimes 2(\norm b^2a-b),
+\]
+which is the displayed formula after substituting $\Sbr{a}{b}$ for $(a-\norm a^2b)/\kap{a}{b}$.
+
+At $a=0$, we have $\kap{0}{b}=1$ and $\Sbr{0}{b}=0$, so the formula collapses to $I$.  For $a\neq0$,
+\[
+    \Sbr{a}{b}=(a^+-b)^+
+\]
+and the identity $D(v^+)=-D^2W^{(2)}_v$ gives
+\[
+    D_a\Sbr{a}{b}
+    =
+    \left(-D^2W^{(2)}_{a^+-b}\right)
+    \circ
+    \left(-D^2W^{(2)}_a\right)
+    =
+    D^2W^{(2)}_{a^+-b}D^2W^{(2)}_a.
+\]
+Both logarithmic Hessian operators are non-degenerate whenever $a\neq0$ and $a^+-b\neq0$; the latter condition is exactly $\kap{a}{b}>0$.  Hence the mixed Hessian is non-degenerate on $\Gamma$, with the origin supplied by the smooth rational extension.
+\end{proof}
+
+\subsection{The inversive Brenier theorem}
+
+We use the upper Kantorovich convention for the Monge theorem: the dual potentials maximize
+\[
+    \int\phi(a)\,d\mu(a)+\int\psi(b)\,d\nu(b)
+    \qquad\text{subject to}\qquad
+    \phi(a)+\psi(b)\le \cs(a,b).
+\]
+With this convention the target potential is the infimum $c$-transform
+\[
+    \psi(b)=\phi^\cs(b)
+    :=
+    \inf_a\left[\cs(a,b)-\phi(a)\right]
+    =
+    \inf_a\left[-\frac12\log\kap{a}{b}-\phi(a)\right].
+\]
+At an equality point, differentiating
+\[
+    \phi(a)+\psi(b)=\cs(a,b)
+\]
+with respect to $a$ gives the sign convention used below:
+\[
+    \grad\phi(a)=\grad_a\cs(a,b).
+\]
+
+Equivalently, the opposite ``lower'' convention often used for logarithmic divergences uses the supremum expression
+\[
+    \sup_a\left[-\cs(a,b)-\varphi(a)\right]
+    =
+    \sup_a\left[
+        \frac12\log\left(1-2\ip a b+\norm a^2\norm b^2\right)-\varphi(a)
+    \right].
+\]
+That convention changes the sign of the stationarity equation.  All Brenier formulas in this paper use the upper convention above, so the source-side stationarity is
+\[
+    \grad\phi(a)=\grad_a\cs(a,b)=\Sbr{b}{a}.
+\]
+
+Let $\phi$ be a $c$-convex Kantorovich potential for the cost $\cs$.  At points of differentiability, the optimal map is characterized by
+\[
+    \grad\phi(a)=\grad_a\cs(a,b)=\Sbr{b}{a}.
+\]
+The smooth bracket reconstruction solves this stationarity equation globally.
+
+\begin{theorem}[The inversive Monge map]
+Let $\mu$ and $\nu$ be probability measures on $\R^d$, with $\mu$ absolutely continuous with respect to Lebesgue measure, and let $\phi$ be an optimal $c$-convex potential for the cost $\cs$.  Under the standard existence hypotheses for the Monge problem, the unique optimal map $T(a)=b$ is given at differentiability points of $\phi$ by
+\[
+    \boxed{
+    T(a)=\Sbr{\grad\phi(a)}{-a}.
+    }
+\]
+When $\grad\phi(a)=0$, the smooth bracket extension gives $T(a)=\Sbr{0}{-a}=0$.
+\end{theorem}
+
+\begin{proof}
+The first-order optimality condition is
+\[
+    \grad\phi(a)=\grad_a\cs(a,b)=\Sbr{b}{a}.
+\]
+Applying the global twist reconstruction to this equation yields
+\[
+    b=\Sbr{\grad_a\cs(a,b)}{-a}=\Sbr{\grad\phi(a)}{-a}.
+\]
+\end{proof}
+
+\subsection{Jacobian and inversive Monge--Amp\`ere equation}
+
+The explicit Monge map also gives a clean factorized Jacobian.  Let
+\[
+    v:=(\grad\phi(a))^+,
+    \qquad
+    b^+=a+v
+\]
+be the inverted target coordinate, so that
+\[
+    T(a)=(b^+)^+=b.
+\]
+At points where $\grad\phi(a)\neq0$ and $b^+\neq0$, the identity $D(r^+)=-D^2W^{(2)}_r$ gives
+\[
+    D_a(b^+)
+    =
+    I+D_av
+    =
+    I-D^2W^{(2)}_{v^+}\nabla^2\phi(a),
+\]
+where $v^+=\grad\phi(a)$.
+Applying the final inversion $T(a)=(b^+)^+$ yields the transport Jacobian
+\[
+    \boxed{
+    DT(a)
+    =
+    -D^2W^{(2)}_{b^+}
+    \left[
+        I-D^2W^{(2)}_{v^+}\nabla^2\phi(a)
+    \right].
+    }
+\]
+Since $\det(-D^2W^{(2)}_r)=-\norm r^{-2d}$, taking the absolute determinant gives
+\[
+    |\det DT(a)|
+    =
+    \norm{b^+}^{-2d}
+    \left|
+    \det\left[
+        I-D^2W^{(2)}_{v^+}\nabla^2\phi(a)
+    \right]
+    \right|.
+\]
+If $\mu=f(a)\,da$ and $\nu=g(b)\,db$, the pushforward relation $T_\push\mu=\nu$ is therefore the inversive Monge--Amp\`ere equation
+\[
+    \boxed{
+    f(a)
+    =
+    g(T(a))\,
+    \norm{b^+}^{-2d}
+    \left|
+    \det\left[
+        I-D^2W^{(2)}_{v^+}\nabla^2\phi(a)
+    \right]
+    \right|.
+    }
+\]
+This is the computational advantage of the inversive cost: the implicit inverse of $\grad_a\cs$ has already been solved algebraically by the chart geometry, leaving a closed second-order equation where the nonlinear inversive metric acts as a linear multiplier on the Euclidean Hessian.
+
+\subsection{Information geometry and K\"ahler connections}
+
+The canonical cost keeps the connection to Wong's logarithmic geometry but removes the asymmetric ad hoc pairing.  Wong's logarithmic transport costs
+\[
+    c^{(\eta)}(x,y)=\frac1\eta\log(1+\eta x\cdot y)
+\]
+generate dually projectively flat statistical geometries with curvature controlled by the logarithmic deformation parameter \cite{Wong2018}.  In the present setting the lifted identity
+\[
+    \kap{a}{b}=1+\Xlift(a)\cdot\Ylift(b)
+\]
+shows that the same projective denominator is present, while the canonical transport cost is its symmetric normalization $-\frac12\log\kap{a}{b}$.
+
+Khan and Zhang's K\"ahler formulation of logarithmic optimal transport identifies the mixed cost Hessian as the metric tensor whose Ma--Trudinger--Wang curvature is read as orthogonal anti-bisectional curvature \cite{KhanZhang2020}.  In the inversive bracket chart this metric is explicit.  Evaluating the mixed cross-Hessian along the diagonal $a=b=w$, where
+\[
+    \kap{w}{w}=(1-\norm w^2)^2=\Om(w)^2,
+    \qquad
+    \Sbr{w}{w}=\frac{w}{\Om(w)}=\UU(w),
+\]
+we obtain
+\[
+    D^2_{a,b}\cs(w,w)
+    =
+    \frac{1}{\Om(w)^2}
+    \left[
+        \left(I-2w\otimes w\right)
+        -2\frac{w}{\Om(w)}\otimes\left(\norm w^2w-w\right)
+    \right].
+\]
+Since
+\[
+    \norm w^2w-w=-\Om(w)w,
+\]
+the tensor simplifies to
+\[
+    \boxed{
+    D^2_{a,b}\cs(w,w)=\frac{I}{\Om(w)^2}.
+    }
+\]
+Thus, along the diagonal, the inversive optimal-transport metric is precisely the Poincar\'e-hyperbolic metric of the ball in this normalization.  The straight-line formula
+\[
+    x^+(t)=(1-t)a^+ + tb^+
+\]
+is the corresponding affine description in inverted coordinates, while the physical ball chart carries the hyperbolic conformal factor.
+
+\section{Conclusion}
+
+The inversive framework is organized by the two-slot bracket
+\[
+    \Sbr{a}{b}=(a^+-b)^+,
+\]
+whose rational extension removes the apparent source-origin singularity and whose gradient identities make it the natural chart for the canonical cost $\cs(a,b)=-\frac12\log\kap{a}{b}$.  The main payoff is that the same bracket language covers the Busemann score, the LMS Möbius reduction, the Peszek--Poyato logarithmic Hessian limit, and the explicit inversive Brenier map without changing coordinates at each step.
+
+The diagonal identity
+\[
+    D^2_{a,b}\cs(w,w)=\frac{I}{(1-\norm w^2)^2}
+\]
+shows that the canonical cost recovers the intrinsic hyperbolic geometry of the ball while retaining the projective denominator that links the construction to Wong's and Khan--Zhang's logarithmic transport geometries.
+
+The next step is to reinterpret the Peszek--Poyato fiber transform itself in this projective gauge.  Their conserved variable $\omega=v+\grad W*\rho$ is already a dual fiber coordinate in a flat pairing.  The present framework suggests replacing that flat pairing by a logarithmic projective pairing and replacing the ordinary force chart by the bracket cost-gradient chart.  In that direction, the bracket calculus may provide a common language for logarithmic optimal transport, free-energy/Renyi divergence geometry, and low-dimensional collective dynamics on conformal/projective state spaces.
+
+\begin{thebibliography}{99}
+
+\bibitem{Wong2018}
+T.-K. L. Wong.
+\newblock Logarithmic divergences from optimal transport and R\'enyi geometry.
+\newblock \emph{Information Geometry}, 1:39--78, 2018.
+\newblock arXiv:1712.03610.
+
+\bibitem{KhanZhang2020}
+G. Khan and J. Zhang.
+\newblock The K\"ahler geometry of certain optimal transport problems.
+\newblock \emph{Pure and Applied Analysis}, 2(2):397--426, 2020.
+\newblock arXiv:1812.00032.
+
+\bibitem{PeszekPoyato2022Fibered}
+J. Peszek and D. Poyato.
+\newblock Heterogeneous gradient flows in the topology of fibered optimal transport.
+\newblock arXiv:2203.08104, 2022.
+
+\bibitem{PeszekPoyato2022CS}
+J. Peszek and D. Poyato.
+\newblock A Cucker--Smale model with weakly singular communication and its fibered gradient-flow structure.
+\newblock arXiv:2207.14764, 2022.
+
+\bibitem{LMS2021}
+M. Lipton, R. E. Mirollo, and S. H. Strogatz.
+\newblock The Kuramoto model on a sphere: explaining its low-dimensional dynamics with group theory and hyperbolic geometry.
+\newblock \emph{Chaos}, 31:093113, 2021.
+\newblock arXiv:1907.07150.
+
+\bibitem{LoeperReflector}
+G. Loeper.
+\newblock Regularity of optimal maps on the sphere: the quadratic cost and the reflector antenna.
+\newblock arXiv:1301.6229.
+
+\end{thebibliography}
+
+\end{document}

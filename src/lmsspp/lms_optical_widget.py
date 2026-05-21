@@ -603,18 +603,21 @@ def _canonical_initialization_np(
     """Build x, w_*, and xi by the exact finite-N canonical-gauge pipeline.
 
     The preset selects the intrinsic shape of the canonical reference cloud ξ on
-    S^{d-1}.  A short Euclidean centering pass improves templates whose ambient
-    mean is not exactly zero; if needed, a single Busemann solve then lifts the
-    template to exact canonical gauge before forming xⁱ=M_{w_target}(ξⁱ).  The
-    final inverse solve on x recovers w_*=w_target up to numerical error.
+    S^{d-1}.  Its template axis is the physical observed-cloud axis, which is
+    opposite ``w_target`` for this LMS Möbius convention.  A short Euclidean
+    centering pass improves templates whose ambient mean is not exactly zero; if
+    needed, a single Busemann solve then lifts the template to exact canonical
+    gauge before forming xⁱ=M_{w_target}(ξⁱ).  The final inverse solve on x
+    recovers w_*=w_target up to numerical error.
     """
     d = max(2, int(dimension))
     r = float(np.clip(float(target_radius), 0.0, 0.9995))
     target_dir = _unit_direction_np(direction, d)
     target_w_np = r * target_dir
+    reference_dir = -target_dir
     n_eff = max(2, int(n))
     weights = np.full((n_eff,), 1.0 / float(n_eff), dtype=np.float64)
-    xi = _reference_cloud_from_preset_np(n_eff, d, rng, preset=preset, direction=target_dir)
+    xi = _reference_cloud_from_preset_np(n_eff, d, rng, preset=preset, direction=reference_dir)
     xi = _euclidean_center_unit_sphere_np(xi, weights)
     P_ref, a_t, pre_lift = _template_to_canonical_reference_np(xi, weights)
     target_w = torch.as_tensor(target_w_np, dtype=P_ref.dtype, device=P_ref.device)
