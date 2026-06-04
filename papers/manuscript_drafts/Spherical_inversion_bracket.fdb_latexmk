@@ -1,6 +1,6 @@
 # Fdb version 4
-["pdflatex"] 1779374630.84842 "/Users/adamsobieszek/pitch/pitch-website/public/notebooks/kuramoto/LMSSPP/papers/manuscript_drafts/Spherical_inversion_bracket.tex" "Spherical_inversion_bracket.pdf" "Spherical_inversion_bracket" 1779374631.40487 0
-  "/Users/adamsobieszek/pitch/pitch-website/public/notebooks/kuramoto/LMSSPP/papers/manuscript_drafts/Spherical_inversion_bracket.tex" 1779374630.56165 43107 2aa0c4fedd014fc0abdb58e1bf100e9d ""
+["pdflatex"] 1779464929.25413 "/Users/adamsobieszek/pitch/pitch-website/public/notebooks/kuramoto/LMSSPP/papers/manuscript_drafts/Spherical_inversion_bracket.tex" "Spherical_inversion_bracket.pdf" "Spherical_inversion_bracket" 1779464929.7385 0
+  "/Users/adamsobieszek/pitch/pitch-website/public/notebooks/kuramoto/LMSSPP/papers/manuscript_drafts/Spherical_inversion_bracket.tex" 1779464928.49787 43176 d4cee1d5ff3852330e34dc296abf9086 ""
   "/opt/homebrew/Cellar/texlive/20260301/share/texmf-dist/fonts/map/fontname/texfonts.map" 1772380719 3524 cb3e574dea2d1052e39280babc910dc8 ""
   "/opt/homebrew/Cellar/texlive/20260301/share/texmf-dist/fonts/map/pdftex/updmap/pdftex.map" 1772380719 5541360 f183aac233c4cd1e5ef882fcbe8e7096 ""
   "/opt/homebrew/Cellar/texlive/20260301/share/texmf-dist/fonts/tfm/public/amsfonts/cmextra/cmbsy5.tfm" 1772380719 1120 1e8878807317373affa7f7bba4cf2f6a ""
@@ -133,10 +133,10 @@
   "/opt/homebrew/Cellar/texlive/20260301/share/texmf-dist/tex/latex/xcolor/xcolor.sty" 1772380719 55384 b454dec21c2d9f45ec0b793f0995b992 ""
   "/opt/homebrew/Cellar/texlive/20260301/share/texmf-dist/web2c/texmf.cnf" 1772380719 43633 14bbc273cebd985e64ab1a698333eaf9 ""
   "/opt/homebrew/Cellar/texlive/20260301/share/texmf-var/web2c/pdftex/pdflatex.fmt" 1772380719 3636956 5168b884cb430e6a6336cfea08fa659a ""
-  "Spherical_inversion_bracket.aux" 1779374631.34828 4692 698fc5dc8356b886d479c52a0b0e857c "pdflatex"
-  "Spherical_inversion_bracket.out" 1779374631.34886 7117 2a7762d568d26279c07f34c58820cd83 "pdflatex"
-  "Spherical_inversion_bracket.tex" 1779374630.56165 43107 2aa0c4fedd014fc0abdb58e1bf100e9d ""
-  "Spherical_inversion_bracket.toc" 1779374631.34907 2788 07e9cc57545c72ca8ebbd8227c4627f6 "pdflatex"
+  "Spherical_inversion_bracket.aux" 1779464929.69132 4692 e03d0e8dc53376a9bcb69986f3dfe731 "pdflatex"
+  "Spherical_inversion_bracket.out" 1779464929.69191 7117 a9bf00c818da9eebf0a9e4ce0a1cad5c "pdflatex"
+  "Spherical_inversion_bracket.tex" 1779464928.49787 43176 d4cee1d5ff3852330e34dc296abf9086 ""
+  "Spherical_inversion_bracket.toc" 1779464929.69207 2788 27fee85c13551bdc5ea5bb6b68edadfc "pdflatex"
   (generated)
   "Spherical_inversion_bracket.aux"
   "Spherical_inversion_bracket.log"
