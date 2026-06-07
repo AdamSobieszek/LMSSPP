@@ -6,10 +6,9 @@ This module evolves particles with fixed conserved labels ``omega_i`` by
     x_i' = omega_i - A_rho(x_i),
 
 where ``A_rho`` is approximated on a regular grid by CIC deposition and FFT
-convolution.  The hot field-evaluation loop can run on NumPy or torch
-CPU/CUDA/MPS backends, while public results remain NumPy arrays.  The original
-one-off script is kept as the default example, but all pieces are now callable
-for arbitrary fiber layouts, shape families, and prebuilt initial conditions.
+convolution.  The original one-off script is kept as the default example, but
+all pieces are now callable for arbitrary fiber layouts, shape families, and
+prebuilt initial conditions.
 
 Typical use:
 
@@ -32,14 +31,12 @@ Run the default dashboard example with:
 from __future__ import annotations
 
 import argparse
-import colorsys
 import json
 import time
-import warnings
 import webbrowser
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import plotly.graph_objects as go
@@ -50,19 +47,8 @@ try:  # Optional: only needed for the interactive notebook widget.
 except Exception:  # pragma: no cover - notebook dependency is optional
     widgets = None  # type: ignore[assignment]
 
-try:  # Optional accelerator backend; NumPy remains the required baseline.
-    import torch
-except Exception:  # pragma: no cover - torch is an optional extra
-    torch = None  # type: ignore[assignment]
-
 Array = np.ndarray
 ShapeSampler = Callable[[int, np.random.Generator], Array]
-BackendChoice = Literal["auto", "numpy", "torch"]
-DTypeChoice = Literal["auto", "float32", "float64"]
-IntegratorChoice = Literal["fixed_rk2", "adaptive_rk2"]
-TimeDirectionChoice = Literal["forward", "backward"]
-InitializationAlgorithmChoice = Literal["raw", "legacy_fast_phase"]
-ColorSchemeChoice = Literal["palette", "phase_color"]
 
 DEFAULT_SHAPES = (
     "gaussian",
@@ -90,20 +76,6 @@ DEFAULT_PALETTE = (
     "#17becf",
 )
 
-PP_INITIALIZATION_PRESETS: dict[str, tuple[str, ...]] = {
-    "mixed": DEFAULT_SHAPES,
-    "gaussian": ("gaussian",),
-    "ring": ("ring",),
-    "line": ("line",),
-    "spiral": ("spiral",),
-    "square": ("square",),
-}
-
-PP_INITIALIZER_OPTIONS: tuple[tuple[str, InitializationAlgorithmChoice], ...] = (
-    ("Raw sample", "raw"),
-    ("Legacy fast phase", "legacy_fast_phase"),
-)
-
 DASHBOARD_FILENAME = "largeN_fft_hessian_dashboard.html"
 ANIMATION_FILENAME = "largeN_fft_dynamics_animation.html"
 
@@ -120,21 +92,6 @@ class FiberSpec:
 
 
 @dataclass(frozen=True)
-class InitializerConfig:
-    """Parameters for discarded-history PP warmup initializers."""
-
-    alpha: float = 0.99
-    K: float = 1.0
-    grid_size: int | None = None
-    domain_radius: float | None = None
-    dt: float = 0.055
-    max_steps: int = 40
-    min_steps: int = 6
-    window: int = 3
-    displacement_tol: float = 1.5e-2
-
-
-@dataclass(frozen=True)
 class SimulationConfig:
     """Parameters for a 2D Peszek--Poyato FFT particle simulation."""
 
@@ -146,13 +103,6 @@ class SimulationConfig:
     shape_names: Sequence[str] = DEFAULT_SHAPES
     omega_atoms: Array | None = None
     seed: int = 2026
-    color_scheme: ColorSchemeChoice = "palette"
-    initialization_algorithm: InitializationAlgorithmChoice = "raw"
-    initializer_config: InitializerConfig | None = None
-    initialization_fast_steps: int = 40
-    initialization_fast_min_steps: int = 6
-    initialization_fast_window: int = 3
-    initialization_fast_displacement_tol: float = 1.5e-2
 
     grid_size: int = 256
     domain_radius: float = 4.0
@@ -161,15 +111,6 @@ class SimulationConfig:
     tol_rms: float = 1.2e-2
     min_steps: int = 30
     record_every: int = 5
-    backend: BackendChoice = "auto"
-    device: str | None = None
-    dtype: DTypeChoice = "auto"
-    integrator: IntegratorChoice = "adaptive_rk2"
-    time_direction: TimeDirectionChoice = "forward"
-    adaptive_tol: float = 5.0e-3
-    dt_min: float = 1.0e-4
-    dt_max: float = 0.09
-    max_displacement_per_step: float = 0.75
 
     farfield_shells: int = 18
     angles_per_shell: int = 64
@@ -219,20 +160,6 @@ class SimulationResult:
     runtime_seconds: float
     rms_residual: float
     max_residual: float
-    backend: str
-    device: str
-    dtype: str
-    field_evaluations: int
-    accepted_steps: int
-    rejected_steps: int
-    dt_min_observed: float
-    dt_max_observed: float
-    dt_mean: float
-    clip_events: int
-    initialization_algorithm: str
-    initialization_steps: int
-    initialization_time: float
-    initialization_stop_metric: float
 
 
 @dataclass(frozen=True)
@@ -273,9 +200,6 @@ class FFTPeszekPoyato2D:
         self.L = float(domain_radius)
         self.h = 2 * self.L / self.G
         self.P = 2 * self.G
-        self.backend_name = "numpy"
-        self.device_name = "cpu"
-        self.dtype_name = "float64"
 
         kernels = self._build_kernels()
         self.fft_Kx = np.fft.rfft2(kernels[0])
@@ -288,57 +212,24 @@ class FFTPeszekPoyato2D:
         margin = 2.1 * self.h
         return np.clip(x, -self.L + margin, self.L - margin)
 
-    def clip_inside_with_count(self, x: Array) -> tuple[Array, int]:
-        margin = 2.1 * self.h
-        lo = -self.L + margin
-        hi = self.L - margin
-        clipped = np.any((x < lo) | (x > hi), axis=1)
-        return np.clip(x, lo, hi), int(np.count_nonzero(clipped))
-
-    def asarray(self, x: Array) -> Array:
-        return np.asarray(x, dtype=np.float64)
-
-    def copy_state(self, x: Array) -> Array:
-        return np.array(x, dtype=np.float64, copy=True)
-
-    def to_numpy(self, x: Any) -> Array:
-        return np.asarray(x, dtype=np.float64)
-
-    def center(self, x: Array) -> Array:
-        return x - x.mean(axis=0, keepdims=True)
-
-    def speed_stats(self, v: Array) -> tuple[float, float]:
-        speed2 = np.sum(v * v, axis=1)
-        return float(np.sqrt(np.mean(speed2))), float(np.sqrt(np.max(speed2)))
-
-    def rms_delta(self, a: Array, b: Array) -> float:
-        delta = a - b
-        return float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
-
-    def synchronize(self) -> None:
-        return None
-
     def convolve(self, rho_grid: Array, fft_kernel: Array) -> Array:
         padded = np.zeros((self.P, self.P), dtype=np.float64)
         padded[: self.G, : self.G] = rho_grid
         conv = np.fft.irfft2(np.fft.rfft2(padded) * fft_kernel, s=(self.P, self.P))
         return conv[: self.G, : self.G]
 
-    def convolve_fields(self, rho_grid: Array, fft_kernels: Sequence[Array]) -> tuple[Array, ...]:
-        padded = np.zeros((self.P, self.P), dtype=np.float64)
-        padded[: self.G, : self.G] = rho_grid
-        rho_hat = np.fft.rfft2(padded)
-        return tuple(np.fft.irfft2(rho_hat * fft_kernel, s=(self.P, self.P))[: self.G, : self.G] for fft_kernel in fft_kernels)
-
     def A_grid_from_particles(self, x: Array) -> tuple[Array, Array, Array]:
         rho_grid = deposit_mass(x, self.G, self.L)
-        Ax_grid, Ay_grid = self.convolve_fields(rho_grid, (self.fft_Kx, self.fft_Ky))
+        Ax_grid = self.convolve(rho_grid, self.fft_Kx)
+        Ay_grid = self.convolve(rho_grid, self.fft_Ky)
         return rho_grid, Ax_grid, Ay_grid
 
     def A_at_particles(self, x: Array) -> tuple[Array, Array]:
         rho_grid, Ax_grid, Ay_grid = self.A_grid_from_particles(x)
-        weights = cic_indices_weights(x, self.G, self.L)
-        A = np.c_[interp_grid_with_weights(Ax_grid, weights), interp_grid_with_weights(Ay_grid, weights)]
+        A = np.c_[
+            interp_grid(Ax_grid, x, self.G, self.L),
+            interp_grid(Ay_grid, x, self.G, self.L),
+        ]
         return A, rho_grid
 
     def velocity(self, x: Array, omega: Array) -> tuple[Array, Array]:
@@ -346,7 +237,11 @@ class FFTPeszekPoyato2D:
         return omega - A, A
 
     def hessian_grid_from_rho(self, rho_grid: Array) -> tuple[Array, Array, Array]:
-        return self.convolve_fields(rho_grid, (self.fft_Hxx, self.fft_Hxy, self.fft_Hyy))  # type: ignore[return-value]
+        return (
+            self.convolve(rho_grid, self.fft_Hxx),
+            self.convolve(rho_grid, self.fft_Hxy),
+            self.convolve(rho_grid, self.fft_Hyy),
+        )
 
     def _build_kernels(self) -> tuple[Array, Array, Array, Array, Array]:
         coords = make_lag_coords(self.P, self.h)
@@ -371,179 +266,6 @@ class FFTPeszekPoyato2D:
         Hxx = np.zeros((self.P, self.P), dtype=np.float64)
         Hxy = np.zeros((self.P, self.P), dtype=np.float64)
         Hyy = np.zeros((self.P, self.P), dtype=np.float64)
-        Hxx[mask] = scale_hess[mask] * (1 - self.alpha * ex[mask] * ex[mask])
-        Hxy[mask] = scale_hess[mask] * (-self.alpha * ex[mask] * ey[mask])
-        Hyy[mask] = scale_hess[mask] * (1 - self.alpha * ey[mask] * ey[mask])
-        return Kx, Ky, Hxx, Hxy, Hyy
-
-
-class TorchPeszekPoyato2D:
-    """Torch-backed PP field evaluator for CPU, CUDA, and MPS devices."""
-
-    def __init__(
-        self,
-        alpha: float,
-        K: float,
-        grid_size: int,
-        domain_radius: float,
-        *,
-        device: Any,
-        dtype: Any,
-    ):
-        if torch is None:  # pragma: no cover - guarded by backend selection
-            raise RuntimeError("torch is not available")
-        if alpha >= 1:
-            raise ValueError("alpha must be < 1 for the current PP kernel normalization")
-        if grid_size < 4:
-            raise ValueError("grid_size must be at least 4")
-        if domain_radius <= 0:
-            raise ValueError("domain_radius must be positive")
-
-        self.alpha = float(alpha)
-        self.K = float(K)
-        self.G = int(grid_size)
-        self.L = float(domain_radius)
-        self.h = 2 * self.L / self.G
-        self.P = 2 * self.G
-        self.device = torch.device(device)
-        self.dtype = dtype
-        self.backend_name = "torch"
-        self.device_name = str(self.device)
-        self.dtype_name = _torch_dtype_name(dtype)
-
-        kernels = self._build_kernels()
-        self.fft_Kx = torch.fft.rfft2(kernels[0])
-        self.fft_Ky = torch.fft.rfft2(kernels[1])
-        self.fft_Hxx = torch.fft.rfft2(kernels[2])
-        self.fft_Hxy = torch.fft.rfft2(kernels[3])
-        self.fft_Hyy = torch.fft.rfft2(kernels[4])
-
-    def asarray(self, x: Array) -> Any:
-        return torch.as_tensor(x, dtype=self.dtype, device=self.device)
-
-    def copy_state(self, x: Any) -> Any:
-        return x.clone()
-
-    def to_numpy(self, x: Any) -> Array:
-        self.synchronize()
-        return x.detach().cpu().numpy().astype(np.float64, copy=False)
-
-    def clip_inside(self, x: Any) -> Any:
-        margin = 2.1 * self.h
-        return torch.clamp(x, -self.L + margin, self.L - margin)
-
-    def clip_inside_with_count(self, x: Any) -> tuple[Any, int]:
-        margin = 2.1 * self.h
-        lo = -self.L + margin
-        hi = self.L - margin
-        clipped = torch.any((x < lo) | (x > hi), dim=1)
-        return torch.clamp(x, lo, hi), int(torch.count_nonzero(clipped).detach().cpu().item())
-
-    def center(self, x: Any) -> Any:
-        return x - x.mean(dim=0, keepdim=True)
-
-    def speed_stats(self, v: Any) -> tuple[float, float]:
-        speed2 = torch.sum(v * v, dim=1)
-        rms = torch.sqrt(torch.mean(speed2))
-        maxv = torch.sqrt(torch.max(speed2))
-        return float(rms.detach().cpu().item()), float(maxv.detach().cpu().item())
-
-    def rms_delta(self, a: Any, b: Any) -> float:
-        delta = a - b
-        rms = torch.sqrt(torch.mean(torch.sum(delta * delta, dim=1)))
-        return float(rms.detach().cpu().item())
-
-    def synchronize(self) -> None:
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-        elif self.device.type == "mps":
-            torch.mps.synchronize()
-
-    def convolve(self, rho_grid: Any, fft_kernel: Any) -> Any:
-        padded = torch.zeros((self.P, self.P), dtype=self.dtype, device=self.device)
-        padded[: self.G, : self.G] = rho_grid
-        conv = torch.fft.irfft2(torch.fft.rfft2(padded) * fft_kernel, s=(self.P, self.P))
-        return conv[: self.G, : self.G]
-
-    def convolve_fields(self, rho_grid: Any, fft_kernels: Sequence[Any]) -> tuple[Any, ...]:
-        padded = torch.zeros((self.P, self.P), dtype=self.dtype, device=self.device)
-        padded[: self.G, : self.G] = rho_grid
-        rho_hat = torch.fft.rfft2(padded)
-        return tuple(torch.fft.irfft2(rho_hat * fft_kernel, s=(self.P, self.P))[: self.G, : self.G] for fft_kernel in fft_kernels)
-
-    def A_grid_from_particles(self, x: Any) -> tuple[Any, Any, Any]:
-        rho_grid = self.deposit_mass(x)
-        Ax_grid, Ay_grid = self.convolve_fields(rho_grid, (self.fft_Kx, self.fft_Ky))
-        return rho_grid, Ax_grid, Ay_grid
-
-    def A_at_particles(self, x: Any) -> tuple[Any, Any]:
-        rho_grid, Ax_grid, Ay_grid = self.A_grid_from_particles(x)
-        weights = self.cic_indices_weights(x)
-        A = torch.stack(
-            [
-                self.interp_grid_with_weights(Ax_grid, weights),
-                self.interp_grid_with_weights(Ay_grid, weights),
-            ],
-            dim=1,
-        )
-        return A, rho_grid
-
-    def velocity(self, x: Any, omega: Any) -> tuple[Any, Any]:
-        A, _ = self.A_at_particles(x)
-        return omega - A, A
-
-    def hessian_grid_from_rho(self, rho_grid: Any) -> tuple[Any, Any, Any]:
-        return self.convolve_fields(rho_grid, (self.fft_Hxx, self.fft_Hxy, self.fft_Hyy))  # type: ignore[return-value]
-
-    def cic_indices_weights(self, x: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
-        h = 2 * self.L / self.G
-        u = (x[:, 0] + self.L) / h
-        v = (x[:, 1] + self.L) / h
-        i = torch.floor(u).to(torch.int64).clamp(0, self.G - 2)
-        j = torch.floor(v).to(torch.int64).clamp(0, self.G - 2)
-        fu = u - i.to(dtype=x.dtype)
-        fv = v - j.to(dtype=x.dtype)
-        return i, j, (1 - fu) * (1 - fv), fu * (1 - fv), (1 - fu) * fv, fu * fv
-
-    def deposit_mass(self, x: Any) -> Any:
-        if int(x.shape[0]) == 0:
-            raise ValueError("cannot deposit an empty particle set")
-        i, j, w00, w10, w01, w11 = self.cic_indices_weights(x)
-        mass = 1.0 / int(x.shape[0])
-        grid_flat = torch.zeros((self.G * self.G,), dtype=self.dtype, device=self.device)
-        grid_flat.index_add_(0, i * self.G + j, mass * w00)
-        grid_flat.index_add_(0, (i + 1) * self.G + j, mass * w10)
-        grid_flat.index_add_(0, i * self.G + j + 1, mass * w01)
-        grid_flat.index_add_(0, (i + 1) * self.G + j + 1, mass * w11)
-        return grid_flat.reshape(self.G, self.G)
-
-    def interp_grid_with_weights(self, field: Any, weights: tuple[Any, Any, Any, Any, Any, Any]) -> Any:
-        i, j, w00, w10, w01, w11 = weights
-        return field[i, j] * w00 + field[i + 1, j] * w10 + field[i, j + 1] * w01 + field[i + 1, j + 1] * w11
-
-    def _build_kernels(self) -> tuple[Any, Any, Any, Any, Any]:
-        coords = _torch_lag_coords(self.P, self.h, self.device, self.dtype)
-        Xlag, Ylag = torch.meshgrid(coords, coords, indexing="ij")
-        R = torch.sqrt(Xlag * Xlag + Ylag * Ylag)
-        mask = R > 1e-14
-
-        Kx = torch.zeros((self.P, self.P), dtype=self.dtype, device=self.device)
-        Ky = torch.zeros_like(Kx)
-        scale_grad = torch.zeros_like(R)
-        scale_grad[mask] = torch.pow(R[mask], -self.alpha) / (1 - self.alpha)
-        Kx[mask] = self.K * Xlag[mask] * scale_grad[mask]
-        Ky[mask] = self.K * Ylag[mask] * scale_grad[mask]
-
-        ex = torch.zeros_like(R)
-        ey = torch.zeros_like(R)
-        ex[mask] = Xlag[mask] / R[mask]
-        ey[mask] = Ylag[mask] / R[mask]
-
-        scale_hess = torch.zeros_like(R)
-        scale_hess[mask] = self.K * torch.pow(R[mask], -self.alpha) / (1 - self.alpha)
-        Hxx = torch.zeros((self.P, self.P), dtype=self.dtype, device=self.device)
-        Hxy = torch.zeros_like(Hxx)
-        Hyy = torch.zeros_like(Hxx)
         Hxx[mask] = scale_hess[mask] * (1 - self.alpha * ex[mask] * ex[mask])
         Hxy[mask] = scale_hess[mask] * (-self.alpha * ex[mask] * ey[mask])
         Hyy[mask] = scale_hess[mask] * (1 - self.alpha * ey[mask] * ey[mask])
@@ -611,68 +333,6 @@ def make_lag_coords(P: int, h: float) -> Array:
     return lag * h
 
 
-def fiber_colors(config: SimulationConfig, omega_atoms: Array | None, n_groups: int) -> list[str]:
-    """Return Plotly marker colors for omega-fiber groups."""
-
-    scheme = config.color_scheme
-    if scheme == "palette" or omega_atoms is None:
-        return [DEFAULT_PALETTE[k % len(DEFAULT_PALETTE)] for k in range(n_groups)]
-    if scheme != "phase_color":
-        raise ValueError(f"unknown color_scheme: {scheme!r}")
-
-    atoms = np.asarray(omega_atoms, dtype=np.float64)
-    if atoms.shape != (n_groups, 2):
-        return [DEFAULT_PALETTE[k % len(DEFAULT_PALETTE)] for k in range(n_groups)]
-    radii = np.linalg.norm(atoms, axis=1)
-    intensities = _phase_color_intensities(radii)
-    if float(np.max(intensities)) <= 0:
-        return ["#000000" for _ in range(n_groups)]
-
-    colors: list[str] = []
-    for atom, intensity in zip(atoms, intensities):
-        if intensity <= 0:
-            colors.append("#000000")
-            continue
-        hue = float((np.arctan2(atom[1], atom[0]) + 2 * np.pi) % (2 * np.pi)) / (2 * np.pi)
-        red, green, blue = colorsys.hsv_to_rgb(hue, float(intensity), float(intensity))
-        colors.append(f"#{round(255 * red):02x}{round(255 * green):02x}{round(255 * blue):02x}")
-    return colors
-
-
-def _phase_color_intensities(radii: Array) -> Array:
-    intensities = np.zeros_like(radii, dtype=np.float64)
-    positive = radii > 0
-    if not np.any(positive):
-        return intensities
-
-    positive_radii = radii[positive]
-    unique_radii = np.unique(positive_radii)
-    if len(unique_radii) == 1:
-        intensities[positive] = 1.0
-        return intensities
-
-    ranks = np.searchsorted(unique_radii, positive_radii, side="left").astype(np.float64)
-    normalized = ranks / float(len(unique_radii) - 1)
-    intensities[positive] = 0.42 + 0.58 * np.sqrt(normalized)
-    return intensities
-
-
-def _torch_lag_coords(P: int, h: float, device: Any, dtype: Any) -> Any:
-    if torch is None:  # pragma: no cover - guarded by backend construction
-        raise RuntimeError("torch is not available")
-    idx = torch.arange(P, device=device)
-    lag = torch.where(idx <= P // 2, idx, idx - P)
-    return lag.to(dtype=dtype) * h
-
-
-def _torch_dtype_name(dtype: Any) -> str:
-    if torch is not None and dtype is torch.float32:
-        return "float32"
-    if torch is not None and dtype is torch.float64:
-        return "float64"
-    return str(dtype).replace("torch.", "")
-
-
 def cic_indices_weights(x: Array, G: int, L: float) -> tuple[Array, Array, Array, Array, Array, Array]:
     h = 2 * L / G
     u = (x[:, 0] + L) / h
@@ -700,11 +360,7 @@ def deposit_mass(x: Array, G: int, L: float) -> Array:
 
 
 def interp_grid(field: Array, x: Array, G: int, L: float) -> Array:
-    return interp_grid_with_weights(field, cic_indices_weights(x, G, L))
-
-
-def interp_grid_with_weights(field: Array, weights: tuple[Array, Array, Array, Array, Array, Array]) -> Array:
-    i, j, w00, w10, w01, w11 = weights
+    i, j, w00, w10, w01, w11 = cic_indices_weights(x, G, L)
     return (
         field[i, j] * w00
         + field[i + 1, j] * w10
@@ -791,147 +447,66 @@ def make_initial_condition(
 def run_simulation(config: SimulationConfig, initial: InitialCondition | None = None) -> SimulationResult:
     """Evolve a PP particle system to an approximate equilibrium."""
 
-    _validate_runtime_config(config)
-    raw_initial = make_initial_condition(config) if initial is None else validate_initial_condition(initial)
-    initial, initialization_meta = _apply_initialization_algorithm(config, raw_initial)
-    solver = _make_pp_backend(config)
+    initial = make_initial_condition(config) if initial is None else validate_initial_condition(initial)
+    solver = FFTPeszekPoyato2D(config.alpha, config.K, config.grid_size, config.domain_radius)
 
-    x = solver.asarray(initial.x)
-    omega = solver.asarray(initial.omega)
-    x, clip_count = solver.clip_inside_with_count(solver.copy_state(x))
-    x_initial = solver.to_numpy(x).copy()
-    diagnostics: list[tuple[int, float, float, float, float, int, int, int, int]] = []
+    x = solver.clip_inside(initial.x.copy())
+    x_initial = x.copy()
+    diagnostics: list[tuple[int, float, float, float]] = []
     trajectory_x: list[Array] = []
     trajectory_rho: list[Array] = []
     trajectory_steps: list[int] = []
     trajectory_times: list[float] = []
     trajectory_stride = _trajectory_stride(config)
     trajectory_limit = _trajectory_frame_limit(config)
-    field_evaluations = 0
-    accepted_steps = 0
-    rejected_steps = 0
-    clip_events = int(clip_count)
-    dt_current = _clamp_dt(float(config.dt), config)
-    dt_history: list[float] = []
-    t = 0.0
-    time_sign = -1.0 if config.time_direction == "backward" else 1.0
 
-    def record_trajectory(step_: int, x_: Any, time_: float, *, force: bool = False) -> None:
+    def record_trajectory(step_: int, x_: Array, *, force: bool = False) -> None:
         if not config.make_animation:
             return
         if trajectory_steps and not force and step_ % trajectory_stride != 0 and step_ != config.max_steps:
             return
         if trajectory_limit is not None and len(trajectory_steps) >= trajectory_limit and not force and step_ != config.max_steps:
             return
-        density_x = solver.to_numpy(x_)
+        density_x = x_
         density_grid_size = config.animation_density_grid_size
         if density_grid_size is None or int(density_grid_size) == solver.G:
             rho = deposit_mass(density_x, solver.G, solver.L)
         else:
             rho = deposit_mass(density_x, int(density_grid_size), solver.L)
-        trajectory_x.append(density_x.astype(np.float32, copy=True))
+        trajectory_x.append(x_.astype(np.float32, copy=True))
         trajectory_rho.append(rho.astype(np.float32, copy=False))
         trajectory_steps.append(int(step_))
-        trajectory_times.append(float(time_))
-
-    def append_diagnostic(step_: int, time_: float, rms_: float, maxv_: float, dt_: float) -> None:
-        diagnostics.append(
-            (
-                int(step_),
-                float(time_),
-                float(rms_),
-                float(maxv_),
-                float(dt_),
-                int(field_evaluations),
-                int(accepted_steps),
-                int(rejected_steps),
-                int(clip_events),
-            )
-        )
+        trajectory_times.append(float(step_ * config.dt))
 
     start = time.time()
 
-    if config.integrator == "fixed_rk2":
-        dt_fixed = float(config.dt)
-        for _ in range(config.max_steps + 1):
-            record_trajectory(accepted_steps, x, t)
-            vf, _ = solver.velocity(x, omega)
-            field_evaluations += 1
-            rms, maxv = solver.speed_stats(vf)
-            if accepted_steps % config.record_every == 0:
-                append_diagnostic(accepted_steps, t, rms, maxv, dt_fixed)
-            if rms < config.tol_rms and accepted_steps > config.min_steps:
-                break
-            if accepted_steps >= config.max_steps:
-                break
-            x_pred, clipped = solver.clip_inside_with_count(x + time_sign * dt_fixed * vf)
-            clip_events += clipped
-            k2, _ = solver.velocity(x_pred, omega)
-            field_evaluations += 1
-            x = x + 0.5 * time_sign * dt_fixed * (vf + k2)
-            x = solver.center(x)
-            x, clipped = solver.clip_inside_with_count(x)
-            clip_events += clipped
-            t += dt_fixed
-            accepted_steps += 1
-            dt_history.append(dt_fixed)
-    else:
-        while True:
-            record_trajectory(accepted_steps, x, t)
-            vf, _ = solver.velocity(x, omega)
-            field_evaluations += 1
-            rms, maxv = solver.speed_stats(vf)
-            if accepted_steps % config.record_every == 0:
-                append_diagnostic(accepted_steps, t, rms, maxv, dt_current)
-            if rms < config.tol_rms and accepted_steps > config.min_steps:
-                break
-            if accepted_steps >= config.max_steps:
-                break
-
-            trial_dt = _cfl_limited_dt(dt_current, maxv, solver.h, config)
-            while True:
-                x_pred, clipped = solver.clip_inside_with_count(x + time_sign * trial_dt * vf)
-                clip_events += clipped
-                k2, _ = solver.velocity(x_pred, omega)
-                field_evaluations += 1
-                x_euler = x + time_sign * trial_dt * vf
-                x_heun = x + 0.5 * time_sign * trial_dt * (vf + k2)
-                local_err = solver.rms_delta(x_heun, x_euler)
-                if not np.isfinite(local_err):
-                    if trial_dt <= config.dt_min * (1 + 1e-12):
-                        raise FloatingPointError("adaptive RK2 local error is non-finite at dt_min")
-                    rejected_steps += 1
-                    trial_dt = max(float(config.dt_min), trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False))
-                    continue
-                if local_err <= config.adaptive_tol or trial_dt <= config.dt_min * (1 + 1e-12):
-                    break
-                rejected_steps += 1
-                trial_dt = max(float(config.dt_min), trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False))
-
-            x = solver.center(x_heun)
-            x, clipped = solver.clip_inside_with_count(x)
-            clip_events += clipped
-            t += trial_dt
-            accepted_steps += 1
-            dt_history.append(trial_dt)
-            dt_current = _clamp_dt(trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=True), config)
+    for step in range(config.max_steps + 1):
+        record_trajectory(step, x)
+        vf, _ = solver.velocity(x, initial.omega)
+        speed2 = np.sum(vf * vf, axis=1)
+        rms = float(np.sqrt(np.mean(speed2)))
+        maxv = float(np.sqrt(np.max(speed2)))
+        if step % config.record_every == 0:
+            diagnostics.append((step, step * config.dt, rms, maxv))
+        if rms < config.tol_rms and step > config.min_steps:
+            break
+        if step < config.max_steps:
+            x_pred = solver.clip_inside(x + config.dt * vf)
+            k2, _ = solver.velocity(x_pred, initial.omega)
+            x = x + 0.5 * config.dt * (vf + k2)
+            x -= x.mean(axis=0, keepdims=True)
+            x = solver.clip_inside(x)
 
     runtime = time.time() - start
-    if config.make_animation and (not trajectory_steps or trajectory_steps[-1] != accepted_steps):
-        record_trajectory(accepted_steps, x, t, force=True)
-    A_final_backend, rho_grid_backend = solver.A_at_particles(x)
-    field_evaluations += 1
-    solver.synchronize()
-    x_final = solver.to_numpy(x).copy()
-    A_final = solver.to_numpy(A_final_backend)
-    rho_grid = solver.to_numpy(rho_grid_backend)
+    if config.make_animation and (not trajectory_steps or trajectory_steps[-1] != step):
+        record_trajectory(step, x, force=True)
+    A_final, rho_grid = solver.A_at_particles(x)
     residual = initial.omega - A_final
     residual_speed2 = np.sum(residual * residual, axis=1)
-    dt_min_observed, dt_max_observed, dt_mean = _dt_history_summary(dt_history)
     return SimulationResult(
         initial=initial,
         x_initial=x_initial,
-        x_final=x_final,
+        x_final=x.copy(),
         A_final=A_final,
         residual=residual,
         rho_grid=rho_grid,
@@ -940,253 +515,12 @@ def run_simulation(config: SimulationConfig, initial: InitialCondition | None = 
         trajectory_rho=np.stack(trajectory_rho) if trajectory_rho else None,
         trajectory_steps=np.array(trajectory_steps, dtype=np.int64) if trajectory_steps else None,
         trajectory_times=np.array(trajectory_times, dtype=np.float64) if trajectory_times else None,
-        steps=int(accepted_steps),
-        final_time=float(t),
+        steps=int(step),
+        final_time=float(step * config.dt),
         runtime_seconds=float(runtime),
         rms_residual=float(np.sqrt(np.mean(residual_speed2))),
         max_residual=float(np.sqrt(np.max(residual_speed2))),
-        backend=solver.backend_name,
-        device=solver.device_name,
-        dtype=solver.dtype_name,
-        field_evaluations=int(field_evaluations),
-        accepted_steps=int(accepted_steps),
-        rejected_steps=int(rejected_steps),
-        dt_min_observed=dt_min_observed,
-        dt_max_observed=dt_max_observed,
-        dt_mean=dt_mean,
-        clip_events=int(clip_events),
-        initialization_algorithm=str(initialization_meta["algorithm"]),
-        initialization_steps=int(initialization_meta["steps"]),
-        initialization_time=float(initialization_meta["time"]),
-        initialization_stop_metric=float(initialization_meta["stop_metric"]),
     )
-
-
-def _apply_initialization_algorithm(
-    config: SimulationConfig,
-    initial: InitialCondition,
-) -> tuple[InitialCondition, dict[str, object]]:
-    if config.initialization_algorithm == "raw":
-        return initial, {"algorithm": "raw", "steps": 0, "time": 0.0, "stop_metric": 0.0}
-    if config.initialization_algorithm == "legacy_fast_phase":
-        return _legacy_fast_phase_initial_condition(config, initial)
-    raise ValueError(f"unknown initialization_algorithm: {config.initialization_algorithm!r}")
-
-
-def _legacy_fast_phase_initial_condition(
-    config: SimulationConfig,
-    initial: InitialCondition,
-) -> tuple[InitialCondition, dict[str, object]]:
-    """Discarded-history fixed-RK2 fast-phase initializer.
-
-    This intentionally mirrors the legacy PP integrator: NumPy float64,
-    forward time, fixed `config.dt`, no adaptive CFL limiting, and no trajectory
-    recording.  Only the final particle locations become the new initial state.
-    """
-
-    init_config = _resolve_initializer_config(config)
-    grid_size = config.grid_size if init_config.grid_size is None else int(init_config.grid_size)
-    domain_radius = config.domain_radius if init_config.domain_radius is None else float(init_config.domain_radius)
-    solver = FFTPeszekPoyato2D(init_config.alpha, init_config.K, grid_size, domain_radius)
-    x = solver.clip_inside(np.asarray(initial.x, dtype=np.float64).copy())
-    omega = np.asarray(initial.omega, dtype=np.float64)
-    max_steps = max(0, int(init_config.max_steps))
-    min_steps = max(0, int(init_config.min_steps))
-    window = max(1, int(init_config.window))
-    tol = float(init_config.displacement_tol)
-    recent_metrics: list[float] = []
-    stop_metric = float("inf") if max_steps else 0.0
-    steps_done = 0
-
-    for step in range(max_steps):
-        vf, _ = solver.velocity(x, omega)
-        x_pred = solver.clip_inside(x + float(init_config.dt) * vf)
-        k2, _ = solver.velocity(x_pred, omega)
-        x_next = x + 0.5 * float(init_config.dt) * (vf + k2)
-        x_next -= x_next.mean(axis=0, keepdims=True)
-        x_next = solver.clip_inside(x_next)
-
-        step_rms = float(np.sqrt(np.mean(np.sum((x_next - x) ** 2, axis=1))))
-        rel = x_next - x_next.mean(axis=0, keepdims=True)
-        support = float(np.quantile(np.linalg.norm(rel, axis=1), 0.95))
-        stop_metric = step_rms / max(support, solver.h, 1e-12)
-        recent_metrics.append(stop_metric)
-        if len(recent_metrics) > window:
-            recent_metrics.pop(0)
-
-        x = x_next
-        steps_done = step + 1
-        if steps_done >= min_steps and len(recent_metrics) == window and max(recent_metrics) <= tol:
-            break
-
-    warmed = InitialCondition(
-        x=x.astype(np.float64, copy=False),
-        omega=omega.copy(),
-        group_id=np.asarray(initial.group_id, dtype=np.int64).copy(),
-        omega_atoms=np.asarray(initial.omega_atoms, dtype=np.float64).copy(),
-        group_names=tuple(initial.group_names),
-    )
-    return warmed, {
-        "algorithm": "legacy_fast_phase",
-        "steps": int(steps_done),
-        "time": float(steps_done * float(init_config.dt)),
-        "stop_metric": float(stop_metric),
-    }
-
-
-def _resolve_initializer_config(config: SimulationConfig) -> InitializerConfig:
-    if config.initializer_config is not None:
-        return config.initializer_config
-    return InitializerConfig(
-        max_steps=config.initialization_fast_steps,
-        min_steps=config.initialization_fast_min_steps,
-        window=config.initialization_fast_window,
-        displacement_tol=config.initialization_fast_displacement_tol,
-    )
-
-
-def _validate_runtime_config(config: SimulationConfig) -> None:
-    if config.backend not in ("auto", "numpy", "torch"):
-        raise ValueError("backend must be one of 'auto', 'numpy', or 'torch'")
-    if config.initialization_algorithm not in ("raw", "legacy_fast_phase"):
-        raise ValueError("initialization_algorithm must be 'raw' or 'legacy_fast_phase'")
-    if config.initialization_fast_steps < 0:
-        raise ValueError("initialization_fast_steps must be non-negative")
-    if config.initialization_fast_min_steps < 0:
-        raise ValueError("initialization_fast_min_steps must be non-negative")
-    if config.initialization_fast_window <= 0:
-        raise ValueError("initialization_fast_window must be positive")
-    if config.initialization_fast_displacement_tol <= 0:
-        raise ValueError("initialization_fast_displacement_tol must be positive")
-    if config.color_scheme not in ("palette", "phase_color"):
-        raise ValueError("color_scheme must be 'palette' or 'phase_color'")
-    init_config = _resolve_initializer_config(config)
-    if init_config.alpha >= 1:
-        raise ValueError("initializer_config.alpha must be < 1")
-    if init_config.grid_size is not None and init_config.grid_size < 4:
-        raise ValueError("initializer_config.grid_size must be at least 4")
-    if init_config.domain_radius is not None and init_config.domain_radius <= 0:
-        raise ValueError("initializer_config.domain_radius must be positive")
-    if init_config.dt <= 0:
-        raise ValueError("initializer_config.dt must be positive")
-    if init_config.max_steps < 0:
-        raise ValueError("initializer_config.max_steps must be non-negative")
-    if init_config.min_steps < 0:
-        raise ValueError("initializer_config.min_steps must be non-negative")
-    if init_config.window <= 0:
-        raise ValueError("initializer_config.window must be positive")
-    if init_config.displacement_tol <= 0:
-        raise ValueError("initializer_config.displacement_tol must be positive")
-    if config.dtype not in ("auto", "float32", "float64"):
-        raise ValueError("dtype must be one of 'auto', 'float32', or 'float64'")
-    if config.integrator not in ("fixed_rk2", "adaptive_rk2"):
-        raise ValueError("integrator must be 'fixed_rk2' or 'adaptive_rk2'")
-    if config.time_direction not in ("forward", "backward"):
-        raise ValueError("time_direction must be 'forward' or 'backward'")
-    if config.dt <= 0:
-        raise ValueError("dt must be positive")
-    if config.dt_min <= 0:
-        raise ValueError("dt_min must be positive")
-    if config.dt_max < config.dt_min:
-        raise ValueError("dt_max must be at least dt_min")
-    if config.adaptive_tol <= 0:
-        raise ValueError("adaptive_tol must be positive")
-    if config.max_displacement_per_step < 0:
-        raise ValueError("max_displacement_per_step must be non-negative")
-    if config.max_steps < 0:
-        raise ValueError("max_steps must be non-negative")
-    if config.min_steps < 0:
-        raise ValueError("min_steps must be non-negative")
-    if config.record_every <= 0:
-        raise ValueError("record_every must be positive")
-
-
-def _make_pp_backend(config: SimulationConfig) -> FFTPeszekPoyato2D | TorchPeszekPoyato2D:
-    backend = str(config.backend)
-    if backend == "auto":
-        if torch is not None and _torch_accelerator_available():
-            backend = "torch"
-        else:
-            if torch is None:
-                warnings.warn("torch is unavailable; falling back to the NumPy PP backend.", RuntimeWarning, stacklevel=2)
-            backend = "numpy"
-
-    if backend == "numpy":
-        if config.device is not None:
-            warnings.warn("SimulationConfig.device is ignored by the NumPy PP backend.", RuntimeWarning, stacklevel=2)
-        if config.dtype == "float32":
-            warnings.warn("The NumPy PP backend preserves the legacy float64 path; dtype='float32' is ignored.", RuntimeWarning, stacklevel=2)
-        return FFTPeszekPoyato2D(config.alpha, config.K, config.grid_size, config.domain_radius)
-
-    if torch is None:
-        raise RuntimeError("backend='torch' requires the optional torch dependency")
-    device = _select_torch_device(config.device)
-    dtype = _resolve_torch_dtype(config.dtype, device)
-    return TorchPeszekPoyato2D(config.alpha, config.K, config.grid_size, config.domain_radius, device=device, dtype=dtype)
-
-
-def _torch_accelerator_available() -> bool:
-    if torch is None:
-        return False
-    return bool(torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()))
-
-
-def _select_torch_device(device: str | None) -> Any:
-    if torch is None:  # pragma: no cover - guarded by caller
-        raise RuntimeError("torch is not available")
-    if device:
-        selected = torch.device(device)
-    elif torch.cuda.is_available():
-        selected = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        selected = torch.device("mps")
-    else:
-        selected = torch.device("cpu")
-    if selected.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
-    if selected.type == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-        raise RuntimeError("MPS was requested but torch.backends.mps.is_available() is false")
-    return selected
-
-
-def _resolve_torch_dtype(dtype: DTypeChoice, device: Any) -> Any:
-    if torch is None:  # pragma: no cover - guarded by caller
-        raise RuntimeError("torch is not available")
-    if dtype == "auto":
-        return torch.float32 if device.type in ("cuda", "mps") else torch.float64
-    if dtype == "float32":
-        return torch.float32
-    if device.type == "mps":
-        raise ValueError("MPS does not support torch.float64; use dtype='auto' or dtype='float32'")
-    return torch.float64
-
-
-def _clamp_dt(dt: float, config: SimulationConfig) -> float:
-    return float(np.clip(float(dt), float(config.dt_min), float(config.dt_max)))
-
-
-def _cfl_limited_dt(dt: float, max_speed: float, h: float, config: SimulationConfig) -> float:
-    limited = _clamp_dt(dt, config)
-    if config.max_displacement_per_step > 0 and max_speed > 1e-14:
-        cfl_dt = float(config.max_displacement_per_step) * float(h) / float(max_speed)
-        limited = min(limited, max(float(config.dt_min), cfl_dt))
-    return _clamp_dt(limited, config)
-
-
-def _adaptive_step_factor(local_err: float, tol: float, *, grow: bool) -> float:
-    if not np.isfinite(local_err) or local_err <= 0:
-        return 2.0 if grow else 0.25
-    factor = 0.92 * float(tol / local_err) ** 0.5
-    if grow:
-        return float(np.clip(factor, 0.5, 2.0))
-    return float(np.clip(factor, 0.2, 0.8))
-
-
-def _dt_history_summary(dt_history: Sequence[float]) -> tuple[float, float, float]:
-    if not dt_history:
-        return 0.0, 0.0, 0.0
-    arr = np.asarray(dt_history, dtype=np.float64)
-    return float(arr.min()), float(arr.max()), float(arr.mean())
 
 
 def analyze_hessian_geometry(result: SimulationResult, config: SimulationConfig) -> GeometryAnalysis:
@@ -1251,22 +585,6 @@ def analyze_hessian_geometry(result: SimulationResult, config: SimulationConfig)
         "steps": int(result.steps),
         "final_time": float(result.final_time),
         "runtime_seconds": float(result.runtime_seconds),
-        "backend": result.backend,
-        "device": result.device,
-        "dtype": result.dtype,
-        "initialization_algorithm": result.initialization_algorithm,
-        "initialization_steps": int(result.initialization_steps),
-        "initialization_time": float(result.initialization_time),
-        "initialization_stop_metric": float(result.initialization_stop_metric),
-        "integrator": config.integrator,
-        "time_direction": config.time_direction,
-        "field_evaluations": int(result.field_evaluations),
-        "accepted_steps": int(result.accepted_steps),
-        "rejected_steps": int(result.rejected_steps),
-        "dt_min_observed": float(result.dt_min_observed),
-        "dt_max_observed": float(result.dt_max_observed),
-        "dt_mean": float(result.dt_mean),
-        "clip_events": int(result.clip_events),
         "rms_equilibrium_residual_fft": result.rms_residual,
         "max_equilibrium_residual_fft": result.max_residual,
         "mean_x": x_final.mean(axis=0).tolist(),
@@ -1394,7 +712,6 @@ def make_dynamics_animation(result: SimulationResult, config: SimulationConfig) 
 
     rng = np.random.default_rng(config.seed + 3)
     sampled_by_group = _animation_sample_indices(group_id, config.max_animation_points_per_group, rng)
-    colors = fiber_colors(config, result.initial.omega_atoms, len(group_names))
     density_axis = _density_axis(config, trajectory_rho.shape[1])
     zmax = float(np.nanquantile(trajectory_rho, 0.995)) if trajectory_rho.size else 1.0
     zmax = max(zmax, 1e-12)
@@ -1412,7 +729,7 @@ def make_dynamics_animation(result: SimulationResult, config: SimulationConfig) 
 
     for k, name in enumerate(group_names):
         idx = sampled_by_group[k]
-        color = colors[k]
+        color = DEFAULT_PALETTE[k % len(DEFAULT_PALETTE)]
         fig.add_trace(
             go.Scatter(
                 x=trajectory_x[0, idx, 0],
@@ -1453,7 +770,7 @@ def make_dynamics_animation(result: SimulationResult, config: SimulationConfig) 
                     x=trajectory_x[frame_idx, idx, 0],
                     y=trajectory_x[frame_idx, idx, 1],
                     mode="markers",
-                    marker=dict(size=4, color=colors[k], opacity=0.70),
+                    marker=dict(size=4, color=DEFAULT_PALETTE[k % len(DEFAULT_PALETTE)], opacity=0.70),
                 )
             )
         traces.append(
@@ -1583,29 +900,6 @@ def _plotly_values(values: Any) -> Any:
     return values
 
 
-def _initialization_preset_from_config(config: SimulationConfig) -> str:
-    if config.fibers is not None:
-        return "mixed"
-    shape_names = tuple(config.shape_names)
-    for key, shapes in PP_INITIALIZATION_PRESETS.items():
-        if shape_names == tuple(shapes):
-            return key
-    return "mixed"
-
-
-def _shape_names_for_initialization_preset(preset: str) -> tuple[str, ...]:
-    return PP_INITIALIZATION_PRESETS.get(str(preset), DEFAULT_SHAPES)
-
-
-def _n_per_fiber_scalar(config: SimulationConfig) -> int:
-    value = config.n_per_fiber
-    if isinstance(value, int):
-        return int(value)
-    if not value:
-        return 1
-    return int(value[0])
-
-
 def make_dynamics_widget(
     config: SimulationConfig,
     result: SimulationResult | None = None,
@@ -1624,13 +918,11 @@ def make_dynamics_widget(
     return PPDynamicsWidget(config, result=result, width=width, height=height)
 
 
-class PeszekPoyatoDynamicsBaseWidget:
+class PPDynamicsWidget:
     """Interactive ``go.FigureWidget`` animation of fiber + joint-density dynamics.
 
-    This base mirrors the interaction model that works well in
-    ``LMSOpticalDiskBaseWidget``: controls are grouped under the figure,
-    expensive simulation results are precomputed into frame payloads, and
-    playback only swaps cached arrays into existing Plotly traces.
+    The control set and caching model are copied from
+    ``LMSOpticalDiskWidget``:
 
     * ``Precompute`` runs the simulation (recording every step) and builds the
       per-frame payload cache.
@@ -1654,12 +946,10 @@ class PeszekPoyatoDynamicsBaseWidget:
     ) -> None:
         if widgets is None:
             raise RuntimeError(
-                "PeszekPoyatoDynamicsBaseWidget requires ipywidgets (install the 'widgets' extra) "
+                "PPDynamicsWidget requires ipywidgets (install the 'widgets' extra) "
                 "and a live notebook kernel."
             )
         self.config = config
-        self._seed = int(config.seed)
-        self._init_preset = _initialization_preset_from_config(config)
         self.width = int(width)
         self.height = int(height)
 
@@ -1671,7 +961,6 @@ class PeszekPoyatoDynamicsBaseWidget:
         self._sampled_by_group: list[Array] = []
         self._density_axis: Array | None = None
         self._zmax = 1.0
-        self._fiber_trace_count = 0
 
         fibers = _normalize_fibers(config)
         self._group_names: tuple[str, ...] = tuple(
@@ -1680,12 +969,10 @@ class PeszekPoyatoDynamicsBaseWidget:
 
         self._build_controls()
         self._build_figure()
-        self._bind_callbacks()
-        self._sync_time_direction_label()
-        self._sync_config_status()
+        self._wire_events()
         self.layout = widgets.VBox(
             [
-                widgets.HTML(self._layout_header_html()),
+                widgets.HTML(self._header_html()),
                 self.fig,
                 self.controls,
                 self.stats_html,
@@ -1699,7 +986,7 @@ class PeszekPoyatoDynamicsBaseWidget:
 
     # -- construction -------------------------------------------------------
 
-    def _layout_header_html(self) -> str:
+    def _header_html(self) -> str:
         return (
             "<b>Peszek--Poyato large-N FFT dynamics</b><br>"
             "Left: sampled per-omega fiber particles. Right: precomputed joint "
@@ -1707,91 +994,16 @@ class PeszekPoyatoDynamicsBaseWidget:
             "swap cached frames in place."
         )
 
-    def _header_html(self) -> str:
-        return self._layout_header_html()
-
     def _build_controls(self) -> None:
-        n_fibers = int(max(1, self.config.n_fibers))
-        n_per_fiber = max(1, _n_per_fiber_scalar(self.config))
-        frame_count = max(0, int(self.config.trajectory_frame_count))
-
-        self.initialization_dropdown = widgets.Dropdown(
-            options=[
-                ("Mixed shapes", "mixed"),
-                ("Gaussian", "gaussian"),
-                ("Rings", "ring"),
-                ("Lines", "line"),
-                ("Spirals", "spiral"),
-                ("Squares", "square"),
-            ],
-            value=self._init_preset,
-            description="init",
-            layout=widgets.Layout(width="190px"),
-        )
-        self.initializer_dropdown = widgets.Dropdown(
-            options=list(PP_INITIALIZER_OPTIONS),
-            value=self.config.initialization_algorithm,
-            description="warmup",
-            layout=widgets.Layout(width="220px"),
-        )
-        self.alpha_slider = widgets.FloatSlider(
-            value=float(self.config.alpha),
-            min=0.0,
-            max=0.999,
-            step=0.001,
-            description="alpha",
-            readout_format=".3f",
-            continuous_update=False,
-            layout=widgets.Layout(width="260px"),
-        )
-        self.n_fibers_slider = widgets.IntSlider(
-            value=n_fibers,
-            min=1,
-            max=max(40, n_fibers),
-            step=1,
-            description="omega atoms",
-            continuous_update=False,
-            layout=widgets.Layout(width="260px"),
-        )
-        self.n_per_fiber_slider = widgets.IntSlider(
-            value=n_per_fiber,
-            min=1,
-            max=max(5000, n_per_fiber * 4),
-            step=1,
-            description="N/omega",
-            continuous_update=False,
-            layout=widgets.Layout(width="260px"),
-        )
-        self.btn_resample = widgets.Button(
-            description="Resample x^0",
-            layout=widgets.Layout(width="140px"),
-        )
-        self.config_status_html = widgets.HTML(value="", layout=widgets.Layout(width="620px"))
-        self.time_direction_toggle = widgets.ToggleButton(
-            value=self.config.time_direction == "backward",
-            description="Time: forward",
-            tooltip="Switch between forward dynamics and the time-inverted vector field.",
-            layout=widgets.Layout(width="150px"),
-        )
-        self.frame_cap_slider = widgets.IntSlider(
-            value=frame_count,
-            min=0,
-            max=max(20000, int(self.config.max_steps) + 1, frame_count),
-            step=10,
-            description="frame cap",
-            continuous_update=False,
-            layout=widgets.Layout(width="340px"),
-        )
-        self.frame_cap_slider.tooltip = "0 records every accepted integration step; positive values downsample to a cap."
         self.btn_precompute = widgets.Button(
-            description="Precompute flow",
+            description="Precompute",
             button_style="warning",
             layout=widgets.Layout(width="140px"),
         )
         self.btn_step = widgets.Button(
-            description="Step flow",
+            description="Step",
             disabled=True,
-            layout=widgets.Layout(width="100px"),
+            layout=widgets.Layout(width="90px"),
         )
         self.play = widgets.Play(
             value=0,
@@ -1820,23 +1032,6 @@ class PeszekPoyatoDynamicsBaseWidget:
         self.stats_html = widgets.HTML(value="")
         self.controls = widgets.VBox(
             [
-                widgets.HBox(
-                    [
-                        self.initialization_dropdown,
-                        self.initializer_dropdown,
-                        self.alpha_slider,
-                        self.n_fibers_slider,
-                        self.n_per_fiber_slider,
-                        self.btn_resample,
-                    ]
-                ),
-                widgets.HBox(
-                    [
-                        self.config_status_html,
-                        self.time_direction_toggle,
-                        self.frame_cap_slider,
-                    ]
-                ),
                 widgets.HBox([self.btn_step, self.play, self.btn_precompute, self.cache_status_html]),
                 widgets.HBox([self.frame_slider, self.frame_counter]),
             ]
@@ -1857,8 +1052,22 @@ class PeszekPoyatoDynamicsBaseWidget:
         )
         self.fig = fig
         self.tr: dict[str, int] = {}
-        self._fiber_trace_count = 0
-        self._ensure_fiber_traces(self._group_names)
+
+        for k, name in enumerate(self._group_names):
+            color = DEFAULT_PALETTE[k % len(DEFAULT_PALETTE)]
+            fig.add_trace(
+                go.Scatter(
+                    x=[],
+                    y=[],
+                    mode="markers",
+                    marker=dict(size=4, color=color, opacity=0.70),
+                    name=f"fiber {k + 1}: {name}",
+                    legendgroup=f"fiber{k}",
+                ),
+                row=1,
+                col=1,
+            )
+            self.tr[f"fiber{k}"] = len(fig.data) - 1
 
         fig.add_trace(
             go.Heatmap(
@@ -1890,115 +1099,11 @@ class PeszekPoyatoDynamicsBaseWidget:
             margin=dict(l=50, r=30, t=70, b=40),
         )
 
-    def _ensure_fiber_traces(self, group_names: Sequence[str], omega_atoms: Array | None = None) -> None:
-        if not hasattr(self, "fig"):
-            return
-        colors = fiber_colors(self.config, omega_atoms, len(group_names))
-        while self._fiber_trace_count < len(group_names):
-            k = self._fiber_trace_count
-            color = colors[k]
-            self.fig.add_trace(
-                go.Scatter(
-                    x=[],
-                    y=[],
-                    mode="markers",
-                    marker=dict(size=4, color=color, opacity=0.70),
-                    name=f"fiber {k + 1}: {group_names[k]}",
-                    legendgroup=f"fiber{k}",
-                    visible=True,
-                ),
-                row=1,
-                col=1,
-            )
-            self.tr[f"fiber{k}"] = len(self.fig.data) - 1
-            self._fiber_trace_count += 1
-
-        with self.fig.batch_update():
-            for k in range(self._fiber_trace_count):
-                trace = self.fig.data[self.tr[f"fiber{k}"]]
-                if k < len(group_names):
-                    trace.name = f"fiber {k + 1}: {group_names[k]}"
-                    trace.legendgroup = f"fiber{k}"
-                    trace.marker.color = colors[k]
-                    trace.visible = True
-                else:
-                    trace.x = []
-                    trace.y = []
-                    trace.visible = False
-
-    def _bind_callbacks(self) -> None:
-        for ctl in (
-            self.initialization_dropdown,
-            self.initializer_dropdown,
-            self.alpha_slider,
-            self.n_fibers_slider,
-            self.n_per_fiber_slider,
-            self.frame_cap_slider,
-        ):
-            ctl.observe(self._on_control_change, names="value")
-        self.time_direction_toggle.observe(self._on_time_direction_toggle, names="value")
-        self.btn_resample.on_click(self._on_resample)
+    def _wire_events(self) -> None:
         self.btn_precompute.on_click(self._on_precompute_clicked)
         self.btn_step.on_click(self._on_step)
         self.play.observe(self._on_play_tick, names="value")
         self.frame_slider.observe(self._on_frame_slider, names="value")
-
-    def _wire_events(self) -> None:
-        self._bind_callbacks()
-
-    def _time_direction(self) -> TimeDirectionChoice:
-        return "backward" if bool(self.time_direction_toggle.value) else "forward"
-
-    def _sync_time_direction_label(self) -> None:
-        self.time_direction_toggle.description = "Time: backward" if self._time_direction() == "backward" else "Time: forward"
-
-    def _preview_group_names_from_controls(self) -> tuple[str, ...]:
-        preset = str(self.initialization_dropdown.value)
-        shape_names = _shape_names_for_initialization_preset(preset)
-        return tuple(shape_names[k % len(shape_names)] for k in range(int(self.n_fibers_slider.value)))
-
-    def _config_from_controls(self, *, make_animation: bool) -> SimulationConfig:
-        preset = str(self.initialization_dropdown.value)
-        shape_names = _shape_names_for_initialization_preset(preset)
-        return replace(
-            self.config,
-            alpha=float(self.alpha_slider.value),
-            n_fibers=int(self.n_fibers_slider.value),
-            n_per_fiber=int(self.n_per_fiber_slider.value),
-            fibers=None,
-            shape_names=shape_names,
-            omega_atoms=None,
-            seed=int(self._seed),
-            initialization_algorithm=self.initializer_dropdown.value,
-            time_direction=self._time_direction(),
-            make_animation=bool(make_animation),
-            trajectory_frame_count=int(self.frame_cap_slider.value),
-        )
-
-    def _sync_config_status(self, result: SimulationResult | None = None) -> None:
-        cfg = self._config_from_controls(make_animation=True)
-        total = int(cfg.n_fibers) * int(cfg.n_per_fiber)
-        backend_text = cfg.backend
-        if result is not None:
-            backend_text = f"{result.backend}/{result.device}/{result.dtype}"
-        residual_text = ""
-        if result is not None:
-            residual_text = f"; residual RMS={result.rms_residual:.3g}; runtime={result.runtime_seconds:.2f}s"
-        frame_text = "all steps" if int(cfg.trajectory_frame_count) <= 0 else f"cap {int(cfg.trajectory_frame_count):,}"
-        self.config_status_html.value = (
-            "<b>PP config:</b> "
-            f"alpha={float(cfg.alpha):.2f}; "
-            f"omega atoms={int(cfg.n_fibers)}; "
-            f"N/omega={int(cfg.n_per_fiber)}; "
-            f"N={total:,}; "
-            f"init={self.initialization_dropdown.label}; "
-            f"warmup={self.initializer_dropdown.label}; "
-            f"time={cfg.time_direction}; "
-            f"frames={frame_text}; "
-            f"backend={backend_text}; "
-            f"seed={int(cfg.seed)}"
-            f"{residual_text}"
-        )
 
     # -- cache + frame state ------------------------------------------------
 
@@ -2019,11 +1124,7 @@ class PeszekPoyatoDynamicsBaseWidget:
         finally:
             self._updating = False
 
-        run_config = self._config_from_controls(make_animation=True)
-        self.config = run_config
-        self._group_names = self._preview_group_names_from_controls()
-        self._ensure_fiber_traces(self._group_names)
-        self._sync_config_status()
+        run_config = self.config if self.config.make_animation else replace(self.config, make_animation=True)
         result = run_simulation(run_config)
         self._ingest_result(result)
 
@@ -2032,7 +1133,6 @@ class PeszekPoyatoDynamicsBaseWidget:
             raise ValueError("result has no trajectory; run with config.make_animation=True")
         self._result = result
         self._group_names = result.initial.group_names
-        self._ensure_fiber_traces(self._group_names, result.initial.omega_atoms)
         rng = np.random.default_rng(self.config.seed + 3)
         self._sampled_by_group = _animation_sample_indices(
             result.initial.group_id, self.config.max_animation_points_per_group, rng
@@ -2045,7 +1145,6 @@ class PeszekPoyatoDynamicsBaseWidget:
         self._frame_index = 0
         self._apply_static_payload_to_figure()
         self._apply_cached_frame(0)
-        self._sync_config_status(result)
         self._mark_cache_ready(f"Cache ready: {len(self._frame_payloads)} frames.")
 
     def _build_frame_payloads(self) -> list[dict[str, Any]]:
@@ -2073,9 +1172,7 @@ class PeszekPoyatoDynamicsBaseWidget:
                     "title": _animation_title(self.config, result, int(steps[f]), float(times[f]), f, frame_count),
                     "stats": (
                         f"frame {f + 1}/{frame_count}; step={int(steps[f])}; "
-                        f"t={float(times[f]):.4g}; time={self.config.time_direction}; "
-                        f"final residual RMS={result.rms_residual:.3g}; "
-                        f"backend={result.backend}/{result.device}/{result.dtype}"
+                        f"t={float(times[f]):.4g}; final residual RMS={result.rms_residual:.3g}"
                     ),
                 }
             )
@@ -2146,8 +1243,6 @@ class PeszekPoyatoDynamicsBaseWidget:
         self.play.disabled = True
         self.frame_slider.disabled = True
         self.cache_status_html.value = f"<span style='color:#9a6700'>{message}</span>"
-        self._sync_config_status()
-        self._sync_frame_controls(0)
 
     def _mark_cache_ready(self, message: str) -> None:
         self._cache_valid = True
@@ -2161,33 +1256,6 @@ class PeszekPoyatoDynamicsBaseWidget:
         self._sync_frame_controls(self._frame_index)
 
     # -- callbacks ----------------------------------------------------------
-
-    def _on_control_change(self, change: dict[str, Any]) -> None:
-        if self._updating or change.get("name") != "value":
-            return
-        owner = change.get("owner")
-        if owner in (
-            self.initialization_dropdown,
-            self.initializer_dropdown,
-            self.n_fibers_slider,
-            self.n_per_fiber_slider,
-            self.alpha_slider,
-            self.frame_cap_slider,
-        ):
-            self._group_names = self._preview_group_names_from_controls()
-            self._ensure_fiber_traces(self._group_names)
-            self._mark_cache_stale("Parameters changed. Precompute flow before playback.")
-            return
-
-    def _on_time_direction_toggle(self, change: dict[str, Any]) -> None:
-        if self._updating or change.get("name") != "value":
-            return
-        self._sync_time_direction_label()
-        self._mark_cache_stale("Time direction changed. Precompute flow before playback.")
-
-    def _on_resample(self, _btn: Any) -> None:
-        self._seed += 1
-        self.precompute()
 
     def _on_precompute_clicked(self, _btn: Any) -> None:
         self.precompute()
@@ -2218,10 +1286,6 @@ class PeszekPoyatoDynamicsBaseWidget:
         display(self.layout)
 
 
-class PPDynamicsWidget(PeszekPoyatoDynamicsBaseWidget):
-    """Backward-compatible PP widget name."""
-
-
 def make_dashboard(result: SimulationResult, analysis: GeometryAnalysis, config: SimulationConfig) -> go.Figure:
     """Create the reusable Plotly diagnostic dashboard."""
 
@@ -2231,7 +1295,6 @@ def make_dashboard(result: SimulationResult, analysis: GeometryAnalysis, config:
     x_final = result.x_final
     omega = result.initial.omega
     N = len(x_final)
-    colors = fiber_colors(config, result.initial.omega_atoms, len(group_names))
 
     fig = make_subplots(
         rows=3,
@@ -2258,7 +1321,7 @@ def make_dashboard(result: SimulationResult, analysis: GeometryAnalysis, config:
         if len(idx_all) == 0:
             continue
         idx = rng.choice(idx_all, size=min(config.max_plot_points_per_group, len(idx_all)), replace=False)
-        color = colors[k]
+        color = DEFAULT_PALETTE[k % len(DEFAULT_PALETTE)]
         trace_name = f"omega fiber {k + 1}: {name}"
 
         fig.add_trace(
@@ -2350,12 +1413,8 @@ def make_dashboard(result: SimulationResult, analysis: GeometryAnalysis, config:
 
 
 def write_time_diagnostics(path: Path, diagnostics: Array) -> None:
-    header = (
-        "step,time,rms_residual,max_residual,dt,field_evaluations,"
-        "accepted_steps,rejected_steps,clip_events\n"
-    )
     with path.open("w") as f:
-        f.write(header)
+        f.write("step,time,rms_residual,max_residual\n")
         for row in diagnostics:
             f.write(",".join(map(str, row)) + "\n")
 
@@ -2447,17 +1506,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--n-fibers", type=int, default=10, help="number of conserved omega groups")
     parser.add_argument("--n-per-fiber", type=int, default=2000, help="particles per omega group")
     parser.add_argument("--shapes", default=",".join(DEFAULT_SHAPES), help="comma-separated shape names, cycled across fibers")
-    parser.add_argument("--initialization-algorithm", choices=("raw", "legacy_fast_phase"), default="raw")
-    parser.add_argument("--initialization-fast-steps", type=int, default=40)
-    parser.add_argument("--initialization-fast-min-steps", type=int, default=6)
-    parser.add_argument("--initialization-fast-window", type=int, default=3)
-    parser.add_argument("--initialization-fast-displacement-tol", type=float, default=1.5e-2)
-    parser.add_argument("--color-scheme", choices=("palette", "phase_color"), default="palette")
-    parser.add_argument("--initializer-alpha", type=float, default=0.99)
-    parser.add_argument("--initializer-K", type=float, default=1.0)
-    parser.add_argument("--initializer-grid-size", type=int, default=None)
-    parser.add_argument("--initializer-domain-radius", type=float, default=None)
-    parser.add_argument("--initializer-dt", type=float, default=0.055)
     parser.add_argument("--alpha", type=float, default=0.50)
     parser.add_argument("--K", type=float, default=1.0)
     parser.add_argument("--grid-size", type=int, default=256)
@@ -2465,15 +1513,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dt", type=float, default=0.055)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--tol-rms", type=float, default=1.2e-2)
-    parser.add_argument("--backend", choices=("auto", "numpy", "torch"), default="auto")
-    parser.add_argument("--device", default=None, help="torch device override, e.g. cuda, cuda:0, mps, or cpu")
-    parser.add_argument("--dtype", choices=("auto", "float32", "float64"), default="auto")
-    parser.add_argument("--integrator", choices=("fixed_rk2", "adaptive_rk2"), default="adaptive_rk2")
-    parser.add_argument("--time-direction", choices=("forward", "backward"), default="forward")
-    parser.add_argument("--adaptive-tol", type=float, default=5.0e-3)
-    parser.add_argument("--dt-min", type=float, default=1.0e-4)
-    parser.add_argument("--dt-max", type=float, default=0.09)
-    parser.add_argument("--max-displacement-per-step", type=float, default=0.75)
     parser.add_argument("--farfield-shells", type=int, default=18)
     parser.add_argument("--angles-per-shell", type=int, default=64)
     parser.add_argument("--seed", type=int, default=None, help="random seed; omitted means choose a fresh seed for this run")
@@ -2499,37 +1538,11 @@ def config_from_args(args: argparse.Namespace) -> SimulationConfig:
         n_per_fiber=args.n_per_fiber,
         shape_names=shapes,
         seed=_seed_from_args(args.seed),
-        color_scheme=args.color_scheme,
-        initialization_algorithm=args.initialization_algorithm,
-        initializer_config=InitializerConfig(
-            alpha=args.initializer_alpha,
-            K=args.initializer_K,
-            grid_size=args.initializer_grid_size,
-            domain_radius=args.initializer_domain_radius,
-            dt=args.initializer_dt,
-            max_steps=args.initialization_fast_steps,
-            min_steps=args.initialization_fast_min_steps,
-            window=args.initialization_fast_window,
-            displacement_tol=args.initialization_fast_displacement_tol,
-        ),
-        initialization_fast_steps=args.initialization_fast_steps,
-        initialization_fast_min_steps=args.initialization_fast_min_steps,
-        initialization_fast_window=args.initialization_fast_window,
-        initialization_fast_displacement_tol=args.initialization_fast_displacement_tol,
         grid_size=args.grid_size,
         domain_radius=args.domain_radius,
         dt=args.dt,
         max_steps=args.max_steps,
         tol_rms=args.tol_rms,
-        backend=args.backend,
-        device=args.device,
-        dtype=args.dtype,
-        integrator=args.integrator,
-        time_direction=args.time_direction,
-        adaptive_tol=args.adaptive_tol,
-        dt_min=args.dt_min,
-        dt_max=args.dt_max,
-        max_displacement_per_step=args.max_displacement_per_step,
         farfield_shells=args.farfield_shells,
         angles_per_shell=args.angles_per_shell,
         out_dir=args.out_dir,
@@ -2631,7 +1644,6 @@ def _animation_title(
         "Large-N FFT Peszek--Poyato dynamics animation<br>"
         f"<sup>N={len(result.x_final):,}, fibers={len(result.initial.group_names)}, "
         f"grid={config.grid_size}^2, alpha={config.alpha}, seed={config.seed}, "
-        f"time={config.time_direction}, "
         f"frame={frame_index + 1}/{frame_count}, step={step}, t={time_value:.4g}, "
         f"final residual RMS={result.rms_residual:.3g}</sup>"
     )
