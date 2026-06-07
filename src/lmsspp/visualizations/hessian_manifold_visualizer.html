@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hessian Manifold Geometric Visualizer</title>
+  
+  <!-- Modern Google Font -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <!-- MathJax Configuration and Script for LaTeX -->
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']]
+      }
+    };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
+  <!-- React, ReactDOM, Babel (for in-browser JSX parsing), and Three.js CDN -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <style>
+    /* CSS Variables & Global Resets */
+    :root {
+      --bg-dark: #09090e;
+      --card-bg: #12121e;
+      --border-color: #2d2d44;
+      --glow-color: rgba(0, 255, 204, 0.3);
+      --font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    }
+
+    body {
+      margin: 0;
+      padding: 20px;
+      background-color: var(--bg-dark);
+      font-family: var(--font-family);
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      box-sizing: border-box;
+    }
+
+    /* Premium Custom Range Input Styles */
+    input[type="range"] {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: 6px;
+      background: #1e1e2f;
+      border-radius: 3px;
+      outline: none;
+      margin: 10px 0;
+    }
+
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #00ffcc;
+      cursor: pointer;
+      box-shadow: 0 0 10px var(--glow-color);
+      transition: transform 0.1s ease, background-color 0.1s ease;
+    }
+
+    input[type="range"]::-webkit-slider-thumb:hover {
+      transform: scale(1.25);
+      background-color: #00e6b8;
+    }
+
+    input[type="range"]::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+      border: none;
+      border-radius: 50%;
+      background: #00ffcc;
+      cursor: pointer;
+      box-shadow: 0 0 10px var(--glow-color);
+      transition: transform 0.1s ease, background-color 0.1s ease;
+    }
+
+    input[type="range"]::-moz-range-thumb:hover {
+      transform: scale(1.25);
+      background-color: #00e6b8;
+    }
+
+    /* Button Hover Effect */
+    button {
+      transition: all 0.2s ease !important;
+    }
+    button:hover {
+      filter: brightness(1.2);
+    }
+
+    /* MathJax typography refinement */
+    .mjx-chtml {
+      color: inherit !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const getExplanationText = (mode) => {
+      switch(mode) {
+        case 'minkowski':
+          return "<strong>Minkowski Hyper-Cone (\\(\\mathbb{R}^{2,1}\\)):</strong> Embedded in a 3D Minkowski space, the angle-excess cone forms a smooth, unwrinkled cone of revolution with completely straight radial rays (\\(K_{\\text{rad}} = 0\\)). The height represents the time-like coordinate \\(z(s) = \\sqrt{\\gamma^2 - 1}s\\), where the time-like metric term allows circular circumferences to expand faster than the radial distance.";
+        case 'helicoid':
+          return "<strong>Conic Helicoid (Euclidean Spiral):</strong> Avoids crowding in the flat plane by wrapping the surface into a spiral ramp. The straight radial rays are represented as the straight steps of a spiral staircase radiating from the origin. The slope climbs with the angular coordinate: \\(z \\propto \\theta\\).";
+        case 'trumpet':
+          return "<strong>Conformal Trumpet (Tractroid Horn):</strong> Sacrifices radial straightness to preserve the negative tangential curvature (\\(K_{\\text{tan}} < 0\\)). The surface flares outward aggressively as it moves away from the central mouthpiece. The speed parameter \\(\\alpha\\) dictates the flare steepness.";
+        case 'escher':
+          return "<strong>Radially Stretched 'Escher' Disk:</strong> In a standard Poincaré disk (morph = 0), tiles shrink isotropically near the boundary. In this anisotropic model (morph = 1), we subtract the exponential radial distance penalty. Radial lengths are kept linear (\\(K_{\\text{rad}} = 0\\)), causing the checkerboard tiles to stretch purely radially into needle-like spokes as they approach the boundary.";
+        case 'darting':
+          return "<strong>Hyperbolic 'Reverse-Darting' (Wedge Slices):</strong> Visualizes cutting out exponentially widening wedges from a highly curved hyperbolic sheet. When morph = 0, the flat template shows the cut-outs (darts). Sliding the morph to 1 bends and glues the remaining wedges together, closing the gaps to form the smooth Hessian cone in Minkowski space.";
+        case 'corrugated':
+          return "<strong>Corrugated Cone (Euclidean Embedding):</strong> Forces the angle excess (\\(\\gamma > 1\\)) to embed directly into Euclidean 3D space by adding corrugated ruffles. This causes the radial rays to curve up and down, violating the flat radial geodesic property of the Hessian manifold but allowing a closed embedding.";
+        default:
+          return "";
+      }
+    };
+
+    function HessianManifoldVisualizer() {
+      const containerRef = useRef(null);
+      const meshRef = useRef(null);
+      const wireframeRef = useRef(null);
+      const geometryRef = useRef(null);
+      
+      // Interactive UI States
+      const [alpha, setAlpha] = useState(0.4);
+      const [ripples, setRipples] = useState(6);
+      const [morph, setMorph] = useState(0); // Morphs parameters differently per mode
+      const [displayMode, setDisplayMode] = useState('both'); // 'surface', 'wireframe', 'both'
+      const [visMode, setVisMode] = useState('minkowski'); // 'minkowski', 'helicoid', 'trumpet', 'escher', 'darting', 'corrugated'
+
+      // Geometry grid configurations
+      const radialSegments = 50;
+      const angularSegments = 100;
+      const maxS = 4.0; // Maximum intrinsic radius
+
+      // Calculate analytical geometric outputs based on note derivations
+      const gamma = (2 - alpha) / (2 * Math.sqrt(1 - alpha));
+      const tangentialCurvatureScale = -Math.pow(alpha / (2 - alpha), 2);
+
+      // Helper to calculate vertex positions based on parameterization and morph state
+      const calculatePosition = (s, theta, currentAlpha, currentRipples, currentMorph, currentVisMode) => {
+        const gammaSq = Math.pow((2 - currentAlpha) / (2 * Math.sqrt(1 - currentAlpha)), 2);
+        const gammaVal = Math.sqrt(gammaSq);
+        const scaleFactor = Math.sqrt(gammaSq - 1);
+
+        if (currentVisMode === 'minkowski') {
+          // Smooth straight-sided cone in Minkowski Space (R^{2,1})
+          const xPrimal = gammaVal * s * Math.cos(theta);
+          const yPrimal = gammaVal * s * Math.sin(theta);
+          const zPrimal = (currentAlpha / (2 * Math.sqrt(1 - currentAlpha))) * s;
+
+          // Legendre Dual Space: w = (1/(1-alpha)) * s^{1-alpha} * x_hat
+          const dualRadius = (1 / (1 - currentAlpha)) * Math.pow(s, 1 - currentAlpha);
+          const viewScale = 1 - currentAlpha;
+          const xDual = dualRadius * Math.cos(theta) * viewScale;
+          const yDual = dualRadius * Math.sin(theta) * viewScale;
+          const zDual = 0;
+
+          return {
+            x: (1 - currentMorph) * xPrimal + currentMorph * xDual,
+            y: (1 - currentMorph) * yPrimal + currentMorph * yDual,
+            z: (1 - currentMorph) * zPrimal + currentMorph * zDual,
+            primalZ: zPrimal
+          };
+        } else if (currentVisMode === 'helicoid') {
+          // Conic Helicoid: Spiral ramp where radial rays are straight lines
+          const xPrimal = s * Math.cos(theta);
+          const yPrimal = s * Math.sin(theta);
+          // z climbs proportionally to the angle excess scaleFactor and theta
+          const zPrimal = scaleFactor * s * (theta / (2 * Math.PI));
+
+          const dualRadius = (1 / (1 - currentAlpha)) * Math.pow(s, 1 - currentAlpha);
+          const viewScale = 1 - currentAlpha;
+          const xDual = dualRadius * Math.cos(theta) * viewScale;
+          const yDual = dualRadius * Math.sin(theta) * viewScale;
+          const zDual = zPrimal;
+
+          return {
+            x: (1 - currentMorph) * xPrimal + currentMorph * xDual,
+            y: (1 - currentMorph) * yPrimal + currentMorph * yDual,
+            z: (1 - currentMorph) * zPrimal + currentMorph * zDual,
+            primalZ: zPrimal
+          };
+        } else if (currentVisMode === 'trumpet') {
+          // Conformal flaring horn representing negative tangential curvature
+          const R = s + 0.4;
+          const xPrimal = R * Math.cos(theta);
+          const yPrimal = R * Math.sin(theta);
+          const zPrimal = - (scaleFactor * 1.8) / (s + 0.3) + (scaleFactor * 1.8) / (maxS + 0.3);
+
+          const dualRadius = (1 / (1 - currentAlpha)) * Math.pow(s, 1 - currentAlpha);
+          const viewScale = 1 - currentAlpha;
+          const xDual = dualRadius * Math.cos(theta) * viewScale;
+          const yDual = dualRadius * Math.sin(theta) * viewScale;
+          const zDual = 0;
+
+          return {
+            x: (1 - currentMorph) * xPrimal + currentMorph * xDual,
+            y: (1 - currentMorph) * yPrimal + currentMorph * yDual,
+            z: (1 - currentMorph) * zPrimal + currentMorph * zDual,
+            primalZ: zPrimal
+          };
+        } else {
+          // Original Corrugated Cone (Euclidean embedding)
+          const amplitude = Math.sqrt(2 * (gammaSq - 1)) / currentRipples;
+          const xPrimal = s * Math.cos(theta);
+          const yPrimal = s * Math.sin(theta);
+          const zPrimal = amplitude * s * Math.sin(currentRipples * theta);
+
+          const dualRadius = (1 / (1 - currentAlpha)) * Math.pow(s, 1 - currentAlpha);
+          const viewScale = 1 - currentAlpha;
+          const xDual = dualRadius * Math.cos(theta) * viewScale;
+          const yDual = dualRadius * Math.sin(theta) * viewScale;
+          const zDual = 0;
+
+          return {
+            x: (1 - currentMorph) * xPrimal + currentMorph * xDual,
+            y: (1 - currentMorph) * yPrimal + currentMorph * yDual,
+            z: (1 - currentMorph) * zPrimal + currentMorph * zDual,
+            primalZ: zPrimal
+          };
+        }
+      };
+
+      // Helper function to cleanly reallocate geometry buffers based on visualization mode
+      const initGeometry = (currentVisMode) => {
+        if (!meshRef.current || !wireframeRef.current) return;
+
+        let geometry = geometryRef.current;
+        if (geometry) {
+          geometry.dispose();
+        }
+
+        geometry = new THREE.BufferGeometry();
+        geometryRef.current = geometry;
+        meshRef.current.geometry = geometry;
+        wireframeRef.current.geometry = geometry;
+
+        let positions, colors, indices;
+
+        if (currentVisMode === 'darting') {
+          // Wedge-based grid: separate segments with gaps
+          const wedgeSegments = 10;
+          const N_wedges = 6;
+          const totalVertices = (radialSegments + 1) * N_wedges * (wedgeSegments + 1);
+
+          positions = new Float32Array(totalVertices * 3);
+          colors = new Float32Array(totalVertices * 3);
+          indices = [];
+
+          for (let k = 0; k < N_wedges; k++) {
+            const offset = k * (radialSegments + 1) * (wedgeSegments + 1);
+            for (let i = 0; i < radialSegments; i++) {
+              for (let w = 0; w < wedgeSegments; w++) {
+                const a = offset + i * (wedgeSegments + 1) + w;
+                const b = offset + i * (wedgeSegments + 1) + w + 1;
+                const c = offset + (i + 1) * (wedgeSegments + 1) + w;
+                const d = offset + (i + 1) * (wedgeSegments + 1) + w + 1;
+
+                indices.push(a, b, c);
+                indices.push(b, d, c);
+              }
+            }
+          }
+        } else {
+          // Standard polar grid
+          const totalVertices = (radialSegments + 1) * (angularSegments + 1);
+          positions = new Float32Array(totalVertices * 3);
+          colors = new Float32Array(totalVertices * 3);
+          indices = [];
+
+          for (let i = 0; i < radialSegments; i++) {
+            for (let j = 0; j < angularSegments; j++) {
+              const a = i * (angularSegments + 1) + j;
+              const b = i * (angularSegments + 1) + j + 1;
+              const c = (i + 1) * (angularSegments + 1) + j;
+              const d = (i + 1) * (angularSegments + 1) + j + 1;
+
+              indices.push(a, b, c);
+              indices.push(b, d, c);
+            }
+          }
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        geometry.setIndex(indices);
+        geometry.computeVertexNormals();
+      };
+
+      // Reset morph when switching modes for better UX flow
+      const handleVisModeChange = (newMode) => {
+        setVisMode(newMode);
+        setMorph(0);
+      };
+
+      // Effect to trigger MathJax typesetting after state changes
+      useEffect(() => {
+        if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') {
+          window.MathJax.typesetPromise();
+        }
+      }, [alpha, ripples, morph, displayMode, visMode]);
+
+      // Effect 1: Initialize Three.js Scene, Camera, Renderer, and Mouse interaction
+      useEffect(() => {
+        if (!containerRef.current) return;
+
+        // Dimensions
+        const width = containerRef.current.clientWidth || 800;
+        const height = 500;
+
+        // Scene & Camera
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a12);
+
+        const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
+        camera.position.set(0, 6, 9);
+        camera.lookAt(0, 0, 0);
+
+        // Renderer
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(width, height);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        containerRef.current.appendChild(renderer.domElement);
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight1 = new THREE.DirectionalLight(0x00ffff, 0.8);
+        dirLight1.position.set(5, 10, 7);
+        scene.add(dirLight1);
+
+        const dirLight2 = new THREE.DirectionalLight(0xff00ff, 0.5);
+        dirLight2.position.set(-5, -5, 2);
+        scene.add(dirLight2);
+
+        // Dummy geometry to initialize meshes
+        const geometry = new THREE.BufferGeometry();
+        geometryRef.current = geometry;
+
+        // Materials
+        const meshMaterial = new THREE.MeshStandardMaterial({
+          vertexColors: true,
+          side: THREE.DoubleSide,
+          roughness: 0.3,
+          metalness: 0.1,
+          flatShading: true
+        });
+
+        const wireMaterial = new THREE.MeshBasicMaterial({
+          color: 0x00ffcc,
+          wireframe: true,
+          transparent: true,
+          opacity: 0.25
+        });
+
+        const mesh = new THREE.Mesh(geometry, meshMaterial);
+        const wireframe = new THREE.Mesh(geometry, wireMaterial);
+        
+        scene.add(mesh);
+        scene.add(wireframe);
+        meshRef.current = mesh;
+        wireframeRef.current = wireframe;
+
+        // Custom mouse orbiting controls (initialized on mousedown to prevent jump)
+        let isDragging = false;
+        let previousMousePosition = { x: 0, y: 0 };
+        
+        mesh.rotation.x = 0.4;
+        mesh.rotation.z = -0.2;
+        wireframe.rotation.x = 0.4;
+        wireframe.rotation.z = -0.2;
+
+        const handleMouseDown = (e) => { 
+          isDragging = true; 
+          previousMousePosition = { x: e.offsetX, y: e.offsetY };
+        };
+        const handleMouseMove = (e) => {
+          const deltaMove = {
+            x: e.offsetX - previousMousePosition.x,
+            y: e.offsetY - previousMousePosition.y
+          };
+
+          if (isDragging) {
+            mesh.rotation.z += deltaMove.x * 0.007;
+            mesh.rotation.x += deltaMove.y * 0.007;
+            wireframe.rotation.z = mesh.rotation.z;
+            wireframe.rotation.x = mesh.rotation.x;
+          }
+
+          previousMousePosition = { x: e.offsetX, y: e.offsetY };
+        };
+        const handleMouseUp = () => { isDragging = false; };
+
+        const canvasElement = renderer.domElement;
+        canvasElement.addEventListener('mousedown', handleMouseDown);
+        canvasElement.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mouseup', handleMouseUp);
+
+        // Animation Loop
+        let animationFrameId;
+        const animate = () => {
+          animationFrameId = requestAnimationFrame(animate);
+          if (!isDragging) {
+            mesh.rotation.z += 0.002;
+            wireframe.rotation.z = mesh.rotation.z;
+          }
+          renderer.render(scene, camera);
+        };
+        animate();
+
+        // Handle Window Resize
+        const handleResize = () => {
+          if (!containerRef.current) return;
+          const w = containerRef.current.clientWidth || 800;
+          camera.aspect = w / height;
+          camera.updateProjectionMatrix();
+          renderer.setSize(w, height);
+        };
+        window.addEventListener('resize', handleResize);
+
+        // Clean Up
+        return () => {
+          cancelAnimationFrame(animationFrameId);
+          window.removeEventListener('resize', handleResize);
+          canvasElement.removeEventListener('mousedown', handleMouseDown);
+          canvasElement.removeEventListener('mousemove', handleMouseMove);
+          window.removeEventListener('mouseup', handleMouseUp);
+          renderer.dispose();
+          geometry.dispose();
+          meshMaterial.dispose();
+          wireMaterial.dispose();
+          if (containerRef.current) {
+            containerRef.current.innerHTML = '';
+          }
+        };
+      }, []);
+
+      // Effect 2: High performance live vertex array updates on state shifts
+      useEffect(() => {
+        if (!geometryRef.current) return;
+
+        // First ensure the geometry buffer sizes and indices match the current visualization mode
+        initGeometry(visMode);
+
+        const geometry = geometryRef.current;
+        const positions = geometry.attributes.position.array;
+        const colors = geometry.attributes.color.array;
+
+        const gammaSq = Math.pow((2 - alpha) / (2 * Math.sqrt(1 - alpha)), 2);
+        const gammaVal = Math.sqrt(gammaSq);
+        const scaleFactor = Math.sqrt(gammaSq - 1);
+
+        if (visMode === 'darting') {
+          // Wedge-based reverse-darting calculations
+          const wedgeSegments = 10;
+          const N_wedges = 6;
+          let vIdx = 0;
+
+          for (let i = 0; i <= radialSegments; i++) {
+            const s = (i / radialSegments) * maxS;
+            // The contraction ratio. sinh(s) handles the hyperbolic space expansion
+            const ratio = Math.min(1.0, (gammaVal * s) / (Math.sinh(s) || 1e-6));
+
+            for (let k = 0; k < N_wedges; k++) {
+              const theta_c = (k / N_wedges) * Math.PI * 2;
+
+              for (let w = 0; w <= wedgeSegments; w++) {
+                const phi_norm = -1.0 + (w / wedgeSegments) * 2.0;
+                const phi_prime_val = phi_norm * (Math.PI / N_wedges);
+                const phi_val = phi_prime_val * ratio;
+
+                // 1. Flat Template (morph = 0) with cut-out wedge gaps
+                const xFlat = s * Math.cos(theta_c + phi_val);
+                const yFlat = s * Math.sin(theta_c + phi_val);
+                const zFlat = 0;
+
+                // 2. Glued Cone (morph = 1) where gaps are closed (exact Minkowski coordinates)
+                const xCone = gammaVal * s * Math.cos(theta_c + phi_prime_val);
+                const yCone = gammaVal * s * Math.sin(theta_c + phi_prime_val);
+                const zCone = (alpha / (2 * Math.sqrt(1 - alpha))) * s;
+
+                // Interpolate
+                positions[vIdx * 3] = (1 - morph) * xFlat + morph * xCone;
+                positions[vIdx * 3 + 1] = (1 - morph) * yFlat + morph * yCone;
+                positions[vIdx * 3 + 2] = (1 - morph) * zFlat + morph * zCone;
+
+                // Polar Checkerboard Mapping
+                const sRing = Math.floor(s / 0.5);
+                const thetaSector = Math.floor((theta_c + phi_prime_val) / (Math.PI / 12));
+                const isColored = (sRing + thetaSector) % 2 === 0;
+
+                const color = new THREE.Color();
+                if (isColored) {
+                  color.setHSL(0.55 + (s / maxS) * 0.15, 0.9, 0.4);
+                } else {
+                  color.setHSL(0.75 + (s / maxS) * 0.15, 0.8, 0.2);
+                }
+
+                colors[vIdx * 3] = color.r;
+                colors[vIdx * 3 + 1] = color.g;
+                colors[vIdx * 3 + 2] = color.b;
+
+                vIdx++;
+              }
+            }
+          }
+        } else if (visMode === 'escher') {
+          // Radially Stretched Escher Disk calculations
+          let vIdx = 0;
+          for (let i = 0; i <= radialSegments; i++) {
+            const s = (i / radialSegments) * maxS;
+            
+            // Standard isotropic Poincaré (morph = 0) vs Stretched disk (morph = 1)
+            const R_std = 3.5 * Math.tanh(s / 2);
+            const R_str = 3.5 * (s / (s + 1)); // v = s/(s+1)
+            const R = (1 - morph) * R_std + morph * R_str;
+
+            for (let j = 0; j <= angularSegments; j++) {
+              const theta = (j / angularSegments) * Math.PI * 2;
+
+              positions[vIdx * 3] = R * Math.cos(theta);
+              positions[vIdx * 3 + 1] = R * Math.sin(theta);
+              positions[vIdx * 3 + 2] = 0;
+
+              // Polar Checkerboard mapping with alpha-dependent angular crushing (gammaVal)
+              const sRing = Math.floor(s / 0.5);
+              const scaleScale = (1 - morph) * 1.0 + morph * gammaVal;
+              const thetaSector = Math.floor((theta * scaleScale) / (Math.PI / 12));
+              const isColored = (sRing + thetaSector) % 2 === 0;
+
+              const color = new THREE.Color();
+              if (isColored) {
+                color.setHSL(0.55 + (s / maxS) * 0.15, 0.9, 0.4);
+              } else {
+                color.setHSL(0.75 + (s / maxS) * 0.15, 0.8, 0.2);
+              }
+
+              colors[vIdx * 3] = color.r;
+              colors[vIdx * 3 + 1] = color.g;
+              colors[vIdx * 3 + 2] = color.b;
+
+              vIdx++;
+            }
+          }
+        } else {
+          // Continuous 3D modes (Minkowski, Helicoid, Trumpet, Corrugated)
+          let vIdx = 0;
+          for (let i = 0; i <= radialSegments; i++) {
+            const s = (i / radialSegments) * maxS;
+            for (let j = 0; j <= angularSegments; j++) {
+              const maxTheta = visMode === 'helicoid' ? Math.PI * 4 : Math.PI * 2;
+              const theta = (j / angularSegments) * maxTheta;
+
+              const pos = calculatePosition(s, theta, alpha, ripples, morph, visMode);
+              positions[vIdx * 3] = pos.x;
+              positions[vIdx * 3 + 1] = pos.y;
+              positions[vIdx * 3 + 2] = pos.z;
+
+              const rRatio = s / maxS;
+              const color = new THREE.Color();
+              
+              if (morph > 0.5) {
+                color.setHSL(0.25 + rRatio * 0.15, 0.95, 0.3 + (1 - morph) * 0.2);
+              } else {
+                const intensity = Math.abs(pos.primalZ) / (visMode === 'trumpet' ? 10 : maxS);
+                color.setHSL(0.55 + intensity * 0.3, 0.9, 0.2 + rRatio * 0.4);
+              }
+
+              colors[vIdx * 3] = color.r;
+              colors[vIdx * 3 + 1] = color.g;
+              colors[vIdx * 3 + 2] = color.b;
+
+              vIdx++;
+            }
+          }
+        }
+
+        geometry.attributes.position.needsUpdate = true;
+        geometry.attributes.color.needsUpdate = true;
+        geometry.computeVertexNormals();
+      }, [alpha, ripples, morph, visMode]);
+
+      // Effect 3: Handle structural Display Visibility toggles
+      useEffect(() => {
+        if (!meshRef.current || !wireframeRef.current) return;
+        meshRef.current.visible = displayMode === 'surface' || displayMode === 'both';
+        wireframeRef.current.visible = displayMode === 'wireframe' || displayMode === 'both';
+      }, [displayMode]);
+
+      // Dynamic labels for the morph slider
+      const getMorphSliderLabel = () => {
+        switch(visMode) {
+          case 'escher':
+            return `Poincaré to Stretched Disk Morph: ${(morph * 100).toFixed(0)}%`;
+          case 'darting':
+            return `Wedge Folding & Gluing Morph: ${(morph * 100).toFixed(0)}%`;
+          default:
+            return `Legendre Duality Transformation Morph: ${(morph * 100).toFixed(0)}%`;
+        }
+      };
+
+      const getMorphSliderCaption = () => {
+        switch(visMode) {
+          case 'escher':
+            return "Morphs from the standard, isotropic Poincaré disk to the radially stretched model where radial lengths are decompressed.";
+          case 'darting':
+            return "Bends and glues the flat wedge cut-outs together, closing the gaps to assemble the Minkowski cone.";
+          default:
+            return "Transforms coordinate maps between the Primal spatial grid and the Dual pushforward profile.";
+        }
+      };
+
+      return (
+        <div style={styles.card}>
+          <div style={styles.header}>
+            <h3 style={styles.title}>Hessian Manifold Geometric Visualizer</h3>
+            <p style={styles.subtitle}>
+              Modeling the Peszek–Poyato Equilibrium Space Kernel Geometry ($g_\alpha = D^2W^\alpha$)
+            </p>
+          </div>
+
+          {/* Embedding Select Panel */}
+          <div style={{ marginBottom: '16px' }}>
+            <label style={{ ...styles.label, marginBottom: '8px' }}>Embedding / Visualization Mode</label>
+            <div style={styles.buttonGroup}>
+              {[
+                { id: 'minkowski', label: 'Minkowski Hyper-Cone (R^{2,1})' },
+                { id: 'helicoid', label: 'Conic Helicoid (Spiral Ramp)' },
+                { id: 'trumpet', label: 'Conformal Trumpet (Tractroid)' },
+                { id: 'escher', label: 'Stretched Escher Disk' },
+                { id: 'darting', label: 'Reverse-Darting (Wedges)' },
+                { id: 'corrugated', label: 'Corrugated Cone (Ruffled)' }
+              ].map((mode) => (
+                <button
+                  key={mode.id}
+                  onClick={() => handleVisModeChange(mode.id)}
+                  style={{
+                    ...styles.button,
+                    ...(visMode === mode.id ? styles.activeButton : {})
+                  }}
+                >
+                  {mode.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Primary 3D Viewport Target */}
+          <div ref={containerRef} style={styles.canvasContainer} />
+          <span style={styles.dragCaption}>💡 Click and drag inside the viewport to rotate the manifold</span>
+
+          {/* Dynamic Mathematical / Physical Explanation */}
+          <div 
+            style={styles.explanationBox}
+            dangerouslySetInnerHTML={{ __html: getExplanationText(visMode) }}
+          />
+
+          {/* Live Geometric Metadata Dashboard */}
+          <div style={styles.dashboard}>
+            <div style={styles.metricBlock}>
+              <span style={styles.metricLabel}>Angular Blow-Up Scale $\gamma(\alpha)$</span>
+              <span style={styles.metricValue}>{gamma.toFixed(4)}</span>
+            </div>
+            <div style={styles.metricBlock}>
+              <span style={styles.metricLabel}>Tangential Curvature Scaling Coefficient</span>
+              <span style={styles.metricValue_neg}>{tangentialCurvatureScale.toFixed(4)} $s^{-2}$</span>
+            </div>
+            <div style={styles.metricBlock}>
+              <span style={styles.metricLabel}>Geometric Target State</span>
+              <span style={styles.metricValue_state}>
+                {visMode === 'escher' 
+                  ? (morph === 0 ? 'Standard Poincaré' : morph === 1 ? 'Stretched Disk' : 'Decompression')
+                  : visMode === 'darting'
+                  ? (morph === 0 ? 'Flat Wedges' : morph === 1 ? 'Glued Cone' : 'Gluing / Folding')
+                  : (morph === 0 ? 'Pure Primal Bulk ($x$)' : morph === 1 ? 'Pure Dual Velocity ($\omega$)' : 'Legendre Interp')}
+              </span>
+            </div>
+          </div>
+
+          {/* Parametric Controls Panel */}
+          <div style={styles.controlPanel}>
+            <div style={styles.controlRow}>
+              <label style={styles.label}>
+                <span>Interaction Parameter ($\alpha$): <strong>{alpha.toFixed(2)}</strong></span>
+                <span style={styles.caption}>Adjusts kernel speed and forces boundary expansion at infinity.</span>
+              </label>
+              <input
+                type="range"
+                min="0.0"
+                max="0.85" // Capped to prevent coordinate overflow on the canvas rendering frame
+                step="0.01"
+                value={alpha}
+                onChange={(e) => setAlpha(parseFloat(e.target.value))}
+                style={styles.slider}
+              />
+            </div>
+
+            <div style={styles.controlRow}>
+              <label style={styles.label}>
+                <span>{getMorphSliderLabel()}</span>
+                <span style={styles.caption}>{getMorphSliderCaption()}</span>
+              </label>
+              <input
+                type="range"
+                min="0.0"
+                max="1.0"
+                step="0.01"
+                value={morph}
+                onChange={(e) => setMorph(parseFloat(e.target.value))}
+                style={styles.slider}
+              />
+            </div>
+
+            {visMode === 'corrugated' && (
+              <div style={styles.controlRow}>
+                <label style={styles.label}>
+                  <span>Embedding Spatial Corrugations ($N$ Folds): <strong>{ripples}</strong></span>
+                  <span style={styles.caption}>Alters the numerical chart embedding frequency required to express angle excess in 3D.</span>
+                </label>
+                <input
+                  type="range"
+                  min="3"
+                  max="12"
+                  step="1"
+                  value={ripples}
+                  onChange={(e) => setRipples(parseInt(e.target.value))}
+                  style={styles.slider}
+                />
+              </div>
+            )}
+
+            <div style={styles.controlRow}>
+              <label style={styles.label}>Viewport Render Topography</label>
+              <div style={styles.buttonGroup}>
+                {['both', 'surface', 'wireframe'].map((mode) => (
+                  <button
+                    key={mode}
+                    onClick={() => setDisplayMode(mode)}
+                    style={{
+                      ...styles.button,
+                      ...(displayMode === mode ? styles.activeButton : {})
+                    }}
+                  >
+                    {mode.toUpperCase()}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Scoped layout styles for self-contained operation
+    const styles = {
+      card: {
+        background: '#12121e',
+        borderRadius: '12px',
+        padding: '24px',
+        color: '#e2e8f0',
+        maxWidth: '900px',
+        width: '100%',
+        margin: '0 auto',
+        boxShadow: '0 10px 25px -5px rgba(0,0,0,0.5)',
+        border: '1px solid #2d2d44',
+        boxSizing: 'border-box'
+      },
+      header: {
+        marginBottom: '16px',
+        borderBottom: '1px solid #2d2d44',
+        paddingBottom: '12px'
+      },
+      title: {
+        margin: '0 0 4px 0',
+        fontSize: '22px',
+        fontWeight: '600',
+        background: 'linear-gradient(90deg, #00ffff, #ff00ff)',
+        WebkitBackgroundClip: 'text',
+        WebkitTextFillColor: 'transparent'
+      },
+      subtitle: {
+        margin: 0,
+        fontSize: '13px',
+        color: '#94a3b8'
+      },
+      canvasContainer: {
+        width: '100%',
+        height: '500px',
+        borderRadius: '8px',
+        overflow: 'hidden',
+        position: 'relative',
+        cursor: 'grab'
+      },
+      dragCaption: {
+        display: 'block',
+        textAlign: 'center',
+        fontSize: '11px',
+        color: '#64748b',
+        marginTop: '6px'
+      },
+      explanationBox: {
+        margin: '16px 0',
+        padding: '14px',
+        background: '#0d0d15',
+        borderLeft: '4px solid #00ffcc',
+        borderRadius: '4px',
+        fontSize: '13px',
+        lineHeight: '1.6',
+        color: '#94a3b8'
+      },
+      dashboard: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+        gap: '12px',
+        margin: '20px 0',
+        background: '#0e0e17',
+        padding: '16px',
+        borderRadius: '8px',
+        border: '1px solid #1e1e2f'
+      },
+      metricBlock: {
+        display: 'flex',
+        flexDirection: 'column'
+      },
+      metricLabel: {
+        fontSize: '11px',
+        color: '#64748b',
+        textTransform: 'uppercase',
+        letterSpacing: '0.05em'
+      },
+      metricValue: {
+        fontSize: '18px',
+        fontWeight: '700',
+        color: '#00ffcc',
+        marginTop: '2px'
+      },
+      metricValue_neg: {
+        fontSize: '18px',
+        fontWeight: '700',
+        color: '#ff00aa',
+        marginTop: '2px'
+      },
+      metricValue_state: {
+        fontSize: '18px',
+        fontWeight: '700',
+        color: '#ffcc00',
+        marginTop: '2px'
+      },
+      controlPanel: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '16px'
+      },
+      controlRow: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '6px'
+      },
+      label: {
+        fontSize: '14px',
+        color: '#cbd5e1',
+        display: 'flex',
+        flexDirection: 'column'
+      },
+      caption: {
+        fontSize: '11px',
+        color: '#64748b',
+        marginTop: '2px'
+      },
+      slider: {
+        width: '100%',
+        accentColor: '#00ffcc',
+        cursor: 'pointer',
+        background: '#1e1e2f',
+        height: '6px',
+        borderRadius: '3px'
+      },
+      buttonGroup: {
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: '8px',
+        marginTop: '4px'
+      },
+      button: {
+        background: '#1e1e2f',
+        border: '1px solid #3d3d5c',
+        color: '#94a3b8',
+        padding: '8px 16px',
+        borderRadius: '6px',
+        cursor: 'pointer',
+        fontSize: '12px',
+        fontWeight: '600',
+        outline: 'none'
+      },
+      activeButton: {
+        background: '#00ffcc',
+        borderColor: '#00ffcc',
+        color: '#0a0a12',
+        boxShadow: '0 0 10px rgba(0,255,204,0.3)'
+      }
+    };
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<HessianManifoldVisualizer />);
+  </script>
+</body>
+</html>
