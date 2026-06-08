@@ -7,8 +7,7 @@ This module evolves particles with fixed conserved labels ``omega_i`` by
 
 where ``A_rho`` is approximated on a regular grid by CIC deposition and FFT
 convolution.  The hot field-evaluation loop can run on NumPy or torch
-CPU/CUDA/MPS backends, while public results remain NumPy arrays.  The original
-one-off script is kept as the default example, but all pieces are now callable
+CPU/CUDA/MPS backends, while public results remain NumPy arrays.  All pieces are callable
 for arbitrary fiber layouts, shape families, and prebuilt initial conditions.
 
 Typical use:
@@ -61,6 +60,8 @@ BackendChoice = Literal["auto", "numpy", "torch"]
 DTypeChoice = Literal["auto", "float32", "float64"]
 IntegratorChoice = Literal["fixed_rk2", "adaptive_rk2"]
 TimeDirectionChoice = Literal["forward", "backward"]
+ExternalFieldChoice = Literal["affine", "projective"]
+SecondPanelChoice = Literal["heatmap", "velocity"]
 InitializationAlgorithmChoice = Literal["raw", "legacy_fast_phase"]
 ColorSchemeChoice = Literal["palette", "phase_color"]
 
@@ -166,6 +167,8 @@ class SimulationConfig:
     dtype: DTypeChoice = "auto"
     integrator: IntegratorChoice = "adaptive_rk2"
     time_direction: TimeDirectionChoice = "forward"
+    external_field: ExternalFieldChoice = "affine"
+    projective_epsilon: float = 0.0
     adaptive_tol: float = 5.0e-3
     dt_min: float = 1.0e-4
     dt_max: float = 0.09
@@ -260,8 +263,10 @@ class FFTPeszekPoyato2D:
     """Grid/FFT evaluator for the PP interaction field and Hessian metric."""
 
     def __init__(self, alpha: float, K: float, grid_size: int, domain_radius: float):
-        if alpha >= 1:
-            raise ValueError("alpha must be < 1 for the current PP kernel normalization")
+        if not 0.0 <= alpha <= 2.0:
+            raise ValueError("alpha must lie in [0, 2] for the PP kernel normalization")
+        if abs(alpha - 1.0) < 1e-9:
+            raise ValueError("alpha = 1 is the singular PP point (1/(1-alpha) diverges); choose alpha != 1")
         if grid_size < 4:
             raise ValueError("grid_size must be at least 4")
         if domain_radius <= 0:
@@ -345,6 +350,16 @@ class FFTPeszekPoyato2D:
         A, _ = self.A_at_particles(x)
         return omega - A, A
 
+    def projective_external(self, x: Array, omega: Array, eps: float) -> Array:
+        """Projective external drift E_eps(omega, x) = eps^{-1} S[eps*omega, x].
+
+        Implements the section 5.2 bracket field with the canonical embedding
+        ``p(omega) = eps * omega``.  As ``eps -> 0`` this returns ``omega`` (the
+        affine Peszek--Poyato label), recovering the flat external gauge.
+        """
+
+        return _projective_external_numpy(np.asarray(x, dtype=np.float64), np.asarray(omega, dtype=np.float64), float(eps))
+
     def hessian_grid_from_rho(self, rho_grid: Array) -> tuple[Array, Array, Array]:
         return self.convolve_fields(rho_grid, (self.fft_Hxx, self.fft_Hxy, self.fft_Hyy))  # type: ignore[return-value]
 
@@ -392,8 +407,10 @@ class TorchPeszekPoyato2D:
     ):
         if torch is None:  # pragma: no cover - guarded by backend selection
             raise RuntimeError("torch is not available")
-        if alpha >= 1:
-            raise ValueError("alpha must be < 1 for the current PP kernel normalization")
+        if not 0.0 <= alpha <= 2.0:
+            raise ValueError("alpha must lie in [0, 2] for the PP kernel normalization")
+        if abs(alpha - 1.0) < 1e-9:
+            raise ValueError("alpha = 1 is the singular PP point (1/(1-alpha) diverges); choose alpha != 1")
         if grid_size < 4:
             raise ValueError("grid_size must be at least 4")
         if domain_radius <= 0:
@@ -491,6 +508,22 @@ class TorchPeszekPoyato2D:
     def velocity(self, x: Any, omega: Any) -> tuple[Any, Any]:
         A, _ = self.A_at_particles(x)
         return omega - A, A
+
+    def projective_external(self, x: Any, omega: Any, eps: float) -> Any:
+        """Projective external drift E_eps(omega, x) = eps^{-1} S[eps*omega, x].
+
+        Torch counterpart of the NumPy bracket field used by the projective
+        Peszek--Poyato gauge; ``eps -> 0`` returns the affine label ``omega``.
+        """
+
+        eps = float(eps)
+        if eps == 0.0:
+            return omega
+        omega_sq = torch.sum(omega * omega, dim=1, keepdim=True)
+        x_sq = torch.sum(x * x, dim=1, keepdim=True)
+        dot = torch.sum(omega * x, dim=1, keepdim=True)
+        kappa = 1.0 - 2.0 * eps * dot + (eps * eps) * omega_sq * x_sq
+        return (omega - eps * omega_sq * x) / kappa
 
     def hessian_grid_from_rho(self, rho_grid: Any) -> tuple[Any, Any, Any]:
         return self.convolve_fields(rho_grid, (self.fft_Hxx, self.fft_Hxy, self.fft_Hyy))  # type: ignore[return-value]
@@ -713,6 +746,59 @@ def interp_grid_with_weights(field: Array, weights: tuple[Array, Array, Array, A
     )
 
 
+def cs_kappa(a: Array, b: Array) -> Array:
+    """Conformal denominator kappa[a, b] = 1 - 2<a,b> + |a|^2 |b|^2 (rowwise)."""
+
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    dot = np.sum(a * b, axis=-1)
+    a_sq = np.sum(a * a, axis=-1)
+    b_sq = np.sum(b * b, axis=-1)
+    return 1.0 - 2.0 * dot + a_sq * b_sq
+
+
+def cs_cost(a: Array, b: Array) -> Array:
+    """Symmetric logarithmic projective cost c_S(a, b) = -1/2 log kappa[a, b]."""
+
+    return -0.5 * np.log(cs_kappa(a, b))
+
+
+def inversive_bracket(a: Array, b: Array) -> Array:
+    """Inversive bracket S[a, b] = (a - |a|^2 b) / kappa[a, b] (rational extension).
+
+    This is grad_b c_S(a, b); for nonzero a it equals (a^+ - b)^+.
+    """
+
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    a_sq = np.sum(a * a, axis=-1, keepdims=True)
+    kappa = cs_kappa(a, b)[..., None]
+    return (a - a_sq * b) / kappa
+
+
+def _projective_external_numpy(x: Array, omega: Array, eps: float) -> Array:
+    eps = float(eps)
+    if eps == 0.0:
+        return omega
+    omega_sq = np.sum(omega * omega, axis=1, keepdims=True)
+    x_sq = np.sum(x * x, axis=1, keepdims=True)
+    dot = np.sum(omega * x, axis=1, keepdims=True)
+    kappa = 1.0 - 2.0 * eps * dot + (eps * eps) * omega_sq * x_sq
+    return (omega - eps * omega_sq * x) / kappa
+
+
+def projective_external_field(omega: Array, x: Array, eps: float) -> Array:
+    """External drift of the projective Peszek--Poyato gauge.
+
+    Returns ``E_eps(omega, x) = eps^{-1} S[eps*omega, x]`` with the canonical
+    embedding ``p(omega) = eps*omega``.  By the affine-tangent corollary this
+    converges to the affine label ``omega`` as ``eps -> 0``, so ``eps`` is a
+    single deformation knob between the flat (affine) and projective fields.
+    """
+
+    return _projective_external_numpy(np.asarray(x, dtype=np.float64), np.asarray(omega, dtype=np.float64), float(eps))
+
+
 def direct_hessian_at(
     points: Array,
     sources: Array,
@@ -816,6 +902,23 @@ def run_simulation(config: SimulationConfig, initial: InitialCondition | None = 
     t = 0.0
     time_sign = -1.0 if config.time_direction == "backward" else 1.0
 
+    proj_eps = float(config.projective_epsilon)
+    use_projective = config.external_field == "projective" and proj_eps != 0.0
+
+    def velocity_fn(state_x: Any) -> tuple[Any, Any]:
+        """RHS of the (affine or projective) Peszek--Poyato field at ``state_x``.
+
+        Affine:      v = omega - A_rho(state_x)
+        Projective:  v = E_eps(omega, state_x) - A_rho(state_x),
+        where the interaction term ``A_rho`` (the FFT field) is shared.
+        """
+
+        if not use_projective:
+            return solver.velocity(state_x, omega)
+        A_loc, _ = solver.A_at_particles(state_x)
+        drift = solver.projective_external(state_x, omega, proj_eps)
+        return drift - A_loc, A_loc
+
     def record_trajectory(step_: int, x_: Any, time_: float, *, force: bool = False) -> None:
         if not config.make_animation:
             return
@@ -855,7 +958,7 @@ def run_simulation(config: SimulationConfig, initial: InitialCondition | None = 
         dt_fixed = float(config.dt)
         for _ in range(config.max_steps + 1):
             record_trajectory(accepted_steps, x, t)
-            vf, _ = solver.velocity(x, omega)
+            vf, _ = velocity_fn(x)
             field_evaluations += 1
             rms, maxv = solver.speed_stats(vf)
             if accepted_steps % config.record_every == 0:
@@ -866,7 +969,7 @@ def run_simulation(config: SimulationConfig, initial: InitialCondition | None = 
                 break
             x_pred, clipped = solver.clip_inside_with_count(x + time_sign * dt_fixed * vf)
             clip_events += clipped
-            k2, _ = solver.velocity(x_pred, omega)
+            k2, _ = velocity_fn(x_pred)
             field_evaluations += 1
             x = x + 0.5 * time_sign * dt_fixed * (vf + k2)
             x = solver.center(x)
@@ -878,7 +981,7 @@ def run_simulation(config: SimulationConfig, initial: InitialCondition | None = 
     else:
         while True:
             record_trajectory(accepted_steps, x, t)
-            vf, _ = solver.velocity(x, omega)
+            vf, _ = velocity_fn(x)
             field_evaluations += 1
             rms, maxv = solver.speed_stats(vf)
             if accepted_steps % config.record_every == 0:
@@ -892,7 +995,7 @@ def run_simulation(config: SimulationConfig, initial: InitialCondition | None = 
             while True:
                 x_pred, clipped = solver.clip_inside_with_count(x + time_sign * trial_dt * vf)
                 clip_events += clipped
-                k2, _ = solver.velocity(x_pred, omega)
+                k2, _ = velocity_fn(x_pred)
                 field_evaluations += 1
                 x_euler = x + time_sign * trial_dt * vf
                 x_heun = x + 0.5 * time_sign * trial_dt * (vf + k2)
@@ -925,7 +1028,11 @@ def run_simulation(config: SimulationConfig, initial: InitialCondition | None = 
     x_final = solver.to_numpy(x).copy()
     A_final = solver.to_numpy(A_final_backend)
     rho_grid = solver.to_numpy(rho_grid_backend)
-    residual = initial.omega - A_final
+    if use_projective:
+        drift_final = solver.to_numpy(solver.projective_external(x, omega, proj_eps))
+        residual = drift_final - A_final
+    else:
+        residual = initial.omega - A_final
     residual_speed2 = np.sum(residual * residual, axis=1)
     dt_min_observed, dt_max_observed, dt_mean = _dt_history_summary(dt_history)
     return SimulationResult(
@@ -1083,6 +1190,10 @@ def _validate_runtime_config(config: SimulationConfig) -> None:
         raise ValueError("integrator must be 'fixed_rk2' or 'adaptive_rk2'")
     if config.time_direction not in ("forward", "backward"):
         raise ValueError("time_direction must be 'forward' or 'backward'")
+    if config.external_field not in ("affine", "projective"):
+        raise ValueError("external_field must be 'affine' or 'projective'")
+    if not np.isfinite(config.projective_epsilon) or config.projective_epsilon < 0:
+        raise ValueError("projective_epsilon must be a finite, non-negative number")
     if config.dt <= 0:
         raise ValueError("dt must be positive")
     if config.dt_min <= 0:
@@ -1612,16 +1723,21 @@ def make_dynamics_widget(
     *,
     width: int = 1450,
     height: int = 720,
+    second_panel: SecondPanelChoice = "velocity",
 ) -> "PPDynamicsWidget":
     """Build the interactive notebook animation widget.
 
     Mirrors the precompute / play / step / frame-slider caching model of
     ``LMSOpticalDiskWidget``: every frame is precomputed once, then playback
-    only swaps cached arrays into the existing traces, so the joint-density
-    heatmap updates in place instead of being redrawn each frame.
+    only swaps cached arrays into the existing traces, so the right-hand panel
+    updates in place instead of being redrawn each frame.
+
+    ``second_panel`` selects the right-hand subplot: ``"velocity"`` (default)
+    scatters the per-particle velocity ``x_dot_i`` with the same fiber colors as
+    the left panel, while ``"heatmap"`` shows the precomputed joint density.
     """
 
-    return PPDynamicsWidget(config, result=result, width=width, height=height)
+    return PPDynamicsWidget(config, result=result, width=width, height=height, second_panel=second_panel)
 
 
 class PeszekPoyatoDynamicsBaseWidget:
@@ -1651,17 +1767,21 @@ class PeszekPoyatoDynamicsBaseWidget:
         *,
         width: int = 1450,
         height: int = 720,
+        second_panel: SecondPanelChoice = "velocity",
     ) -> None:
         if widgets is None:
             raise RuntimeError(
                 "PeszekPoyatoDynamicsBaseWidget requires ipywidgets (install the 'widgets' extra) "
                 "and a live notebook kernel."
             )
+        if second_panel not in ("heatmap", "velocity"):
+            raise ValueError("second_panel must be 'heatmap' or 'velocity'")
         self.config = config
         self._seed = int(config.seed)
         self._init_preset = _initialization_preset_from_config(config)
         self.width = int(width)
         self.height = int(height)
+        self._second_panel: SecondPanelChoice = second_panel
 
         self._result: SimulationResult | None = None
         self._frame_payloads: list[dict[str, Any]] = []
@@ -1671,6 +1791,7 @@ class PeszekPoyatoDynamicsBaseWidget:
         self._sampled_by_group: list[Array] = []
         self._density_axis: Array | None = None
         self._zmax = 1.0
+        self._vmax = 1.0
         self._fiber_trace_count = 0
 
         fibers = _normalize_fibers(config)
@@ -1700,11 +1821,17 @@ class PeszekPoyatoDynamicsBaseWidget:
     # -- construction -------------------------------------------------------
 
     def _layout_header_html(self) -> str:
+        if self._second_panel == "velocity":
+            right = (
+                "Right: negative-velocity scatter (-x_dot_i) of the same sampled particles (same colors); "
+                "near the origin when settled, spread out when moving fast."
+            )
+        else:
+            right = "Right: precomputed joint spatial density."
         return (
             "<b>Peszek--Poyato large-N FFT dynamics</b><br>"
-            "Left: sampled per-omega fiber particles. Right: precomputed joint "
-            "spatial density. Precompute caches every step, then Play/Step/slider "
-            "swap cached frames in place."
+            f"Left: sampled per-omega fiber particles. {right} "
+            "Precompute caches every step, then Play/Step/slider swap cached frames in place."
         )
 
     def _header_html(self) -> str:
@@ -1737,12 +1864,24 @@ class PeszekPoyatoDynamicsBaseWidget:
         self.alpha_slider = widgets.FloatSlider(
             value=float(self.config.alpha),
             min=0.0,
-            max=0.999,
+            max=2.0,
             step=0.001,
             description="alpha",
             readout_format=".3f",
             continuous_update=False,
-            layout=widgets.Layout(width="260px"),
+            tooltip="PP kernel order: alpha in [0,1) is the classic regime, (1,2] the renormalized W^alpha family (alpha->2 is the -log|x| kernel); alpha=1 is singular.",
+            layout=widgets.Layout(width="780px"),
+        )
+        self.K_slider = widgets.FloatSlider(
+            value=float(self.config.K),
+            min=0.0,
+            max=max(5.0, 4.0 * float(self.config.K)),
+            step=0.01,
+            description="K",
+            readout_format=".2f",
+            continuous_update=False,
+            tooltip="Coupling strength multiplying the PP interaction force K grad W^alpha * rho.",
+            layout=widgets.Layout(width="780px"),
         )
         self.n_fibers_slider = widgets.IntSlider(
             value=n_fibers,
@@ -1751,7 +1890,7 @@ class PeszekPoyatoDynamicsBaseWidget:
             step=1,
             description="omega atoms",
             continuous_update=False,
-            layout=widgets.Layout(width="260px"),
+            layout=widgets.Layout(width="410px"),
         )
         self.n_per_fiber_slider = widgets.IntSlider(
             value=n_per_fiber,
@@ -1760,7 +1899,7 @@ class PeszekPoyatoDynamicsBaseWidget:
             step=1,
             description="N/omega",
             continuous_update=False,
-            layout=widgets.Layout(width="260px"),
+            layout=widgets.Layout(width="410px"),
         )
         self.btn_resample = widgets.Button(
             description="Resample x^0",
@@ -1824,12 +1963,13 @@ class PeszekPoyatoDynamicsBaseWidget:
                     [
                         self.initialization_dropdown,
                         self.initializer_dropdown,
-                        self.alpha_slider,
                         self.n_fibers_slider,
                         self.n_per_fiber_slider,
                         self.btn_resample,
                     ]
                 ),
+                widgets.HBox([self.alpha_slider]),
+                widgets.HBox([self.K_slider]),
                 widgets.HBox(
                     [
                         self.config_status_html,
@@ -1843,14 +1983,19 @@ class PeszekPoyatoDynamicsBaseWidget:
         )
 
     def _build_figure(self) -> None:
+        velocity_panel = self._second_panel == "velocity"
+        second_title = (
+            "Negative velocity scatter (-x_dot_i = A_rho - omega_i)" if velocity_panel else "Precomputed joint density rho_t"
+        )
+        second_spec = {"type": "scatter"} if velocity_panel else {"type": "heatmap"}
         fig = go.FigureWidget(
             make_subplots(
                 rows=1,
                 cols=2,
-                specs=[[{"type": "scatter"}, {"type": "heatmap"}]],
+                specs=[[{"type": "scatter"}, second_spec]],
                 subplot_titles=[
                     "Per-omega fiber particle dynamics",
-                    "Precomputed joint density rho_t",
+                    second_title,
                 ],
                 horizontal_spacing=0.08,
             )
@@ -1860,28 +2005,32 @@ class PeszekPoyatoDynamicsBaseWidget:
         self._fiber_trace_count = 0
         self._ensure_fiber_traces(self._group_names)
 
-        fig.add_trace(
-            go.Heatmap(
-                x=[],
-                y=[],
-                z=[[0.0]],
-                colorscale="Viridis",
-                zmin=0.0,
-                zmax=1.0,
-                zsmooth=False,
-                colorbar=dict(title="mass"),
-                name="rho_t",
-            ),
-            row=1,
-            col=2,
-        )
-        self.tr["density"] = len(fig.data) - 1
-
         r = self.config.domain_radius
         fig.update_xaxes(title_text="x1", range=[-r, r], scaleanchor="y", scaleratio=1, row=1, col=1)
         fig.update_yaxes(title_text="x2", range=[-r, r], row=1, col=1)
-        fig.update_xaxes(title_text="x1", range=[-r, r], row=1, col=2)
-        fig.update_yaxes(title_text="x2", range=[-r, r], scaleanchor="x2", scaleratio=1, row=1, col=2)
+        if velocity_panel:
+            v = float(self._vmax)
+            fig.update_xaxes(title_text="v1", range=[-v, v], row=1, col=2)
+            fig.update_yaxes(title_text="v2", range=[-v, v], scaleanchor="x2", scaleratio=1, row=1, col=2)
+        else:
+            fig.add_trace(
+                go.Heatmap(
+                    x=[],
+                    y=[],
+                    z=[[0.0]],
+                    colorscale="Viridis",
+                    zmin=0.0,
+                    zmax=1.0,
+                    zsmooth=False,
+                    colorbar=dict(title="mass"),
+                    name="rho_t",
+                ),
+                row=1,
+                col=2,
+            )
+            self.tr["density"] = len(fig.data) - 1
+            fig.update_xaxes(title_text="x1", range=[-r, r], row=1, col=2)
+            fig.update_yaxes(title_text="x2", range=[-r, r], scaleanchor="x2", scaleratio=1, row=1, col=2)
         fig.update_layout(
             width=self.width,
             height=self.height,
@@ -1893,6 +2042,7 @@ class PeszekPoyatoDynamicsBaseWidget:
     def _ensure_fiber_traces(self, group_names: Sequence[str], omega_atoms: Array | None = None) -> None:
         if not hasattr(self, "fig"):
             return
+        velocity_panel = self._second_panel == "velocity"
         colors = fiber_colors(self.config, omega_atoms, len(group_names))
         while self._fiber_trace_count < len(group_names):
             k = self._fiber_trace_count
@@ -1911,26 +2061,48 @@ class PeszekPoyatoDynamicsBaseWidget:
                 col=1,
             )
             self.tr[f"fiber{k}"] = len(self.fig.data) - 1
+            if velocity_panel:
+                self.fig.add_trace(
+                    go.Scatter(
+                        x=[],
+                        y=[],
+                        mode="markers",
+                        marker=dict(size=4, color=color, opacity=0.70),
+                        name=f"fiber {k + 1}: {group_names[k]}",
+                        legendgroup=f"fiber{k}",
+                        showlegend=False,
+                        visible=True,
+                    ),
+                    row=1,
+                    col=2,
+                )
+                self.tr[f"vfiber{k}"] = len(self.fig.data) - 1
             self._fiber_trace_count += 1
 
         with self.fig.batch_update():
             for k in range(self._fiber_trace_count):
-                trace = self.fig.data[self.tr[f"fiber{k}"]]
-                if k < len(group_names):
-                    trace.name = f"fiber {k + 1}: {group_names[k]}"
-                    trace.legendgroup = f"fiber{k}"
-                    trace.marker.color = colors[k]
-                    trace.visible = True
-                else:
-                    trace.x = []
-                    trace.y = []
-                    trace.visible = False
+                visible = k < len(group_names)
+                for prefix in ("fiber", "vfiber"):
+                    key = f"{prefix}{k}"
+                    if key not in self.tr:
+                        continue
+                    trace = self.fig.data[self.tr[key]]
+                    if visible:
+                        trace.name = f"fiber {k + 1}: {group_names[k]}"
+                        trace.legendgroup = f"fiber{k}"
+                        trace.marker.color = colors[k]
+                        trace.visible = True
+                    else:
+                        trace.x = []
+                        trace.y = []
+                        trace.visible = False
 
     def _bind_callbacks(self) -> None:
         for ctl in (
             self.initialization_dropdown,
             self.initializer_dropdown,
             self.alpha_slider,
+            self.K_slider,
             self.n_fibers_slider,
             self.n_per_fiber_slider,
             self.frame_cap_slider,
@@ -1963,6 +2135,7 @@ class PeszekPoyatoDynamicsBaseWidget:
         return replace(
             self.config,
             alpha=float(self.alpha_slider.value),
+            K=float(self.K_slider.value),
             n_fibers=int(self.n_fibers_slider.value),
             n_per_fiber=int(self.n_per_fiber_slider.value),
             fibers=None,
@@ -1988,6 +2161,7 @@ class PeszekPoyatoDynamicsBaseWidget:
         self.config_status_html.value = (
             "<b>PP config:</b> "
             f"alpha={float(cfg.alpha):.2f}; "
+            f"K={float(cfg.K):.2f}; "
             f"omega atoms={int(cfg.n_fibers)}; "
             f"N/omega={int(cfg.n_per_fiber)}; "
             f"N={total:,}; "
@@ -2057,6 +2231,10 @@ class PeszekPoyatoDynamicsBaseWidget:
         times = np.asarray(result.trajectory_times, dtype=np.float64)
         frame_count = trajectory_x.shape[0]
 
+        velocity_panel = self._second_panel == "velocity"
+        velocity_frames = self._compute_trajectory_velocities(trajectory_x) if velocity_panel else None
+        vmax = 1e-6
+
         payloads: list[dict[str, Any]] = []
         for f in range(frame_count):
             fiber_x: list[Array] = []
@@ -2065,23 +2243,68 @@ class PeszekPoyatoDynamicsBaseWidget:
                 idx = self._sampled_by_group[k]
                 fiber_x.append(trajectory_x[f, idx, 0])
                 fiber_y.append(trajectory_x[f, idx, 1])
-            payloads.append(
-                {
-                    "fiber_x": fiber_x,
-                    "fiber_y": fiber_y,
-                    "density_z": trajectory_rho[f].T,
-                    "title": _animation_title(self.config, result, int(steps[f]), float(times[f]), f, frame_count),
-                    "stats": (
-                        f"frame {f + 1}/{frame_count}; step={int(steps[f])}; "
-                        f"t={float(times[f]):.4g}; time={self.config.time_direction}; "
-                        f"final residual RMS={result.rms_residual:.3g}; "
-                        f"backend={result.backend}/{result.device}/{result.dtype}"
-                    ),
-                }
-            )
+            payload: dict[str, Any] = {
+                "fiber_x": fiber_x,
+                "fiber_y": fiber_y,
+                "title": _animation_title(self.config, result, int(steps[f]), float(times[f]), f, frame_count),
+                "stats": (
+                    f"frame {f + 1}/{frame_count}; step={int(steps[f])}; "
+                    f"t={float(times[f]):.4g}; time={self.config.time_direction}; "
+                    f"final residual RMS={result.rms_residual:.3g}; "
+                    f"backend={result.backend}/{result.device}/{result.dtype}"
+                ),
+            }
+            if velocity_panel:
+                assert velocity_frames is not None
+                vframe = velocity_frames[f]
+                vfiber_x: list[Array] = []
+                vfiber_y: list[Array] = []
+                for k in range(len(self._group_names)):
+                    idx = self._sampled_by_group[k]
+                    vfiber_x.append(vframe[idx, 0])
+                    vfiber_y.append(vframe[idx, 1])
+                    if idx.size:
+                        vmax = max(vmax, float(np.max(np.abs(vframe[idx]))))
+                payload["vfiber_x"] = vfiber_x
+                payload["vfiber_y"] = vfiber_y
+            else:
+                payload["density_z"] = trajectory_rho[f].T
+            payloads.append(payload)
+
+        self._vmax = vmax * 1.08 if velocity_panel else self._vmax
         return payloads
 
+    def _compute_trajectory_velocities(self, trajectory_x: Array) -> Array:
+        """Per-frame negative PP velocity -x_dot = A_rho(x) - external(x) per particle.
+
+        Recomputes the same affine/projective field that ``run_simulation`` uses,
+        from the cached frame positions, then negates it so the right-hand scatter
+        shows ``-x_dot_i`` for each displayed particle.
+        """
+
+        result = self._result
+        assert result is not None
+        solver = FFTPeszekPoyato2D(
+            self.config.alpha, self.config.K, self.config.grid_size, self.config.domain_radius
+        )
+        omega = np.asarray(result.initial.omega, dtype=np.float64)
+        eps = float(self.config.projective_epsilon)
+        use_projective = self.config.external_field == "projective" and eps != 0.0
+        frames = np.empty_like(trajectory_x)
+        for f in range(trajectory_x.shape[0]):
+            xf = solver.clip_inside(trajectory_x[f])
+            A, _ = solver.A_at_particles(xf)
+            external = solver.projective_external(xf, omega, eps) if use_projective else omega
+            frames[f] = A - external
+        return frames
+
     def _apply_static_payload_to_figure(self) -> None:
+        if self._second_panel == "velocity":
+            v = float(self._vmax)
+            with self.fig.batch_update():
+                self.fig.update_xaxes(range=[-v, v], row=1, col=2)
+                self.fig.update_yaxes(range=[-v, v], row=1, col=2)
+            return
         if self._density_axis is None:
             return
         axis = _plotly_values(self._density_axis)
@@ -2097,12 +2320,18 @@ class PeszekPoyatoDynamicsBaseWidget:
             return
         idx = int(np.clip(int(frame_idx), 0, len(self._frame_payloads) - 1))
         payload = self._frame_payloads[idx]
+        velocity_panel = self._second_panel == "velocity"
         with self.fig.batch_update():
             for k in range(len(self._group_names)):
                 trace = self.fig.data[self.tr[f"fiber{k}"]]
                 trace.x = _plotly_values(payload["fiber_x"][k])
                 trace.y = _plotly_values(payload["fiber_y"][k])
-            self.fig.data[self.tr["density"]].z = _plotly_values(payload["density_z"])
+                if velocity_panel:
+                    vtrace = self.fig.data[self.tr[f"vfiber{k}"]]
+                    vtrace.x = _plotly_values(payload["vfiber_x"][k])
+                    vtrace.y = _plotly_values(payload["vfiber_y"][k])
+            if not velocity_panel:
+                self.fig.data[self.tr["density"]].z = _plotly_values(payload["density_z"])
             self.fig.layout.title.text = payload["title"]
         self.stats_html.value = payload["stats"]
 
@@ -2172,6 +2401,7 @@ class PeszekPoyatoDynamicsBaseWidget:
             self.n_fibers_slider,
             self.n_per_fiber_slider,
             self.alpha_slider,
+            self.K_slider,
             self.frame_cap_slider,
         ):
             self._group_names = self._preview_group_names_from_controls()
@@ -2220,6 +2450,129 @@ class PeszekPoyatoDynamicsBaseWidget:
 
 class PPDynamicsWidget(PeszekPoyatoDynamicsBaseWidget):
     """Backward-compatible PP widget name."""
+
+
+class ProjectivePeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsBaseWidget):
+    """PP dynamics widget with an optional projective (c_S) external gauge.
+
+    This subclass is a thin extension of :class:`PeszekPoyatoDynamicsBaseWidget`.
+    It inherits the entire control / cache / playback / figure machinery and only
+    adds the controls and config wiring needed to select between two external
+    gauges of the same fibered transport ray:
+
+    * **affine** (default, identical to the base widget) ::
+
+          dot x_i = omega_i - K grad W^alpha * rho(x_i)
+
+    * **projective** (section 5.2 of the inversive gauge manuscript) replaces the
+      affine label ``omega`` by the inversive bracket field
+      ``S[p(omega), x]`` with the canonical embedding ``p(omega) = eps * omega`` ::
+
+          dot x_i = E_eps(omega_i, x_i) - K grad W^alpha * rho(x_i),
+          E_eps(omega, x) = eps^{-1} S[eps*omega, x]
+                          = (omega - eps |omega|^2 x)
+                            / (1 - 2 eps <omega, x> + eps^2 |omega|^2 |x|^2).
+
+      The affine-tangent corollary ``eps^{-1} S[eps*omega, x] -> omega`` means the
+      ``eps`` slider is a single deformation knob: ``eps = 0`` reproduces the flat
+      Peszek--Poyato field exactly, ``eps > 0`` bends the external drift along the
+      projective bracket ray.
+
+    The actual change of dynamics lives entirely in the (inherited) precompute
+    path: this widget only sets ``external_field`` / ``projective_epsilon`` on the
+    :class:`SimulationConfig`, and ``run_simulation`` dispatches the velocity to
+    the projective bracket when requested.  Any future control or rendering hook
+    added to the base class is therefore inherited automatically; only the gauge
+    selection is overridden here.
+    """
+
+    def _layout_header_html(self) -> str:
+        return (
+            "<b>Peszek--Poyato dynamics &mdash; affine / projective (c<sub>S</sub>) external gauge</b><br>"
+            "Affine: x&#775;<sub>i</sub>=&omega;<sub>i</sub>&minus;K&nabla;W<sup>&alpha;</sup>&lowast;&rho;. "
+            "Projective: x&#775;<sub>i</sub>=&epsilon;<sup>&minus;1</sup>S[&epsilon;&omega;<sub>i</sub>,x<sub>i</sub>]&minus;K&nabla;W<sup>&alpha;</sup>&lowast;&rho; "
+            "(&epsilon;&rarr;0 recovers the affine field). "
+            "Left: per-omega fiber particles. Right: precomputed joint density."
+        )
+
+    def _build_controls(self) -> None:
+        super()._build_controls()
+        default_eps = float(self.config.projective_epsilon)
+        if default_eps <= 0.0:
+            default_eps = 0.30
+        self.external_field_toggle = widgets.ToggleButton(
+            value=self.config.external_field == "projective",
+            description="Field: affine",
+            tooltip="Switch the external drive between the affine omega field and the projective S[p(omega), x] field.",
+            layout=widgets.Layout(width="170px"),
+        )
+        self.projective_epsilon_slider = widgets.FloatSlider(
+            value=default_eps,
+            min=0.0,
+            max=2.0,
+            step=0.01,
+            description="proj eps",
+            readout_format=".2f",
+            continuous_update=False,
+            tooltip="Projective embedding scale eps in p(omega)=eps*omega; eps->0 is the affine limit.",
+            layout=widgets.Layout(width="560px"),
+        )
+        self.projective_status_html = widgets.HTML(value="", layout=widgets.Layout(width="620px"))
+        self.controls.children = tuple(self.controls.children) + (
+            widgets.HBox(
+                [
+                    self.external_field_toggle,
+                    self.projective_epsilon_slider,
+                    self.projective_status_html,
+                ]
+            ),
+        )
+        self._update_projective_enabled()
+
+    def _bind_callbacks(self) -> None:
+        super()._bind_callbacks()
+        self.external_field_toggle.observe(self._on_projective_change, names="value")
+        self.projective_epsilon_slider.observe(self._on_projective_change, names="value")
+
+    def _external_field_choice(self) -> ExternalFieldChoice:
+        return "projective" if bool(self.external_field_toggle.value) else "affine"
+
+    def _config_from_controls(self, *, make_animation: bool) -> SimulationConfig:
+        cfg = super()._config_from_controls(make_animation=make_animation)
+        return replace(
+            cfg,
+            external_field=self._external_field_choice(),
+            projective_epsilon=float(self.projective_epsilon_slider.value),
+        )
+
+    def _update_projective_enabled(self) -> None:
+        self.projective_epsilon_slider.disabled = self._external_field_choice() != "projective"
+
+    def _sync_projective_label(self) -> None:
+        mode = self._external_field_choice()
+        eps = float(self.projective_epsilon_slider.value)
+        self.external_field_toggle.description = "Field: projective" if mode == "projective" else "Field: affine"
+        if mode == "projective" and eps != 0.0:
+            self.projective_status_html.value = (
+                "<b>External gauge:</b> projective; "
+                f"E<sub>&epsilon;</sub>(&omega;,x)=&epsilon;<sup>&minus;1</sup>S[&epsilon;&omega;,x], "
+                f"&epsilon;={eps:.2f}"
+            )
+        else:
+            self.projective_status_html.value = (
+                "<b>External gauge:</b> affine; E(&omega;,x)=&omega; (flat Peszek--Poyato field)"
+            )
+
+    def _sync_config_status(self, result: SimulationResult | None = None) -> None:
+        super()._sync_config_status(result)
+        self._sync_projective_label()
+
+    def _on_projective_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self._update_projective_enabled()
+        self._sync_projective_label()
+        self._mark_cache_stale("External gauge changed. Precompute flow before playback.")
 
 
 def make_dashboard(result: SimulationResult, analysis: GeometryAnalysis, config: SimulationConfig) -> go.Figure:
