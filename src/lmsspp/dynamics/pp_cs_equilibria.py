@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import colorsys
 import json
+import threading
 import time
 import warnings
 import webbrowser
@@ -62,7 +63,10 @@ IntegratorChoice = Literal["fixed_rk2", "adaptive_rk2"]
 TimeDirectionChoice = Literal["forward", "backward"]
 ExternalFieldChoice = Literal["affine", "projective"]
 SecondPanelChoice = Literal["heatmap", "velocity"]
-InitializationAlgorithmChoice = Literal["raw", "legacy_fast_phase"]
+DensitySolverChoice = Literal["explicit_fv", "split_implicit_diffusion", "chang_cooper"]
+DensityBoundaryChoice = Literal["noflux", "periodic"]
+ContinuousDensityPanelChoice = Literal["rho", "r_fiber", "velocity_mag", "div_A"]
+InitializationAlgorithmChoice = Literal["raw", "alpha_ball"]
 ColorSchemeChoice = Literal["palette", "phase_color"]
 
 DEFAULT_SHAPES = (
@@ -102,7 +106,7 @@ PP_INITIALIZATION_PRESETS: dict[str, tuple[str, ...]] = {
 
 PP_INITIALIZER_OPTIONS: tuple[tuple[str, InitializationAlgorithmChoice], ...] = (
     ("Raw sample", "raw"),
-    ("Legacy fast phase", "legacy_fast_phase"),
+    ("Alpha>>0 Ball", "alpha_ball"),
 )
 
 DASHBOARD_FILENAME = "largeN_fft_hessian_dashboard.html"
@@ -142,7 +146,7 @@ class SimulationConfig:
     alpha: float = 0.50
     K: float = 1.0
     n_fibers: int = 10
-    n_per_fiber: int | Sequence[int] = 2000
+    n_per_fiber: int | Sequence[int] = 200
     fibers: Sequence[FiberSpec] | None = None
     shape_names: Sequence[str] = DEFAULT_SHAPES
     omega_atoms: Array | None = None
@@ -190,6 +194,25 @@ class SimulationConfig:
     animation_transition_ms: int = 0
     out_dir: Path | str = Path("pp_largeN_fft_hessian_output")
 
+    density_solver: DensitySolverChoice = "explicit_fv"
+    eps_entropy: float = 0.0
+    density_boundary: DensityBoundaryChoice = "noflux"
+    density_cfl_adv: float = 0.45
+    density_cfl_diff: float = 0.24
+    density_entropy_floor: float = 1.0e-12
+    density_renormalize_each_step: bool = True
+    record_free_energy: bool = True
+    record_entropy_balance: bool = True
+
+    density_dynamic_zoom: bool = True
+    density_dynamic_zoom_mass: float = 0.995
+    density_dynamic_zoom_margin: float = 1.35
+    density_dynamic_zoom_min_width: float | None = None
+    density_dynamic_zoom_smoothing: float = 0.25
+    density_display_grid_size: int = 96
+    density_heatmap_smoothing: bool = True
+    density_edge_band_fraction: float = 0.15
+
 
 @dataclass(frozen=True)
 class InitialCondition:
@@ -236,6 +259,38 @@ class SimulationResult:
     initialization_steps: int
     initialization_time: float
     initialization_stop_metric: float
+
+
+@dataclass(frozen=True)
+class DensityInitialCondition:
+    """Conditional fiber densities and fixed weights for continuous PP."""
+
+    r_fiber: Array
+    omega: Array
+    nu: Array
+    group_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DensitySimulationResult:
+    """State and diagnostics returned by ``run_density_simulation``."""
+
+    initial: DensityInitialCondition
+    r_fiber: Array
+    rho_grid: Array
+    diagnostics: Array
+    trajectory_r_fiber: Array | None
+    trajectory_rho: Array | None
+    trajectory_steps: Array | None
+    trajectory_times: Array | None
+    steps: int
+    final_time: float
+    runtime_seconds: float
+    accepted_steps: int
+    rejected_steps: int
+    dt_min_observed: float
+    dt_max_observed: float
+    dt_mean: float
 
 
 @dataclass(frozen=True)
@@ -390,6 +445,96 @@ class FFTPeszekPoyato2D:
         Hxy[mask] = scale_hess[mask] * (-self.alpha * ex[mask] * ey[mask])
         Hyy[mask] = scale_hess[mask] * (1 - self.alpha * ey[mask] * ey[mask])
         return Kx, Ky, Hxx, Hxy, Hyy
+
+
+class FFTPeszekPoyatoDensity2D:
+    """Grid/FFT evaluator for continuous-density PP fields and diagnostics."""
+
+    def __init__(self, alpha: float, K: float, grid_size: int, domain_radius: float):
+        if not 0.0 <= alpha < 1.0:
+            raise ValueError("continuous density requires 0 <= alpha < 1")
+        if grid_size < 4:
+            raise ValueError("grid_size must be at least 4")
+        if domain_radius <= 0:
+            raise ValueError("domain_radius must be positive")
+
+        self.alpha = float(alpha)
+        self.K = float(K)
+        self.G = int(grid_size)
+        self.L = float(domain_radius)
+        self.h = 2 * self.L / self.G
+        self.P = 2 * self.G
+        self.cell_area = self.h * self.h
+
+        kernels = self._build_kernels()
+        self.fft_Kx = np.fft.rfft2(kernels[0])
+        self.fft_Ky = np.fft.rfft2(kernels[1])
+        self.fft_Hxx = np.fft.rfft2(kernels[2])
+        self.fft_Hxy = np.fft.rfft2(kernels[3])
+        self.fft_Hyy = np.fft.rfft2(kernels[4])
+        self.fft_W = np.fft.rfft2(kernels[5])
+
+    def convolve(self, rho_grid: Array, fft_kernel: Array) -> Array:
+        padded = np.zeros((self.P, self.P), dtype=np.float64)
+        padded[: self.G, : self.G] = rho_grid
+        conv = np.fft.irfft2(np.fft.rfft2(padded) * fft_kernel, s=(self.P, self.P))
+        return conv[: self.G, : self.G]
+
+    def convolve_fields(self, rho_grid: Array, fft_kernels: Sequence[Array]) -> tuple[Array, ...]:
+        padded = np.zeros((self.P, self.P), dtype=np.float64)
+        padded[: self.G, : self.G] = rho_grid
+        rho_hat = np.fft.rfft2(padded)
+        return tuple(np.fft.irfft2(rho_hat * fft_kernel, s=(self.P, self.P))[: self.G, : self.G] for fft_kernel in fft_kernels)
+
+    def marginal_from_fibers(self, r_fiber: Array, nu: Array) -> Array:
+        return np.tensordot(nu, r_fiber, axes=(0, 0))
+
+    def _mass_grid_from_density(self, rho_grid: Array) -> Array:
+        return rho_grid * self.cell_area
+
+    def A_grid_from_rho(self, rho_grid: Array) -> tuple[Array, Array]:
+        mass_grid = self._mass_grid_from_density(rho_grid)
+        Ax_grid, Ay_grid = self.convolve_fields(mass_grid, (self.fft_Kx, self.fft_Ky))
+        return Ax_grid, Ay_grid
+
+    def hessian_grid_from_rho(self, rho_grid: Array) -> tuple[Array, Array, Array]:
+        mass_grid = self._mass_grid_from_density(rho_grid)
+        return self.convolve_fields(mass_grid, (self.fft_Hxx, self.fft_Hxy, self.fft_Hyy))  # type: ignore[return-value]
+
+    def W_grid_from_rho(self, rho_grid: Array) -> Array:
+        mass_grid = self._mass_grid_from_density(rho_grid)
+        return self.convolve(mass_grid, self.fft_W)
+
+    def _build_kernels(self) -> tuple[Array, Array, Array, Array, Array, Array]:
+        coords = make_lag_coords(self.P, self.h)
+        Xlag, Ylag = np.meshgrid(coords, coords, indexing="ij")
+        R = np.sqrt(Xlag**2 + Ylag**2)
+        mask = R > 1e-14
+
+        Kx = np.zeros((self.P, self.P), dtype=np.float64)
+        Ky = np.zeros((self.P, self.P), dtype=np.float64)
+        scale_grad = np.zeros_like(R)
+        scale_grad[mask] = (R[mask] ** (-self.alpha)) / (1 - self.alpha)
+        Kx[mask] = self.K * Xlag[mask] * scale_grad[mask]
+        Ky[mask] = self.K * Ylag[mask] * scale_grad[mask]
+
+        ex = np.zeros_like(R)
+        ey = np.zeros_like(R)
+        ex[mask] = Xlag[mask] / R[mask]
+        ey[mask] = Ylag[mask] / R[mask]
+
+        scale_hess = np.zeros_like(R)
+        scale_hess[mask] = self.K * (R[mask] ** (-self.alpha)) / (1 - self.alpha)
+        Hxx = np.zeros((self.P, self.P), dtype=np.float64)
+        Hxy = np.zeros((self.P, self.P), dtype=np.float64)
+        Hyy = np.zeros((self.P, self.P), dtype=np.float64)
+        Hxx[mask] = scale_hess[mask] * (1 - self.alpha * ex[mask] * ex[mask])
+        Hxy[mask] = scale_hess[mask] * (-self.alpha * ex[mask] * ey[mask])
+        Hyy[mask] = scale_hess[mask] * (1 - self.alpha * ey[mask] * ey[mask])
+
+        W = np.zeros((self.P, self.P), dtype=np.float64)
+        W[mask] = self.K * (R[mask] ** (1 - self.alpha)) / (1 - self.alpha)
+        return Kx, Ky, Hxx, Hxy, Hyy, W
 
 
 class TorchPeszekPoyato2D:
@@ -874,10 +1019,19 @@ def make_initial_condition(
     return InitialCondition(x=x, omega=omega, group_id=group_id, omega_atoms=omega_atoms, group_names=tuple(group_names))
 
 
-def run_simulation(config: SimulationConfig, initial: InitialCondition | None = None) -> SimulationResult:
+def run_simulation(
+    config: SimulationConfig,
+    initial: InitialCondition | None = None,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+) -> SimulationResult:
     """Evolve a PP particle system to an approximate equilibrium."""
 
     _validate_runtime_config(config)
+
+    def _raise_if_cancelled() -> None:
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("PP simulation cancelled.")
     raw_initial = make_initial_condition(config) if initial is None else validate_initial_condition(initial)
     initial, initialization_meta = _apply_initialization_algorithm(config, raw_initial)
     solver = _make_pp_backend(config)
@@ -957,6 +1111,7 @@ def run_simulation(config: SimulationConfig, initial: InitialCondition | None = 
     if config.integrator == "fixed_rk2":
         dt_fixed = float(config.dt)
         for _ in range(config.max_steps + 1):
+            _raise_if_cancelled()
             record_trajectory(accepted_steps, x, t)
             vf, _ = velocity_fn(x)
             field_evaluations += 1
@@ -980,6 +1135,7 @@ def run_simulation(config: SimulationConfig, initial: InitialCondition | None = 
             dt_history.append(dt_fixed)
     else:
         while True:
+            _raise_if_cancelled()
             record_trajectory(accepted_steps, x, t)
             vf, _ = velocity_fn(x)
             field_evaluations += 1
@@ -1069,18 +1225,626 @@ def run_simulation(config: SimulationConfig, initial: InitialCondition | None = 
     )
 
 
+DENSITY_DIAGNOSTIC_FIELDS = (
+    "step",
+    "time",
+    "dt",
+    "min_density",
+    "max_density",
+    "negative_count",
+    "mass_min",
+    "mass_max",
+    "total_mass",
+    "max_mass_error",
+    "renorm_correction",
+    "free_energy",
+    "entropy_H",
+    "fisher_information",
+    "trace_div_A",
+    "entropy_balance_rhs",
+    "rms_velocity",
+)
+
+
+def _validate_density_config(config: SimulationConfig) -> None:
+    if config.density_solver == "split_implicit_diffusion":
+        raise ValueError("density_solver='split_implicit_diffusion' is not implemented; use 'explicit_fv'")
+    if config.density_solver == "chang_cooper":
+        raise ValueError("density_solver='chang_cooper' is not implemented; use 'explicit_fv'")
+    if config.density_solver != "explicit_fv":
+        raise ValueError(f"unknown density_solver: {config.density_solver!r}")
+    if not 0.0 <= config.alpha < 1.0:
+        raise ValueError("continuous density requires 0 <= alpha < 1")
+    if config.density_boundary == "periodic":
+        raise ValueError("density_boundary='periodic' is not implemented; use 'noflux'")
+    if config.density_boundary != "noflux":
+        raise ValueError(f"unknown density_boundary: {config.density_boundary!r}")
+    if config.eps_entropy > 0 and config.time_direction == "backward":
+        raise ValueError("backward time is incompatible with eps_entropy > 0")
+    if config.density_cfl_adv <= 0:
+        raise ValueError("density_cfl_adv must be positive")
+    if config.density_cfl_diff <= 0:
+        raise ValueError("density_cfl_diff must be positive")
+    if config.density_entropy_floor <= 0:
+        raise ValueError("density_entropy_floor must be positive")
+    if not 0.0 < config.density_dynamic_zoom_mass <= 1.0:
+        raise ValueError("density_dynamic_zoom_mass must lie in (0, 1]")
+    if config.density_dynamic_zoom_margin <= 0:
+        raise ValueError("density_dynamic_zoom_margin must be positive")
+    if not 0.0 <= config.density_dynamic_zoom_smoothing <= 1.0:
+        raise ValueError("density_dynamic_zoom_smoothing must lie in [0, 1]")
+    if not 0.0 < config.density_edge_band_fraction < 1.0:
+        raise ValueError("density_edge_band_fraction must lie in (0, 1)")
+
+
+def _density_grid_axis(G: int, L: float) -> Array:
+    h = 2 * L / G
+    return np.linspace(-L + 0.5 * h, L - 0.5 * h, G)
+
+
+def _effective_density_display_grid_size(config: SimulationConfig) -> int:
+    """Display-only resolution, clamped to the backend grid and a minimum of 4."""
+
+    return int(max(4, min(int(config.density_display_grid_size), int(config.grid_size))))
+
+
+@dataclass
+class _DensityZoomWindow:
+    """Square viewport centered at the origin with equal x/y half-extent."""
+
+    half_extent: float
+
+    def as_bounds(self) -> tuple[float, float, float, float]:
+        h = float(self.half_extent)
+        return (-h, h, -h, h)
+
+
+def _mass_central_interval(marginal: Array, axis: Array, mass_fraction: float) -> tuple[float, float]:
+    total = float(marginal.sum())
+    if total <= 0.0:
+        return float(axis[0]), float(axis[-1])
+    cdf = np.cumsum(marginal) / total
+    tail = max(0.0, min(0.5, 0.5 * (1.0 - float(mass_fraction))))
+    lo_idx = int(np.clip(np.searchsorted(cdf, tail, side="left"), 0, len(axis) - 1))
+    hi_idx = int(np.clip(np.searchsorted(cdf, 1.0 - tail, side="left"), 0, len(axis) - 1))
+    return float(axis[lo_idx]), float(axis[hi_idx])
+
+
+def _density_support_window(
+    field: Array,
+    axis: Array,
+    *,
+    L: float,
+    mass_fraction: float,
+    margin: float,
+    min_half_width: float | None,
+) -> _DensityZoomWindow:
+    """Origin-centered square window: ±max(half_x, half_y) with half_k = max(|lo_k|, |hi_k|)."""
+
+    h = float(axis[1] - axis[0]) if len(axis) > 1 else 2 * L
+    min_half = float(2.0 * h if min_half_width is None else min_half_width)
+    mx = field.sum(axis=1)
+    my = field.sum(axis=0)
+    x_lo, x_hi = _mass_central_interval(mx, axis, mass_fraction)
+    y_lo, y_hi = _mass_central_interval(my, axis, mass_fraction)
+    half_x = max(abs(x_lo), abs(x_hi))
+    half_y = max(abs(y_lo), abs(y_hi))
+    half_extent = max(min_half, float(margin) * max(half_x, half_y))
+    half_extent = min(half_extent, float(L))
+    return _DensityZoomWindow(half_extent=half_extent)
+
+
+def _smooth_density_zoom_window(
+    previous: _DensityZoomWindow | None,
+    raw: _DensityZoomWindow,
+    smoothing: float,
+) -> _DensityZoomWindow:
+    if previous is None or smoothing <= 0.0:
+        return raw
+    blend = float(np.clip(smoothing, 0.0, 1.0))
+    keep = 1.0 - blend
+    return _DensityZoomWindow(half_extent=keep * previous.half_extent + blend * raw.half_extent)
+
+
+def _bilinear_resample_field(
+    field: Array,
+    axis: Array,
+    x_lo: float,
+    x_hi: float,
+    y_lo: float,
+    y_hi: float,
+    display_size: int,
+) -> tuple[Array, Array, Array]:
+    if display_size < 2:
+        raise ValueError("display_size must be at least 2")
+    x_out = np.linspace(float(x_lo), float(x_hi), int(display_size))
+    y_out = np.linspace(float(y_lo), float(y_hi), int(display_size))
+    X_out, Y_out = np.meshgrid(x_out, y_out, indexing="ij")
+    G = int(field.shape[0])
+    h = float(axis[1] - axis[0]) if len(axis) > 1 else 1.0
+    origin = float(axis[0])
+    ui = np.clip((X_out - origin) / h, 0.0, G - 1 - 1e-12)
+    vi = np.clip((Y_out - origin) / h, 0.0, G - 1 - 1e-12)
+    i0 = np.floor(ui).astype(np.int64)
+    j0 = np.floor(vi).astype(np.int64)
+    i1 = np.minimum(i0 + 1, G - 1)
+    j1 = np.minimum(j0 + 1, G - 1)
+    fu = ui - i0
+    fv = vi - j0
+    sampled = (
+        (1.0 - fu) * (1.0 - fv) * field[i0, j0]
+        + fu * (1.0 - fv) * field[i1, j0]
+        + (1.0 - fu) * fv * field[i0, j1]
+        + fu * fv * field[i1, j1]
+    )
+    return sampled, x_out, y_out
+
+
+def _nyquist_checkerboard_amplitude(field: Array) -> float:
+    """Amplitude of the (-1)^(i+j) checkerboard mode relative to the field mean."""
+
+    values = np.asarray(field, dtype=np.float64)
+    if values.size == 0:
+        return 0.0
+    ii, jj = np.indices(values.shape)
+    mode = (-1.0) ** (ii + jj)
+    centered = values - float(values.mean())
+    return float(np.sum(centered * mode) / np.sum(mode * mode))
+
+
+def _antialias_display_field(field: Array) -> Array:
+    """Display-only separable binomial blur; leaves backend simulation grids untouched."""
+
+    values = np.asarray(field, dtype=np.float64)
+    if values.ndim != 2 or min(values.shape) < 3:
+        return values
+    padded = np.pad(values, ((1, 1), (1, 1)), mode="edge")
+    along_x = (padded[1:-1, :-2] + 2.0 * padded[1:-1, 1:-1] + padded[1:-1, 2:]) * 0.25
+    padded_y = np.pad(along_x, ((1, 1), (0, 0)), mode="edge")
+    return (padded_y[:-2] + 2.0 * padded_y[1:-1] + padded_y[2:]) * 0.25
+
+
+def _density_edge_mass_fraction(
+    rho: Array,
+    axis: Array,
+    L: float,
+    band_fraction: float,
+) -> float:
+    if rho.size == 0:
+        return 0.0
+    h = float(axis[1] - axis[0]) if len(axis) > 1 else 2 * L / max(rho.shape[0], 1)
+    total = float(rho.sum()) * h * h
+    if total <= 0.0:
+        return 0.0
+    X, Y = np.meshgrid(axis, axis, indexing="ij")
+    edge_cut = max(0.0, min(1.0, 1.0 - float(band_fraction)))
+    edge = (np.abs(X) >= edge_cut * L) | (np.abs(Y) >= edge_cut * L)
+    return float(rho[edge].sum() * h * h / total)
+
+
+def _density_display_payload_from_grid(
+    field: Array,
+    axis: Array,
+    cfg: SimulationConfig,
+    *,
+    dynamic_zoom: bool,
+    window: _DensityZoomWindow | None,
+    heatmap_smoothing: bool | None = None,
+) -> dict[str, Any]:
+    L = float(cfg.domain_radius)
+    smooth_display = bool(cfg.density_heatmap_smoothing if heatmap_smoothing is None else heatmap_smoothing)
+    if dynamic_zoom and window is not None:
+        x_lo, x_hi, y_lo, y_hi = window.as_bounds()
+        z, x_axis, y_axis = _bilinear_resample_field(
+            field,
+            axis,
+            x_lo,
+            x_hi,
+            y_lo,
+            y_hi,
+            int(_effective_density_display_grid_size(cfg)),
+        )
+    else:
+        z = np.asarray(field, dtype=np.float64)
+        x_axis = np.asarray(axis, dtype=np.float64)
+        y_axis = np.asarray(axis, dtype=np.float64)
+        x_lo = -L
+        x_hi = L
+        y_lo = -L
+        y_hi = L
+    if smooth_display:
+        z = _antialias_display_field(z)
+    return {
+        "z": np.asarray(z, dtype=np.float64),
+        "x": np.asarray(x_axis, dtype=np.float64),
+        "y": np.asarray(y_axis, dtype=np.float64),
+        "x_range": [float(x_lo), float(x_hi)],
+        "y_range": [float(y_lo), float(y_hi)],
+        "zoomed": bool(dynamic_zoom and window is not None),
+    }
+
+
+def validate_density_initial_condition(
+    initial: DensityInitialCondition,
+    config: SimulationConfig,
+) -> DensityInitialCondition:
+    r_fiber = np.asarray(initial.r_fiber, dtype=np.float64)
+    omega = np.asarray(initial.omega, dtype=np.float64)
+    nu = np.asarray(initial.nu, dtype=np.float64)
+    G = int(config.grid_size)
+    if r_fiber.ndim != 3:
+        raise ValueError("r_fiber must have shape (n_fibers, G, G)")
+    n_fibers = int(r_fiber.shape[0])
+    if r_fiber.shape[1:] != (G, G):
+        raise ValueError(f"r_fiber must have spatial shape ({G}, {G})")
+    if omega.shape != (n_fibers, 2):
+        raise ValueError(f"omega must have shape ({n_fibers}, 2)")
+    if nu.shape != (n_fibers,):
+        raise ValueError(f"nu must have shape ({n_fibers},)")
+    if np.any(nu < 0):
+        raise ValueError("nu must be non-negative")
+    nu_sum = float(nu.sum())
+    if abs(nu_sum - 1.0) > 1e-10:
+        raise ValueError(f"nu must sum to 1, got {nu_sum}")
+    if len(initial.group_names) != n_fibers:
+        raise ValueError("group_names length must match fiber count")
+    return DensityInitialCondition(
+        r_fiber=r_fiber,
+        omega=omega,
+        nu=nu,
+        group_names=tuple(initial.group_names),
+    )
+
+
+def make_density_initial_condition(
+    config: SimulationConfig,
+    initial: DensityInitialCondition | None = None,
+) -> DensityInitialCondition:
+    if initial is not None:
+        return validate_density_initial_condition(initial, config)
+
+    fibers = _normalize_fibers(config)
+    n_fibers = len(fibers)
+    rng = np.random.default_rng(config.seed)
+    omega_atoms = _omega_atoms_from_config(config, fibers, rng)
+    G = int(config.grid_size)
+    L = float(config.domain_radius)
+    h = 2 * L / G
+    axis = _density_grid_axis(G, L)
+    x1, x2 = np.meshgrid(axis, axis, indexing="ij")
+
+    r_fiber = np.zeros((n_fibers, G, G), dtype=np.float64)
+    group_names: list[str] = []
+    for k, spec in enumerate(fibers):
+        center = _fiber_center(spec.center, rng)
+        sigma = 0.35 + 0.08 * float(rng.random())
+        bump = np.exp(-((x1 - center[0]) ** 2 + (x2 - center[1]) ** 2) / (2.0 * sigma**2))
+        mass = float(bump.sum()) * h * h
+        if mass <= 0:
+            raise ValueError(f"fiber {k} initial bump has zero mass")
+        r_fiber[k] = bump / mass
+        group_names.append(spec.name or _shape_name(spec.shape, k))
+
+    nu = np.full(n_fibers, 1.0 / n_fibers, dtype=np.float64)
+    return DensityInitialCondition(
+        r_fiber=r_fiber,
+        omega=omega_atoms.astype(np.float64, copy=False),
+        nu=nu,
+        group_names=tuple(group_names),
+    )
+
+
+def _face_average_x(field: Array) -> Array:
+    return 0.5 * (field[:-1, :] + field[1:, :])
+
+
+def _face_average_y(field: Array) -> Array:
+    return 0.5 * (field[:, :-1] + field[:, 1:])
+
+
+def _upwind_advective_flux_x(r: Array, u: Array) -> Array:
+    return np.where(u >= 0.0, r[:-1, :] * u, r[1:, :] * u)
+
+
+def _upwind_advective_flux_y(r: Array, v: Array) -> Array:
+    return np.where(v >= 0.0, r[:, :-1] * v, r[:, 1:] * v)
+
+
+def _centered_diffusive_flux_x(r: Array, eps: float, h: float) -> Array:
+    if eps == 0.0:
+        return np.zeros((r.shape[0] - 1, r.shape[1]), dtype=np.float64)
+    return -eps * (r[1:, :] - r[:-1, :]) / h
+
+
+def _centered_diffusive_flux_y(r: Array, eps: float, h: float) -> Array:
+    if eps == 0.0:
+        return np.zeros((r.shape[0], r.shape[1] - 1), dtype=np.float64)
+    return -eps * (r[:, 1:] - r[:, :-1]) / h
+
+
+def _divergence_from_face_fluxes(fx: Array, fy: Array, h: float) -> Array:
+    G = fx.shape[1]
+    div = np.zeros((G, G), dtype=np.float64)
+    div[0, :] += fx[0, :] / h
+    if G > 1:
+        div[1:-1, :] += (fx[1:, :] - fx[:-1, :]) / h
+        div[-1, :] -= fx[-1, :] / h
+    div[:, 0] += fy[:, 0] / h
+    if G > 1:
+        div[:, 1:-1] += (fy[:, 1:] - fy[:, :-1]) / h
+        div[:, -1] -= fy[:, -1] / h
+    return div
+
+
+def _density_fv_step_single(
+    r: Array,
+    omega_k: Array,
+    Ax: Array,
+    Ay: Array,
+    eps: float,
+    dt: float,
+    h: float,
+    time_sign: float,
+) -> Array:
+    ux = time_sign * (float(omega_k[0]) - _face_average_x(Ax))
+    uy = time_sign * (float(omega_k[1]) - _face_average_y(Ay))
+    Jx = _upwind_advective_flux_x(r, ux) + _centered_diffusive_flux_x(r, eps, h)
+    Jy = _upwind_advective_flux_y(r, uy) + _centered_diffusive_flux_y(r, eps, h)
+    return r - dt * _divergence_from_face_fluxes(Jx, Jy, h)
+
+
+def _density_cfl_dt(
+    Ax: Array,
+    Ay: Array,
+    omega: Array,
+    eps: float,
+    h: float,
+    config: SimulationConfig,
+    time_sign: float,
+) -> float:
+    Ax_f = _face_average_x(Ax)
+    Ay_f = _face_average_y(Ay)
+    max_speed = 0.0
+    for k in range(int(omega.shape[0])):
+        max_speed = max(
+            max_speed,
+            float(np.max(np.abs(time_sign * (float(omega[k, 0]) - Ax_f)))),
+            float(np.max(np.abs(time_sign * (float(omega[k, 1]) - Ay_f)))),
+        )
+    dt_adv = float(config.density_cfl_adv) * h / max(max_speed, 1e-14)
+    dt_diff = float(config.density_cfl_diff) * h * h / float(eps) if eps > 0.0 else float("inf")
+    return _clamp_dt(min(dt_adv, dt_diff), config)
+
+
+def _repair_fiber_densities(
+    r_fiber: Array,
+    h: float,
+    floor: float,
+    renormalize: bool,
+) -> tuple[Array, float, int]:
+    out = np.array(r_fiber, dtype=np.float64, copy=True)
+    negative_count = int(np.count_nonzero(out < 0.0))
+    out = np.where(out < 0.0, 0.0, out)
+    renorm_correction = 0.0
+    area = h * h
+    if renormalize:
+        for k in range(out.shape[0]):
+            mass = float(out[k].sum()) * area
+            if mass > floor:
+                renorm_correction = max(renorm_correction, abs(mass - 1.0))
+                out[k] /= mass
+    return out, renorm_correction, negative_count
+
+
+def _density_diagnostic_row(
+    *,
+    step: int,
+    time: float,
+    dt: float,
+    r_fiber: Array,
+    nu: Array,
+    omega: Array,
+    solver: FFTPeszekPoyatoDensity2D,
+    eps: float,
+    floor: float,
+    record_free_energy: bool,
+) -> Array:
+    rho = solver.marginal_from_fibers(r_fiber, nu)
+    area = solver.cell_area
+    h = solver.h
+    masses = np.array([float(r.sum()) * area for r in r_fiber], dtype=np.float64)
+    total_mass = float(rho.sum()) * area
+    max_mass_error = float(np.max(np.abs(masses - 1.0))) if masses.size else 0.0
+
+    Ax, Ay = solver.A_grid_from_rho(rho)
+    Hxx, _, Hyy = solver.hessian_grid_from_rho(rho)
+    trace_field = Hxx + Hyy
+    trace_div_A = float(np.sum(trace_field * rho) * area / max(total_mass, floor))
+
+    fisher_information = 0.0
+    entropy_H = 0.0
+    for k in range(r_fiber.shape[0]):
+        r_k = r_fiber[k]
+        grad_x = np.gradient(r_k, h, axis=0)
+        grad_y = np.gradient(r_k, h, axis=1)
+        safe_r = np.maximum(r_k, floor)
+        fisher_information += float(nu[k] * np.sum((grad_x * grad_x + grad_y * grad_y) / safe_r) * area)
+        entropy_H += float(nu[k] * np.sum(r_k * np.log(safe_r)) * area)
+
+    free_energy = 0.0
+    if record_free_energy:
+        W_grid = solver.W_grid_from_rho(rho)
+        free_energy = 0.5 * float(np.sum(W_grid * rho) * area)
+
+    entropy_balance_rhs = trace_div_A - eps * fisher_information
+
+    vx = omega[:, None, None, 0] - Ax[None, :, :]
+    vy = omega[:, None, None, 1] - Ay[None, :, :]
+    speed2 = nu[:, None, None] * (vx * vx + vy * vy) * r_fiber
+    rms_velocity = float(np.sqrt(np.sum(speed2) * area / max(total_mass, floor)))
+
+    return np.array(
+        [
+            float(step),
+            float(time),
+            float(dt),
+            float(np.min(r_fiber)),
+            float(np.max(r_fiber)),
+            0.0,
+            float(np.min(masses)),
+            float(np.max(masses)),
+            total_mass,
+            max_mass_error,
+            0.0,
+            free_energy,
+            entropy_H,
+            fisher_information,
+            trace_div_A,
+            entropy_balance_rhs,
+            rms_velocity,
+        ],
+        dtype=np.float64,
+    )
+
+
+def run_density_simulation(
+    config: SimulationConfig,
+    initial: DensityInitialCondition | None = None,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+) -> DensitySimulationResult:
+    """Evolve conditional fiber densities with explicit finite-volume advection-diffusion."""
+
+    _validate_density_config(config)
+
+    def _raise_if_cancelled() -> None:
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("Density simulation cancelled.")
+    initial_cond = make_density_initial_condition(config, initial)
+    solver = FFTPeszekPoyatoDensity2D(config.alpha, config.K, config.grid_size, config.domain_radius)
+
+    r_fiber = np.array(initial_cond.r_fiber, dtype=np.float64, copy=True)
+    nu = np.asarray(initial_cond.nu, dtype=np.float64)
+    omega = np.asarray(initial_cond.omega, dtype=np.float64)
+    eps = float(config.eps_entropy)
+    floor = float(config.density_entropy_floor)
+    time_sign = -1.0 if config.time_direction == "backward" else 1.0
+
+    diagnostics: list[Array] = []
+    trajectory_r: list[Array] = []
+    trajectory_rho: list[Array] = []
+    trajectory_steps: list[int] = []
+    trajectory_times: list[float] = []
+    trajectory_stride = _trajectory_stride(config)
+    trajectory_limit = _trajectory_frame_limit(config)
+
+    dt_current = _clamp_dt(float(config.dt), config)
+    dt_history: list[float] = []
+    accepted_steps = 0
+    rejected_steps = 0
+    t = 0.0
+    use_fixed_dt = config.integrator == "fixed_rk2"
+
+    def record_trajectory(step_: int, time_: float, *, force: bool = False) -> None:
+        if not config.make_animation:
+            return
+        if trajectory_steps and not force and step_ % trajectory_stride != 0 and step_ != config.max_steps:
+            return
+        if trajectory_limit is not None and len(trajectory_steps) >= trajectory_limit and not force and step_ != config.max_steps:
+            return
+        trajectory_r.append(r_fiber.astype(np.float32, copy=True))
+        trajectory_rho.append(solver.marginal_from_fibers(r_fiber, nu).astype(np.float32, copy=False))
+        trajectory_steps.append(int(step_))
+        trajectory_times.append(float(time_))
+
+    start = time.time()
+
+    while True:
+        _raise_if_cancelled()
+        record_trajectory(accepted_steps, t)
+        rho = solver.marginal_from_fibers(r_fiber, nu)
+        Ax, Ay = solver.A_grid_from_rho(rho)
+        step_dt = float(config.dt) if use_fixed_dt else min(_density_cfl_dt(Ax, Ay, omega, eps, solver.h, config, time_sign), dt_current)
+        row = _density_diagnostic_row(
+            step=accepted_steps,
+            time=t,
+            dt=step_dt,
+            r_fiber=r_fiber,
+            nu=nu,
+            omega=omega,
+            solver=solver,
+            eps=eps,
+            floor=floor,
+            record_free_energy=config.record_free_energy or config.record_entropy_balance,
+        )
+        rms_velocity = float(row[DENSITY_DIAGNOSTIC_FIELDS.index("rms_velocity")])
+
+        if accepted_steps % config.record_every == 0 and (config.record_free_energy or config.record_entropy_balance):
+            diagnostics.append(row.copy())
+
+        if rms_velocity < config.tol_rms and accepted_steps > config.min_steps:
+            break
+        if accepted_steps >= config.max_steps:
+            break
+
+        r_next = np.empty_like(r_fiber)
+        for k in range(r_fiber.shape[0]):
+            r_next[k] = _density_fv_step_single(r_fiber[k], omega[k], Ax, Ay, eps, step_dt, solver.h, time_sign)
+
+        r_fiber, renorm_correction, negative_count = _repair_fiber_densities(
+            r_next,
+            solver.h,
+            floor,
+            config.density_renormalize_each_step,
+        )
+        if diagnostics:
+            diagnostics[-1][DENSITY_DIAGNOSTIC_FIELDS.index("renorm_correction")] = renorm_correction
+            diagnostics[-1][DENSITY_DIAGNOSTIC_FIELDS.index("negative_count")] = float(negative_count)
+
+        t += step_dt
+        accepted_steps += 1
+        dt_history.append(step_dt)
+        if not use_fixed_dt:
+            dt_current = _clamp_dt(step_dt, config)
+
+    runtime = time.time() - start
+    if config.make_animation and (not trajectory_steps or trajectory_steps[-1] != accepted_steps):
+        record_trajectory(accepted_steps, t, force=True)
+
+    rho_final = solver.marginal_from_fibers(r_fiber, nu)
+    dt_min_observed, dt_max_observed, dt_mean = _dt_history_summary(dt_history)
+    return DensitySimulationResult(
+        initial=initial_cond,
+        r_fiber=r_fiber,
+        rho_grid=rho_final,
+        diagnostics=np.stack(diagnostics) if diagnostics else np.zeros((0, len(DENSITY_DIAGNOSTIC_FIELDS))),
+        trajectory_r_fiber=np.stack(trajectory_r) if trajectory_r else None,
+        trajectory_rho=np.stack(trajectory_rho) if trajectory_rho else None,
+        trajectory_steps=np.array(trajectory_steps, dtype=np.int64) if trajectory_steps else None,
+        trajectory_times=np.array(trajectory_times, dtype=np.float64) if trajectory_times else None,
+        steps=int(accepted_steps),
+        final_time=float(t),
+        runtime_seconds=float(runtime),
+        accepted_steps=int(accepted_steps),
+        rejected_steps=int(rejected_steps),
+        dt_min_observed=dt_min_observed,
+        dt_max_observed=dt_max_observed,
+        dt_mean=dt_mean,
+    )
+
+
 def _apply_initialization_algorithm(
     config: SimulationConfig,
     initial: InitialCondition,
 ) -> tuple[InitialCondition, dict[str, object]]:
     if config.initialization_algorithm == "raw":
         return initial, {"algorithm": "raw", "steps": 0, "time": 0.0, "stop_metric": 0.0}
-    if config.initialization_algorithm == "legacy_fast_phase":
-        return _legacy_fast_phase_initial_condition(config, initial)
+    if config.initialization_algorithm == "alpha_ball":
+        return _alpha_ball_initial_condition(config, initial)
     raise ValueError(f"unknown initialization_algorithm: {config.initialization_algorithm!r}")
 
 
-def _legacy_fast_phase_initial_condition(
+def _alpha_ball_initial_condition(
     config: SimulationConfig,
     initial: InitialCondition,
 ) -> tuple[InitialCondition, dict[str, object]]:
@@ -1134,7 +1898,7 @@ def _legacy_fast_phase_initial_condition(
         group_names=tuple(initial.group_names),
     )
     return warmed, {
-        "algorithm": "legacy_fast_phase",
+        "algorithm": "alpha_ball",
         "steps": int(steps_done),
         "time": float(steps_done * float(init_config.dt)),
         "stop_metric": float(stop_metric),
@@ -1155,8 +1919,8 @@ def _resolve_initializer_config(config: SimulationConfig) -> InitializerConfig:
 def _validate_runtime_config(config: SimulationConfig) -> None:
     if config.backend not in ("auto", "numpy", "torch"):
         raise ValueError("backend must be one of 'auto', 'numpy', or 'torch'")
-    if config.initialization_algorithm not in ("raw", "legacy_fast_phase"):
-        raise ValueError("initialization_algorithm must be 'raw' or 'legacy_fast_phase'")
+    if config.initialization_algorithm not in ("raw", "alpha_ball"):
+        raise ValueError("initialization_algorithm must be 'raw' or 'alpha_ball'")
     if config.initialization_fast_steps < 0:
         raise ValueError("initialization_fast_steps must be non-negative")
     if config.initialization_fast_min_steps < 0:
@@ -1740,7 +2504,164 @@ def make_dynamics_widget(
     return PPDynamicsWidget(config, result=result, width=width, height=height, second_panel=second_panel)
 
 
-class PeszekPoyatoDynamicsBaseWidget:
+class _AsyncPrecomputeControlsMixin:
+    """Shared async precompute, interrupt, and playback-disable plumbing for PP widgets."""
+
+    _precompute_worker_thread_name = "pp-precompute-worker"
+
+    def _init_async_precompute_state(self) -> None:
+        self._precompute_busy = False
+        self._precompute_stale_message = ""
+        self._async_lock = threading.Lock()
+        self._async_seq = 0
+        self._async_cancel_before = 0
+        self._async_pending_job: dict[str, Any] | None = None
+        self._async_worker: threading.Thread | None = None
+
+    def _dispatch_precompute_callback(self, fn: Callable[[], None]) -> None:
+        fn()
+
+    def _release_precompute_worker_thread(self) -> None:
+        self._async_worker = None
+
+    def _is_precompute_cancelled(self, seq: int) -> bool:
+        with self._async_lock:
+            return int(seq) <= int(self._async_cancel_before)
+
+    def _playback_disabled(self) -> bool:
+        return bool(self._precompute_busy) or len(self._frame_payloads) <= 1
+
+    def _set_precompute_computing(self) -> None:
+        self._precompute_busy = True
+        self._cache_valid = False
+        self.cache_status_html.value = "<span style='color:#666'>Computing all cached frames...</span>"
+        self.btn_precompute.description = "Interrupt"
+        self.btn_precompute.button_style = "info"
+        self.btn_precompute.disabled = False
+        self.btn_step.disabled = True
+        self.play.disabled = True
+        self.frame_slider.disabled = True
+        self._updating = True
+        try:
+            self.play.value = 0
+            self.frame_slider.value = 0
+        finally:
+            self._updating = False
+
+    def _capture_precompute_job(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _prepare_precompute_job(self, job: dict[str, Any]) -> None:
+        return None
+
+    def _run_precompute_job(self, job: dict[str, Any]) -> Any:
+        seq = int(job["seq"])
+        return run_simulation(
+            job["config"],
+            cancel_check=lambda: self._is_precompute_cancelled(seq),
+        )
+
+    def _ingest_precompute_result(self, result: Any) -> None:
+        raise NotImplementedError
+
+    def _queue_async_precompute(self) -> None:
+        job = self._capture_precompute_job()
+        self._prepare_precompute_job(job)
+        self._precompute_stale_message = ""
+        self._set_precompute_computing()
+        with self._async_lock:
+            self._async_seq += 1
+            seq = int(self._async_seq)
+            job["seq"] = seq
+            self._async_pending_job = job
+            worker_alive = self._async_worker is not None and self._async_worker.is_alive()
+            if worker_alive:
+                return
+            self._async_worker = threading.Thread(
+                target=self._async_precompute_worker_loop,
+                name=self._precompute_worker_thread_name,
+                daemon=True,
+            )
+            self._async_worker.start()
+
+    def _async_precompute_worker_loop(self) -> None:
+        try:
+            while True:
+                with self._async_lock:
+                    job = self._async_pending_job
+                    self._async_pending_job = None
+                if job is None:
+                    self._dispatch_precompute_callback(self._on_precompute_worker_idle)
+                    return
+                seq = int(job["seq"])
+                try:
+                    result = self._run_precompute_job(job)
+                except InterruptedError:
+                    continue
+                except Exception as exc:
+                    if self._is_precompute_cancelled(seq):
+                        continue
+                    err_text = str(exc)
+                    self._dispatch_precompute_callback(lambda msg=err_text: self._on_precompute_worker_error(msg))
+                    continue
+                if self._is_precompute_cancelled(seq):
+                    continue
+                self._dispatch_precompute_callback(
+                    lambda res=result, job_seq=seq: self._apply_async_precompute_result(res, job_seq)
+                )
+
+                with self._async_lock:
+                    if self._async_pending_job is None:
+                        return
+        finally:
+            self._dispatch_precompute_callback(self._release_precompute_worker_thread)
+
+    def _on_precompute_worker_idle(self) -> None:
+        if not self._precompute_busy:
+            return
+        message = self._precompute_stale_message or "Precompute interrupted."
+        self._precompute_busy = False
+        self._mark_cache_stale(message)
+
+    def _on_precompute_worker_error(self, err_text: str) -> None:
+        self._precompute_busy = False
+        self.btn_precompute.description = "Precompute flow"
+        self.btn_precompute.button_style = "warning"
+        self.btn_precompute.disabled = False
+        self.cache_status_html.value = f"<span style='color:#b00020'>Precompute error: {err_text}</span>"
+        if hasattr(self, "_sync_config_status"):
+            self._sync_config_status()
+        self._sync_frame_controls(self._frame_index)
+
+    def _apply_async_precompute_result(self, result: Any, seq: int) -> None:
+        if self._is_precompute_cancelled(seq):
+            return
+        with self._async_lock:
+            if int(seq) < int(self._async_seq):
+                return
+        self._precompute_busy = False
+        self._precompute_stale_message = ""
+        self._ingest_precompute_result(result)
+
+    def _interrupt_precompute(self) -> None:
+        with self._async_lock:
+            self._async_cancel_before = int(self._async_seq)
+            self._async_pending_job = None
+        self._precompute_busy = False
+        message = self._precompute_stale_message or "Precompute interrupted. Adjust settings and click Precompute flow."
+        self._mark_cache_stale(message)
+
+    def precompute(self) -> None:
+        self._queue_async_precompute()
+
+    def _on_precompute_clicked(self, _btn: Any) -> None:
+        if self._precompute_busy:
+            self._interrupt_precompute()
+            return
+        self.precompute()
+
+
+class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
     """Interactive ``go.FigureWidget`` animation of fiber + joint-density dynamics.
 
     This base mirrors the interaction model that works well in
@@ -1748,8 +2669,9 @@ class PeszekPoyatoDynamicsBaseWidget:
     expensive simulation results are precomputed into frame payloads, and
     playback only swaps cached arrays into existing Plotly traces.
 
-    * ``Precompute`` runs the simulation (recording every step) and builds the
-      per-frame payload cache.
+    * ``Precompute flow`` runs the simulation on a background thread (recording every step) and builds the
+      per-frame payload cache. While computing, the button turns light blue and reads ``Interrupt``;
+      click it to cancel and try different slider settings.
     * ``widgets.Play`` provides start / pause / stop transport, ``Step`` advances
       one frame, and the frame slider scrubs; all of them funnel through
       ``_set_frame_index`` -> ``_apply_cached_frame``.
@@ -1788,6 +2710,7 @@ class PeszekPoyatoDynamicsBaseWidget:
         self._frame_index = 0
         self._cache_valid = False
         self._updating = False
+        self._init_async_precompute_state()
         self._sampled_by_group: list[Array] = []
         self._density_axis: Array | None = None
         self._zmax = 1.0
@@ -2176,29 +3099,21 @@ class PeszekPoyatoDynamicsBaseWidget:
 
     # -- cache + frame state ------------------------------------------------
 
-    def precompute(self) -> None:
-        """Run the simulation, build the frame cache, and show the first frame."""
-
-        self._cache_valid = False
-        self.cache_status_html.value = "<span style='color:#666'>Running simulation and caching frames...</span>"
-        self.btn_precompute.disabled = True
-        self.btn_precompute.button_style = "info"
-        self.btn_step.disabled = True
-        self.play.disabled = True
-        self.frame_slider.disabled = True
-        self._updating = True
-        try:
-            self.play.value = 0
-            self.frame_slider.value = 0
-        finally:
-            self._updating = False
-
-        run_config = self._config_from_controls(make_animation=True)
+    def _prepare_precompute_job(self, job: dict[str, Any]) -> None:
+        run_config = job["config"]
         self.config = run_config
-        self._group_names = self._preview_group_names_from_controls()
+        self._group_names = tuple(job["group_names"])
         self._ensure_fiber_traces(self._group_names)
         self._sync_config_status()
-        result = run_simulation(run_config)
+
+    def _capture_precompute_job(self) -> dict[str, Any]:
+        run_config = self._config_from_controls(make_animation=True)
+        return {
+            "config": run_config,
+            "group_names": self._preview_group_names_from_controls(),
+        }
+
+    def _ingest_precompute_result(self, result: SimulationResult) -> None:
         self._ingest_result(result)
 
     def _ingest_result(self, result: SimulationResult) -> None:
@@ -2344,7 +3259,7 @@ class PeszekPoyatoDynamicsBaseWidget:
         max_idx = max(0, count - 1)
         frame = int(np.clip(int(idx), 0, max_idx)) if count else 0
         self._frame_index = frame
-        disabled = (not self._cache_valid) or count <= 1
+        disabled = self._playback_disabled()
         self._updating = True
         try:
             if int(self.frame_slider.max) != max_idx:
@@ -2369,18 +3284,27 @@ class PeszekPoyatoDynamicsBaseWidget:
 
     def _mark_cache_stale(self, message: str) -> None:
         self._cache_valid = False
+        if self._precompute_busy:
+            self._precompute_stale_message = message
+            self.cache_status_html.value = "<span style='color:#666'>Computing all cached frames...</span>"
+            self.btn_precompute.description = "Interrupt"
+            self.btn_precompute.button_style = "info"
+            self.btn_precompute.disabled = False
+            self._sync_config_status()
+            self._sync_frame_controls(self._frame_index)
+            return
+        self.btn_precompute.description = "Precompute flow"
         self.btn_precompute.disabled = False
         self.btn_precompute.button_style = "warning"
-        self.btn_step.disabled = True
-        self.play.disabled = True
-        self.frame_slider.disabled = True
         self.cache_status_html.value = f"<span style='color:#9a6700'>{message}</span>"
         self._sync_config_status()
-        self._sync_frame_controls(0)
+        self._sync_frame_controls(self._frame_index)
 
     def _mark_cache_ready(self, message: str) -> None:
         self._cache_valid = True
+        self._precompute_busy = False
         count = len(self._frame_payloads)
+        self.btn_precompute.description = "Precompute flow"
         self.btn_precompute.disabled = False
         self.btn_precompute.button_style = "success"
         self.btn_step.disabled = count <= 1
@@ -2406,39 +3330,38 @@ class PeszekPoyatoDynamicsBaseWidget:
         ):
             self._group_names = self._preview_group_names_from_controls()
             self._ensure_fiber_traces(self._group_names)
-            self._mark_cache_stale("Parameters changed. Precompute flow before playback.")
+            self._mark_cache_stale("Parameters changed. Click Interrupt, then Precompute flow.")
             return
 
     def _on_time_direction_toggle(self, change: dict[str, Any]) -> None:
         if self._updating or change.get("name") != "value":
             return
         self._sync_time_direction_label()
-        self._mark_cache_stale("Time direction changed. Precompute flow before playback.")
+        self._mark_cache_stale("Time direction changed. Click Interrupt, then Precompute flow.")
 
     def _on_resample(self, _btn: Any) -> None:
         self._seed += 1
-        self.precompute()
-
-    def _on_precompute_clicked(self, _btn: Any) -> None:
+        if self._precompute_busy:
+            self._mark_cache_stale("Resampled seed. Click Interrupt, then Precompute flow.")
+            return
         self.precompute()
 
     def _on_step(self, _btn: Any) -> None:
-        if not self._cache_valid or len(self._frame_payloads) <= 1:
+        if self._playback_disabled():
             return
         self._set_frame_index((self._frame_index + 1) % len(self._frame_payloads))
 
     def _on_play_tick(self, change: dict[str, Any]) -> None:
         if self._updating or change.get("name") != "value":
             return
-        if not self._cache_valid:
-            self._sync_frame_controls(0)
+        if self._playback_disabled():
             return
         self._set_frame_index(int(change.get("new", 0)), source=self.play)
 
     def _on_frame_slider(self, change: dict[str, Any]) -> None:
         if self._updating or change.get("name") != "value":
             return
-        if not self._cache_valid:
+        if self._playback_disabled():
             return
         self._set_frame_index(int(self.frame_slider.value), source=self.frame_slider)
 
@@ -2572,7 +3495,645 @@ class ProjectivePeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsBaseWidget):
             return
         self._update_projective_enabled()
         self._sync_projective_label()
-        self._mark_cache_stale("External gauge changed. Precompute flow before playback.")
+        self._mark_cache_stale("External gauge changed. Click Interrupt, then Precompute flow.")
+
+
+class PeszekPoyatoContinuousDensityWidget(_AsyncPrecomputeControlsMixin):
+    """Interactive heatmap playback for continuous-density PP simulations."""
+
+    _precompute_worker_thread_name = "pp-density-precompute-worker"
+
+    _PANEL_OPTIONS: tuple[tuple[str, ContinuousDensityPanelChoice], ...] = (
+        ("Marginal rho", "rho"),
+        ("Fiber density r_k", "r_fiber"),
+        ("Velocity magnitude", "velocity_mag"),
+        ("div A_rho", "div_A"),
+    )
+
+    def __init__(
+        self,
+        config: SimulationConfig,
+        result: DensitySimulationResult | None = None,
+        *,
+        width: int = 900,
+        height: int = 720,
+    ) -> None:
+        if widgets is None:
+            raise RuntimeError(
+                "PeszekPoyatoContinuousDensityWidget requires ipywidgets (install the 'widgets' extra) "
+                "and a live notebook kernel."
+            )
+        self.config = config
+        self._seed = int(config.seed)
+        self.width = int(width)
+        self.height = int(height)
+
+        self._result: DensitySimulationResult | None = None
+        self._frame_payloads: list[dict[str, Any]] = []
+        self._frame_index = 0
+        self._cache_valid = False
+        self._updating = False
+        self._init_async_precompute_state()
+        self._density_axis: Array | None = None
+        self._zmax = 1.0
+        self._solver: FFTPeszekPoyatoDensity2D | None = None
+
+        fibers = _normalize_fibers(config)
+        self._group_names: tuple[str, ...] = tuple(
+            spec.name or _shape_name(spec.shape, k) for k, spec in enumerate(fibers)
+        )
+
+        self._build_controls()
+        self._build_figure()
+        self._bind_callbacks()
+        self._sync_config_status()
+        self.layout = widgets.VBox(
+            [
+                widgets.HTML(self._header_html()),
+                self.fig,
+                self.controls,
+                self.stats_html,
+            ]
+        )
+
+        if result is not None:
+            self._ingest_result(result)
+        else:
+            self._mark_cache_stale("Click Precompute to run the density simulation and cache frames.")
+
+    def _header_html(self) -> str:
+        return (
+            "<b>Peszek--Poyato continuous-density dynamics</b><br>"
+            "Precompute runs the explicit finite-volume entropic solver; playback swaps cached heatmaps."
+        )
+
+    def _build_controls(self) -> None:
+        n_fibers = int(max(1, self.config.n_fibers))
+        frame_count = max(0, int(self.config.trajectory_frame_count))
+
+        self.alpha_slider = widgets.FloatSlider(
+            value=float(self.config.alpha),
+            min=0.0,
+            max=0.999,
+            step=0.001,
+            description="alpha",
+            readout_format=".3f",
+            continuous_update=False,
+            layout=widgets.Layout(width="780px"),
+        )
+        self.K_slider = widgets.FloatSlider(
+            value=float(self.config.K),
+            min=0.0,
+            max=max(5.0, 4.0 * float(self.config.K)),
+            step=0.01,
+            description="K",
+            readout_format=".2f",
+            continuous_update=False,
+            layout=widgets.Layout(width="780px"),
+        )
+        self.eps_entropy_slider = widgets.FloatSlider(
+            value=float(self.config.eps_entropy),
+            min=0.0,
+            max=2.0,
+            step=0.01,
+            description="eps",
+            readout_format=".3f",
+            continuous_update=False,
+            layout=widgets.Layout(width="780px"),
+        )
+        self.n_fibers_slider = widgets.IntSlider(
+            value=n_fibers,
+            min=1,
+            max=max(20, n_fibers),
+            step=1,
+            description="omega atoms",
+            continuous_update=False,
+            layout=widgets.Layout(width="410px"),
+        )
+        self.fiber_dropdown = widgets.Dropdown(
+            options=[(f"fiber {k + 1}: {name}", k) for k, name in enumerate(self._group_names)],
+            value=0,
+            description="fiber",
+            layout=widgets.Layout(width="260px"),
+        )
+        self.panel_dropdown = widgets.Dropdown(
+            options=list(self._PANEL_OPTIONS),
+            value="rho",
+            description="panel",
+            layout=widgets.Layout(width="260px"),
+        )
+        self.dynamic_zoom_toggle = widgets.ToggleButton(
+            value=bool(self.config.density_dynamic_zoom),
+            description="Zoom: on",
+            tooltip="Crop/resample heatmaps around active density support (display-only).",
+            layout=widgets.Layout(width="120px"),
+        )
+        backend_g = int(self.config.grid_size)
+        display_min = min(32, max(4, backend_g))
+        self.display_grid_slider = widgets.IntSlider(
+            value=max(display_min, min(int(self.config.density_display_grid_size), backend_g)),
+            min=display_min,
+            max=backend_g,
+            step=8,
+            description="display px",
+            continuous_update=False,
+            layout=widgets.Layout(width="340px"),
+        )
+        self.heatmap_smooth_toggle = widgets.ToggleButton(
+            value=bool(self.config.density_heatmap_smoothing),
+            description="Smooth: on",
+            tooltip="Plotly heatmap z-smoothing for cleaner playback.",
+            layout=widgets.Layout(width="120px"),
+        )
+        self.frame_cap_slider = widgets.IntSlider(
+            value=frame_count,
+            min=0,
+            max=max(20000, int(self.config.max_steps) + 1, frame_count),
+            step=10,
+            description="frame cap",
+            continuous_update=False,
+            layout=widgets.Layout(width="340px"),
+        )
+        self.btn_precompute = widgets.Button(
+            description="Precompute flow",
+            button_style="warning",
+            layout=widgets.Layout(width="140px"),
+        )
+        self.btn_step = widgets.Button(
+            description="Step flow",
+            disabled=True,
+            layout=widgets.Layout(width="100px"),
+        )
+        self.play = widgets.Play(
+            value=0,
+            min=0,
+            max=0,
+            step=1,
+            interval=max(1, int(self.config.animation_frame_duration_ms)),
+            disabled=True,
+            show_repeat=True,
+            layout=widgets.Layout(width="160px"),
+        )
+        if "repeat" in self.play.traits():
+            self.play.repeat = True
+        self.frame_slider = widgets.IntSlider(
+            value=0,
+            min=0,
+            max=0,
+            step=1,
+            description="frame",
+            continuous_update=True,
+            disabled=True,
+            layout=widgets.Layout(width="640px"),
+        )
+        self.frame_counter = widgets.HTML(value="frame 0 / 0", layout=widgets.Layout(width="120px"))
+        self.cache_status_html = widgets.HTML(value="", layout=widgets.Layout(width="420px"))
+        self.config_status_html = widgets.HTML(value="", layout=widgets.Layout(width="620px"))
+        self.stats_html = widgets.HTML(value="")
+        self.controls = widgets.VBox(
+            [
+                widgets.HBox([self.alpha_slider]),
+                widgets.HBox([self.K_slider, self.eps_entropy_slider]),
+                widgets.HBox([self.n_fibers_slider, self.fiber_dropdown, self.panel_dropdown]),
+                widgets.HBox(
+                    [
+                        self.dynamic_zoom_toggle,
+                        self.display_grid_slider,
+                        self.heatmap_smooth_toggle,
+                    ]
+                ),
+                widgets.HBox([self.config_status_html, self.frame_cap_slider]),
+                widgets.HBox([self.btn_step, self.play, self.btn_precompute, self.cache_status_html]),
+                widgets.HBox([self.frame_slider, self.frame_counter]),
+            ]
+        )
+
+    def _build_figure(self) -> None:
+        self.fig = go.FigureWidget(
+            data=[
+                go.Heatmap(
+                    x=[],
+                    y=[],
+                    z=[[0.0]],
+                    colorscale="Viridis",
+                    zmin=0.0,
+                    zmax=1.0,
+                    zsmooth="best" if self.config.density_heatmap_smoothing else False,
+                    colorbar=dict(title="density"),
+                )
+            ],
+            layout=go.Layout(
+                width=self.width,
+                height=self.height,
+                template="plotly_white",
+                title="Continuous-density PP field",
+                margin=dict(l=50, r=30, t=70, b=40),
+            ),
+        )
+        r = self.config.domain_radius
+        self.fig.update_xaxes(title_text="x1", range=[-r, r])
+        self.fig.update_yaxes(title_text="x2", range=[-r, r], scaleanchor="x", scaleratio=1)
+
+    def _bind_callbacks(self) -> None:
+        for control in (
+            self.alpha_slider,
+            self.K_slider,
+            self.eps_entropy_slider,
+            self.n_fibers_slider,
+            self.fiber_dropdown,
+            self.panel_dropdown,
+            self.frame_cap_slider,
+            self.dynamic_zoom_toggle,
+            self.display_grid_slider,
+            self.heatmap_smooth_toggle,
+        ):
+            control.observe(self._on_control_change, names="value")
+        self.btn_precompute.on_click(self._on_precompute_clicked)
+        self.btn_step.on_click(self._on_step)
+        self.play.observe(self._on_play_tick, names="value")
+        self.frame_slider.observe(self._on_frame_slider, names="value")
+
+    def _sync_display_grid_slider_bounds(self) -> None:
+        backend_g = int(self.config.grid_size)
+        display_min = min(32, max(4, backend_g))
+        display_max = max(display_min, backend_g)
+        display_value = int(np.clip(int(self.display_grid_slider.value), display_min, backend_g))
+        self._updating = True
+        try:
+            if int(self.display_grid_slider.min) != display_min:
+                self.display_grid_slider.min = display_min
+            if int(self.display_grid_slider.max) != display_max:
+                self.display_grid_slider.max = display_max
+            if int(self.display_grid_slider.value) != display_value:
+                self.display_grid_slider.value = display_value
+        finally:
+            self._updating = False
+
+    def _dynamic_zoom_enabled(self) -> bool:
+        return bool(self.dynamic_zoom_toggle.value)
+
+    def _sync_zoom_toggle_labels(self) -> None:
+        self.dynamic_zoom_toggle.description = "Zoom: on" if self._dynamic_zoom_enabled() else "Zoom: off"
+        self.heatmap_smooth_toggle.description = "Smooth: on" if bool(self.heatmap_smooth_toggle.value) else "Smooth: off"
+
+    def _config_from_controls(self, *, make_animation: bool) -> SimulationConfig:
+        n_fibers = int(self.n_fibers_slider.value)
+        fibers = tuple(FiberSpec(shape=self.config.shape_names[k % len(self.config.shape_names)]) for k in range(n_fibers))
+        return replace(
+            self.config,
+            alpha=float(self.alpha_slider.value),
+            K=float(self.K_slider.value),
+            eps_entropy=float(self.eps_entropy_slider.value),
+            n_fibers=n_fibers,
+            fibers=fibers,
+            seed=self._seed,
+            make_dashboard=False,
+            make_animation=make_animation,
+            trajectory_frame_count=int(self.frame_cap_slider.value),
+            integrator="fixed_rk2",
+            density_solver="explicit_fv",
+            density_boundary="noflux",
+            record_free_energy=True,
+            record_entropy_balance=True,
+            density_dynamic_zoom=self._dynamic_zoom_enabled(),
+            density_display_grid_size=min(int(self.display_grid_slider.value), int(self.config.grid_size)),
+            density_heatmap_smoothing=bool(self.heatmap_smooth_toggle.value),
+        )
+
+    def _sync_config_status(self, result: DensitySimulationResult | None = None) -> None:
+        self._sync_display_grid_slider_bounds()
+        cfg = self._config_from_controls(make_animation=False)
+        self._sync_zoom_toggle_labels()
+        zoom_text = f"zoom={cfg.density_display_grid_size}px" if cfg.density_dynamic_zoom else "zoom=off"
+        msg = (
+            f"<b>Config:</b> alpha={cfg.alpha:.3f}, K={cfg.K:.2f}, eps={cfg.eps_entropy:.3f}, "
+            f"fibers={cfg.n_fibers}, grid={cfg.grid_size}^2, {zoom_text}"
+        )
+        if result is not None:
+            msg += f", steps={result.steps}, t={result.final_time:.3g}"
+        self.config_status_html.value = msg
+
+    def _capture_precompute_job(self) -> dict[str, Any]:
+        return {"config": self._config_from_controls(make_animation=True)}
+
+    def _prepare_precompute_job(self, job: dict[str, Any]) -> None:
+        cfg = job["config"]
+        self.config = cfg
+        self._group_names = tuple(
+            spec.name or _shape_name(spec.shape, k) for k, spec in enumerate(_normalize_fibers(cfg))
+        )
+        fiber_options = [(f"fiber {k + 1}: {name}", k) for k, name in enumerate(self._group_names)]
+        self._updating = True
+        try:
+            self.fiber_dropdown.options = fiber_options
+            if int(self.fiber_dropdown.value) >= len(fiber_options):
+                self.fiber_dropdown.value = 0
+        finally:
+            self._updating = False
+        self._sync_config_status()
+
+    def _run_precompute_job(self, job: dict[str, Any]) -> DensitySimulationResult:
+        seq = int(job["seq"])
+        return run_density_simulation(
+            job["config"],
+            cancel_check=lambda: self._is_precompute_cancelled(seq),
+        )
+
+    def _ingest_precompute_result(self, result: DensitySimulationResult) -> None:
+        self._ingest_result(result)
+
+    def _mark_cache_stale(self, message: str) -> None:
+        self._cache_valid = False
+        if self._precompute_busy:
+            self._precompute_stale_message = message
+            self.cache_status_html.value = "<span style='color:#666'>Computing all cached frames...</span>"
+            self.btn_precompute.description = "Interrupt"
+            self.btn_precompute.button_style = "info"
+            self.btn_precompute.disabled = False
+            self._sync_config_status()
+            self._sync_frame_controls(self._frame_index)
+            return
+        self.btn_precompute.description = "Precompute flow"
+        self.btn_precompute.button_style = "warning"
+        self.btn_precompute.disabled = False
+        self.cache_status_html.value = f"<span style='color:#9a6700'>{message}</span>"
+        self._sync_config_status()
+        self._sync_frame_controls(self._frame_index)
+
+    def _mark_cache_ready(self, message: str) -> None:
+        self._cache_valid = True
+        self._precompute_busy = False
+        count = len(self._frame_payloads)
+        self.btn_precompute.description = "Precompute flow"
+        self.btn_precompute.button_style = "success"
+        self.btn_precompute.disabled = False
+        self.cache_status_html.value = f"<span style='color:#188038'>{message}</span>"
+        self._sync_config_status()
+        self._sync_frame_controls(self._frame_index)
+
+    def _sync_frame_controls(self, frame_index: int) -> None:
+        max_frame = max(0, len(self._frame_payloads) - 1)
+        frame_index = int(np.clip(frame_index, 0, max_frame))
+        disabled = self._playback_disabled()
+        self._updating = True
+        try:
+            self.frame_slider.min = 0
+            self.frame_slider.max = max_frame
+            self.frame_slider.value = frame_index
+            self.frame_slider.disabled = disabled
+            self.play.min = 0
+            self.play.max = max_frame
+            self.play.value = frame_index
+            self.play.disabled = disabled
+            self.btn_step.disabled = disabled
+            self.frame_counter.value = f"frame {frame_index} / {max_frame}"
+        finally:
+            self._updating = False
+
+    def _set_frame_index(self, index: int, *, source: Any | None = None) -> None:
+        if not self._frame_payloads:
+            return
+        index = int(np.clip(index, 0, len(self._frame_payloads) - 1))
+        self._frame_index = index
+        self._apply_cached_frame(self._frame_payloads[index])
+        self._updating = True
+        try:
+            if source is not self.frame_slider:
+                self.frame_slider.value = index
+            if source is not self.play:
+                pass
+            elif hasattr(self.play, "value"):
+                self.play.value = index
+            self.frame_counter.value = f"frame {index} / {len(self._frame_payloads) - 1}"
+        finally:
+            self._updating = False
+
+    def _plotly_values(self, arr: Array) -> list[float]:
+        return np.asarray(arr, dtype=np.float64).tolist()
+
+    def _apply_cached_frame(self, payload: dict[str, Any]) -> None:
+        with self.fig.batch_update():
+            heatmap = self.fig.data[0]
+            heatmap.x = self._plotly_values(np.asarray(payload["x"], dtype=np.float64))
+            heatmap.y = self._plotly_values(np.asarray(payload["y"], dtype=np.float64))
+            heatmap.z = payload["z"]
+            heatmap.zmin = 0.0 if payload["panel"] != "div_A" else payload.get("zmin", 0.0)
+            heatmap.zmax = float(payload.get("zmax", self._zmax))
+            heatmap.zsmooth = "best" if payload.get("heatmap_smoothing", True) else False
+            x_range = payload.get("x_range", [-self.config.domain_radius, self.config.domain_radius])
+            y_range = payload.get("y_range", [-self.config.domain_radius, self.config.domain_radius])
+            self.fig.update_xaxes(range=list(x_range))
+            self.fig.update_yaxes(range=list(y_range))
+            self.fig.layout.title = payload.get("title", self.fig.layout.title)
+        stats = payload.get("stats", "")
+        if stats:
+            self.stats_html.value = stats
+
+    def _support_field_for_panel(
+        self,
+        panel: ContinuousDensityPanelChoice,
+        r_fiber: Array,
+        rho: Array,
+        fiber: int,
+    ) -> Array:
+        if panel == "r_fiber":
+            idx = int(np.clip(fiber, 0, r_fiber.shape[0] - 1))
+            return r_fiber[idx]
+        return rho
+
+    def _build_frame_payloads(self, result: DensitySimulationResult, cfg: SimulationConfig) -> list[dict[str, Any]]:
+        solver = FFTPeszekPoyatoDensity2D(cfg.alpha, cfg.K, cfg.grid_size, cfg.domain_radius)
+        self._solver = solver
+        axis = _density_axis(cfg, cfg.grid_size)
+        self._density_axis = axis
+        panel = self.panel_dropdown.value
+        fiber = int(self.fiber_dropdown.value)
+        payloads: list[dict[str, Any]] = []
+
+        if result.trajectory_r_fiber is None or result.trajectory_rho is None:
+            frames_r = [result.r_fiber]
+            frames_rho = [result.rho_grid]
+            frame_steps = [int(result.steps)]
+        else:
+            frames_r = list(result.trajectory_r_fiber)
+            frames_rho = list(result.trajectory_rho)
+            frame_steps = [int(s) for s in result.trajectory_steps] if result.trajectory_steps is not None else list(range(len(frames_rho)))
+
+        raw_windows: list[_DensityZoomWindow] = []
+        for frame_rho in frames_rho:
+            support = self._support_field_for_panel(
+                panel,
+                np.asarray(frames_r[len(raw_windows)], dtype=np.float64),
+                np.asarray(frame_rho, dtype=np.float64),
+                fiber,
+            )
+            raw_windows.append(
+                _density_support_window(
+                    support,
+                    axis,
+                    L=float(cfg.domain_radius),
+                    mass_fraction=float(cfg.density_dynamic_zoom_mass),
+                    margin=float(cfg.density_dynamic_zoom_margin),
+                    min_half_width=cfg.density_dynamic_zoom_min_width,
+                )
+            )
+
+        smoothed_windows: list[_DensityZoomWindow | None] = []
+        previous: _DensityZoomWindow | None = None
+        for raw in raw_windows:
+            if cfg.density_dynamic_zoom:
+                previous = _smooth_density_zoom_window(previous, raw, float(cfg.density_dynamic_zoom_smoothing))
+                smoothed_windows.append(previous)
+            else:
+                smoothed_windows.append(None)
+
+        zmax = 0.0
+        for frame_idx, (frame_r, frame_rho) in enumerate(zip(frames_r, frames_rho, strict=True)):
+            frame_r = np.asarray(frame_r, dtype=np.float64)
+            frame_rho = np.asarray(frame_rho, dtype=np.float64)
+            field, title, zmin = self._panel_array(
+                panel,
+                frame_r,
+                frame_rho,
+                solver,
+                result.initial.omega,
+                result.initial.nu,
+                fiber,
+            )
+            edge_mass = _density_edge_mass_fraction(
+                frame_rho,
+                axis,
+                float(cfg.domain_radius),
+                float(cfg.density_edge_band_fraction),
+            )
+            display = _density_display_payload_from_grid(
+                field,
+                axis,
+                cfg,
+                dynamic_zoom=bool(cfg.density_dynamic_zoom),
+                window=smoothed_windows[frame_idx],
+            )
+            z = display["z"]
+            zmax = max(zmax, float(np.max(z)))
+            step = frame_steps[frame_idx] if frame_idx < len(frame_steps) else frame_idx
+            zoom_note = "dynamic zoom" if display["zoomed"] else "full domain"
+            stats = (
+                f"frame {frame_idx + 1}/{len(frames_rho)}; step={step}; "
+                f"edge_mass={edge_mass:.3e}; {zoom_note}; "
+                f"x=[{display['x_range'][0]:.3g}, {display['x_range'][1]:.3g}]"
+            )
+            payloads.append(
+                {
+                    "panel": panel,
+                    "z": self._plotly_values(z.T),
+                    "x": self._plotly_values(display["x"]),
+                    "y": self._plotly_values(display["y"]),
+                    "x_range": list(display["x_range"]),
+                    "y_range": list(display["y_range"]),
+                    "zmax": float(np.max(z)),
+                    "zmin": zmin,
+                    "title": title,
+                    "stats": stats,
+                    "edge_mass_fraction": edge_mass,
+                    "heatmap_smoothing": bool(cfg.density_heatmap_smoothing),
+                }
+            )
+        self._zmax = max(zmax, 1e-12)
+        for payload in payloads:
+            payload["zmax"] = self._zmax
+        return payloads
+
+    def _panel_array(
+        self,
+        panel: ContinuousDensityPanelChoice,
+        r_fiber: Array,
+        rho: Array,
+        solver: FFTPeszekPoyatoDensity2D,
+        omega: Array,
+        nu: Array,
+        fiber: int,
+    ) -> tuple[Array, str, float]:
+        if panel == "rho":
+            return rho, "Marginal density rho(x)", 0.0
+        if panel == "r_fiber":
+            idx = int(np.clip(fiber, 0, r_fiber.shape[0] - 1))
+            return r_fiber[idx], f"Fiber density r_{idx + 1}(x)", 0.0
+        Ax, Ay = solver.A_grid_from_rho(rho)
+        if panel == "velocity_mag":
+            idx = int(np.clip(fiber, 0, omega.shape[0] - 1))
+            speed = np.sqrt((omega[idx, 0] - Ax) ** 2 + (omega[idx, 1] - Ay) ** 2)
+            return speed, f"|omega_{idx + 1} - A_rho|", 0.0
+        Hxx, _, Hyy = solver.hessian_grid_from_rho(rho)
+        trace = Hxx + Hyy
+        return trace, "trace div A_rho = Hxx + Hyy", float(np.min(trace))
+
+    def _ingest_result(self, result: DensitySimulationResult) -> None:
+        cfg = self._config_from_controls(make_animation=True)
+        self._result = result
+        self._frame_payloads = self._build_frame_payloads(result, cfg)
+        self._frame_index = 0
+        if self._frame_payloads:
+            self._apply_cached_frame(self._frame_payloads[0])
+        self._mark_cache_ready(f"Cache ready: {len(self._frame_payloads)} frames.")
+
+    def _on_control_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        if change.get("owner") in (
+            self.panel_dropdown,
+            self.fiber_dropdown,
+            self.dynamic_zoom_toggle,
+            self.display_grid_slider,
+            self.heatmap_smooth_toggle,
+        ) and self._result is not None:
+            self._sync_zoom_toggle_labels()
+            self._frame_payloads = self._build_frame_payloads(self._result, self._config_from_controls(make_animation=True))
+            self._cache_valid = bool(self._frame_payloads)
+            self._set_frame_index(self._frame_index)
+            return
+        if change.get("owner") is self.n_fibers_slider:
+            n_fibers = int(self.n_fibers_slider.value)
+            self._group_names = tuple(
+                spec.name or _shape_name(spec.shape, k) for k, spec in enumerate(_normalize_fibers(replace(self.config, n_fibers=n_fibers)))
+            )
+            self.fiber_dropdown.options = [(f"fiber {k + 1}: {name}", k) for k, name in enumerate(self._group_names)]
+        self._mark_cache_stale("Parameters changed. Click Interrupt, then Precompute flow.")
+
+    def _on_step(self, _btn: Any) -> None:
+        if self._playback_disabled():
+            return
+        self._set_frame_index((self._frame_index + 1) % len(self._frame_payloads))
+
+    def _on_play_tick(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        if self._playback_disabled():
+            return
+        self._set_frame_index(int(change.get("new", 0)), source=self.play)
+
+    def _on_frame_slider(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        if self._playback_disabled():
+            return
+        self._set_frame_index(int(self.frame_slider.value), source=self.frame_slider)
+
+    def _ipython_display_(self) -> None:  # pragma: no cover - notebook display hook
+        from IPython.display import display
+
+        display(self.layout)
+
+
+def make_continuous_density_widget(
+    config: SimulationConfig,
+    result: DensitySimulationResult | None = None,
+    *,
+    width: int = 900,
+    height: int = 720,
+) -> PeszekPoyatoContinuousDensityWidget:
+    """Build the continuous-density PP notebook widget."""
+
+    return PeszekPoyatoContinuousDensityWidget(config, result=result, width=width, height=height)
 
 
 def make_dashboard(result: SimulationResult, analysis: GeometryAnalysis, config: SimulationConfig) -> go.Figure:
@@ -2800,7 +4361,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--n-fibers", type=int, default=10, help="number of conserved omega groups")
     parser.add_argument("--n-per-fiber", type=int, default=2000, help="particles per omega group")
     parser.add_argument("--shapes", default=",".join(DEFAULT_SHAPES), help="comma-separated shape names, cycled across fibers")
-    parser.add_argument("--initialization-algorithm", choices=("raw", "legacy_fast_phase"), default="raw")
+    parser.add_argument("--initialization-algorithm", choices=("raw", "alpha_ball"), default="raw")
     parser.add_argument("--initialization-fast-steps", type=int, default=40)
     parser.add_argument("--initialization-fast-min-steps", type=int, default=6)
     parser.add_argument("--initialization-fast-window", type=int, default=3)
