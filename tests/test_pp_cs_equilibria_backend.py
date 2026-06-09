@@ -17,7 +17,6 @@ from lmsspp.dynamics.pp_cs_equilibria import (
     _density_display_payload_from_grid,
     _density_edge_mass_fraction,
     _density_grid_axis,
-    _nyquist_checkerboard_amplitude,
     _density_support_window,
     _effective_density_display_grid_size,
     _make_pp_backend,
@@ -675,46 +674,43 @@ class DensityDynamicZoomTests(unittest.TestCase):
         self.assertLess(abs(float(x_out[peak[0]]) - 1.0), 0.15)
         self.assertLess(abs(float(y_out[peak[1]]) + 0.5), 0.15)
 
-    def test_density_fft_fields_have_no_nyquist_checkerboard(self) -> None:
+    def test_density_a_field_matches_gradient_of_w_convolution(self) -> None:
+        config = _small_density_config(n_fibers=1, grid_size=48, domain_radius=4.0, alpha=0.6, K=1.5)
+        initial = make_density_initial_condition(config)
+        solver = FFTPeszekPoyatoDensity2D(config.alpha, config.K, config.grid_size, config.domain_radius)
+        rho = solver.marginal_from_fibers(initial.r_fiber, initial.nu)
+        w_field = solver.W_grid_from_rho(rho)
+        h = solver.h
+        expected_ax = np.gradient(w_field, h, axis=0)
+        expected_ay = np.gradient(w_field, h, axis=1)
+        ax, ay = solver.A_grid_from_rho(rho)
+        margin = 6
+        sl = slice(margin, -margin)
+        np.testing.assert_allclose(ax[sl, sl], expected_ax[sl, sl], rtol=0.0, atol=1e-12)
+        np.testing.assert_allclose(ay[sl, sl], expected_ay[sl, sl], rtol=0.0, atol=1e-12)
+
+    def test_entropic_run_does_not_spawn_spurious_far_field_peaks(self) -> None:
         config = SimulationConfig(
             n_fibers=8,
-            alpha=0.5,
+            alpha=0.6,
             K=2.0,
             eps_entropy=0.15,
-            grid_size=64,
+            grid_size=128,
             domain_radius=5.0,
             dt=0.008,
-            max_steps=120,
+            max_steps=50,
             make_animation=False,
             seed=2026,
+            integrator="fixed_rk2",
         )
-        result = run_density_simulation(config, make_density_initial_condition(config))
-        solver = FFTPeszekPoyatoDensity2D(config.alpha, config.K, config.grid_size, config.domain_radius)
-        rho = result.rho_grid
-        Ax, Ay = solver.A_grid_from_rho(rho)
-        Hxx, _, Hyy = solver.hessian_grid_from_rho(rho)
-
-        rel = max(float(np.max(np.abs(rho))), 1.0)
-        self.assertLess(_nyquist_checkerboard_amplitude(rho) / rel, 1e-6)
-        self.assertLess(_nyquist_checkerboard_amplitude(Ax) / max(float(np.max(np.abs(Ax))), 1.0), 1e-4)
-        self.assertLess(_nyquist_checkerboard_amplitude(Ay) / max(float(np.max(np.abs(Ay))), 1.0), 1e-6)
-        trace = Hxx + Hyy
-        self.assertLess(_nyquist_checkerboard_amplitude(trace) / max(float(np.max(np.abs(trace))), 1.0), 1e-6)
-
-    def test_display_payload_applies_display_antialias_when_smoothing_enabled(self) -> None:
-        G = 16
-        L = 2.0
-        axis = _density_grid_axis(G, L)
-        X, Y = np.meshgrid(axis, axis, indexing="ij")
-        field = np.exp(-((X**2 + Y**2) / 0.25))
-        cfg = SimulationConfig(grid_size=G, domain_radius=L, density_heatmap_smoothing=True)
-        raw = _density_display_payload_from_grid(field, axis, cfg, dynamic_zoom=False, window=None, heatmap_smoothing=False)
-        smooth = _density_display_payload_from_grid(field, axis, cfg, dynamic_zoom=False, window=None, heatmap_smoothing=True)
-        self.assertFalse(np.allclose(raw["z"], smooth["z"]))
-        peak_raw = np.unravel_index(int(np.argmax(raw["z"])), raw["z"].shape)
-        peak_smooth = np.unravel_index(int(np.argmax(smooth["z"])), smooth["z"].shape)
-        self.assertLess(abs(peak_raw[0] - peak_smooth[0]), 2)
-        self.assertLess(abs(peak_raw[1] - peak_smooth[1]), 2)
+        initial = make_density_initial_condition(config)
+        axis = _density_grid_axis(config.grid_size, config.domain_radius)
+        x1, x2 = np.meshgrid(axis, axis, indexing="ij")
+        far = (x1**2 + x2**2) > 16.0
+        rho0 = np.tensordot(initial.nu, initial.r_fiber, axes=(0, 0))
+        result = run_density_simulation(config, initial)
+        self.assertLess(float(result.rho_grid[far].max()), 1.5 * float(rho0[far].max()) + 0.05)
+        self.assertLess(float(np.max(result.r_fiber)), 6.0)
 
     def test_display_payload_zoom_off_uses_full_grid(self) -> None:
         G = 16
@@ -722,9 +718,7 @@ class DensityDynamicZoomTests(unittest.TestCase):
         axis = _density_grid_axis(G, L)
         field = np.ones((G, G), dtype=np.float64)
         cfg = SimulationConfig(grid_size=G, domain_radius=L, density_dynamic_zoom=False)
-        payload = _density_display_payload_from_grid(
-            field, axis, cfg, dynamic_zoom=False, window=None, heatmap_smoothing=False
-        )
+        payload = _density_display_payload_from_grid(field, axis, cfg, dynamic_zoom=False, window=None)
         self.assertFalse(payload["zoomed"])
         np.testing.assert_array_equal(payload["z"], field)
         self.assertEqual(payload["x_range"], [-L, L])

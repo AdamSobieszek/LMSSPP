@@ -450,6 +450,8 @@ class FFTPeszekPoyato2D:
 class FFTPeszekPoyatoDensity2D:
     """Grid/FFT evaluator for continuous-density PP fields and diagnostics."""
 
+    _BOUNDED_PAD_FACTOR = 4
+
     def __init__(self, alpha: float, K: float, grid_size: int, domain_radius: float):
         if not 0.0 <= alpha < 1.0:
             raise ValueError("continuous density requires 0 <= alpha < 1")
@@ -463,28 +465,12 @@ class FFTPeszekPoyatoDensity2D:
         self.G = int(grid_size)
         self.L = float(domain_radius)
         self.h = 2 * self.L / self.G
-        self.P = 2 * self.G
+        self.P = self._BOUNDED_PAD_FACTOR * self.G
+        self._embed_offset = (self.P - self.G) // 2
         self.cell_area = self.h * self.h
 
-        kernels = self._build_kernels()
-        self.fft_Kx = np.fft.rfft2(kernels[0])
-        self.fft_Ky = np.fft.rfft2(kernels[1])
-        self.fft_Hxx = np.fft.rfft2(kernels[2])
-        self.fft_Hxy = np.fft.rfft2(kernels[3])
-        self.fft_Hyy = np.fft.rfft2(kernels[4])
-        self.fft_W = np.fft.rfft2(kernels[5])
-
-    def convolve(self, rho_grid: Array, fft_kernel: Array) -> Array:
-        padded = np.zeros((self.P, self.P), dtype=np.float64)
-        padded[: self.G, : self.G] = rho_grid
-        conv = np.fft.irfft2(np.fft.rfft2(padded) * fft_kernel, s=(self.P, self.P))
-        return conv[: self.G, : self.G]
-
-    def convolve_fields(self, rho_grid: Array, fft_kernels: Sequence[Array]) -> tuple[Array, ...]:
-        padded = np.zeros((self.P, self.P), dtype=np.float64)
-        padded[: self.G, : self.G] = rho_grid
-        rho_hat = np.fft.rfft2(padded)
-        return tuple(np.fft.irfft2(rho_hat * fft_kernel, s=(self.P, self.P))[: self.G, : self.G] for fft_kernel in fft_kernels)
+        w_kernel = self._build_w_kernel()
+        self.fft_W = np.fft.rfft2(w_kernel)
 
     def marginal_from_fibers(self, r_fiber: Array, nu: Array) -> Array:
         return np.tensordot(nu, r_fiber, axes=(0, 0))
@@ -492,49 +478,46 @@ class FFTPeszekPoyatoDensity2D:
     def _mass_grid_from_density(self, rho_grid: Array) -> Array:
         return rho_grid * self.cell_area
 
-    def A_grid_from_rho(self, rho_grid: Array) -> tuple[Array, Array]:
-        mass_grid = self._mass_grid_from_density(rho_grid)
-        Ax_grid, Ay_grid = self.convolve_fields(mass_grid, (self.fft_Kx, self.fft_Ky))
-        return Ax_grid, Ay_grid
+    def _embed_mass(self, mass_grid: Array) -> Array:
+        padded = np.zeros((self.P, self.P), dtype=np.float64)
+        off = self._embed_offset
+        padded[off : off + self.G, off : off + self.G] = mass_grid
+        return padded
 
-    def hessian_grid_from_rho(self, rho_grid: Array) -> tuple[Array, Array, Array]:
-        mass_grid = self._mass_grid_from_density(rho_grid)
-        return self.convolve_fields(mass_grid, (self.fft_Hxx, self.fft_Hxy, self.fft_Hyy))  # type: ignore[return-value]
+    def convolve(self, mass_grid: Array, fft_kernel: Array) -> Array:
+        padded = self._embed_mass(mass_grid)
+        conv = np.fft.irfft2(np.fft.rfft2(padded) * fft_kernel, s=(self.P, self.P))
+        off = self._embed_offset
+        return conv[off : off + self.G, off : off + self.G]
 
     def W_grid_from_rho(self, rho_grid: Array) -> Array:
-        mass_grid = self._mass_grid_from_density(rho_grid)
-        return self.convolve(mass_grid, self.fft_W)
+        return self.convolve(self._mass_grid_from_density(rho_grid), self.fft_W)
 
-    def _build_kernels(self) -> tuple[Array, Array, Array, Array, Array, Array]:
+    def A_grid_from_rho(self, rho_grid: Array) -> tuple[Array, Array]:
+        """A_rho = grad(W^alpha * rho) on the grid, using one scalar bounded FFT pass."""
+        w_field = self.W_grid_from_rho(rho_grid)
+        ax_grid = np.gradient(w_field, self.h, axis=0)
+        ay_grid = np.gradient(w_field, self.h, axis=1)
+        return ax_grid, ay_grid
+
+    def hessian_grid_from_rho(self, rho_grid: Array) -> tuple[Array, Array, Array]:
+        """Hessian of the scalar interaction potential, consistent with A = grad W."""
+        w_field = self.W_grid_from_rho(rho_grid)
+        ax_grid = np.gradient(w_field, self.h, axis=0)
+        ay_grid = np.gradient(w_field, self.h, axis=1)
+        hxx = np.gradient(ax_grid, self.h, axis=0)
+        hxy = np.gradient(ax_grid, self.h, axis=1)
+        hyy = np.gradient(ay_grid, self.h, axis=1)
+        return hxx, hxy, hyy
+
+    def _build_w_kernel(self) -> Array:
         coords = make_lag_coords(self.P, self.h)
-        Xlag, Ylag = np.meshgrid(coords, coords, indexing="ij")
-        R = np.sqrt(Xlag**2 + Ylag**2)
-        mask = R > 1e-14
-
-        Kx = np.zeros((self.P, self.P), dtype=np.float64)
-        Ky = np.zeros((self.P, self.P), dtype=np.float64)
-        scale_grad = np.zeros_like(R)
-        scale_grad[mask] = (R[mask] ** (-self.alpha)) / (1 - self.alpha)
-        Kx[mask] = self.K * Xlag[mask] * scale_grad[mask]
-        Ky[mask] = self.K * Ylag[mask] * scale_grad[mask]
-
-        ex = np.zeros_like(R)
-        ey = np.zeros_like(R)
-        ex[mask] = Xlag[mask] / R[mask]
-        ey[mask] = Ylag[mask] / R[mask]
-
-        scale_hess = np.zeros_like(R)
-        scale_hess[mask] = self.K * (R[mask] ** (-self.alpha)) / (1 - self.alpha)
-        Hxx = np.zeros((self.P, self.P), dtype=np.float64)
-        Hxy = np.zeros((self.P, self.P), dtype=np.float64)
-        Hyy = np.zeros((self.P, self.P), dtype=np.float64)
-        Hxx[mask] = scale_hess[mask] * (1 - self.alpha * ex[mask] * ex[mask])
-        Hxy[mask] = scale_hess[mask] * (-self.alpha * ex[mask] * ey[mask])
-        Hyy[mask] = scale_hess[mask] * (1 - self.alpha * ey[mask] * ey[mask])
-
-        W = np.zeros((self.P, self.P), dtype=np.float64)
-        W[mask] = self.K * (R[mask] ** (1 - self.alpha)) / (1 - self.alpha)
-        return Kx, Ky, Hxx, Hxy, Hyy, W
+        xlag, ylag = np.meshgrid(coords, coords, indexing="ij")
+        r = np.sqrt(xlag**2 + ylag**2)
+        mask = r > 1e-14
+        w = np.zeros((self.P, self.P), dtype=np.float64)
+        w[mask] = self.K * (r[mask] ** (2 - self.alpha)) / ((2 - self.alpha) * (1 - self.alpha))
+        return w
 
 
 class TorchPeszekPoyato2D:
@@ -1380,30 +1363,6 @@ def _bilinear_resample_field(
     return sampled, x_out, y_out
 
 
-def _nyquist_checkerboard_amplitude(field: Array) -> float:
-    """Amplitude of the (-1)^(i+j) checkerboard mode relative to the field mean."""
-
-    values = np.asarray(field, dtype=np.float64)
-    if values.size == 0:
-        return 0.0
-    ii, jj = np.indices(values.shape)
-    mode = (-1.0) ** (ii + jj)
-    centered = values - float(values.mean())
-    return float(np.sum(centered * mode) / np.sum(mode * mode))
-
-
-def _antialias_display_field(field: Array) -> Array:
-    """Display-only separable binomial blur; leaves backend simulation grids untouched."""
-
-    values = np.asarray(field, dtype=np.float64)
-    if values.ndim != 2 or min(values.shape) < 3:
-        return values
-    padded = np.pad(values, ((1, 1), (1, 1)), mode="edge")
-    along_x = (padded[1:-1, :-2] + 2.0 * padded[1:-1, 1:-1] + padded[1:-1, 2:]) * 0.25
-    padded_y = np.pad(along_x, ((1, 1), (0, 0)), mode="edge")
-    return (padded_y[:-2] + 2.0 * padded_y[1:-1] + padded_y[2:]) * 0.25
-
-
 def _density_edge_mass_fraction(
     rho: Array,
     axis: Array,
@@ -1429,10 +1388,8 @@ def _density_display_payload_from_grid(
     *,
     dynamic_zoom: bool,
     window: _DensityZoomWindow | None,
-    heatmap_smoothing: bool | None = None,
 ) -> dict[str, Any]:
     L = float(cfg.domain_radius)
-    smooth_display = bool(cfg.density_heatmap_smoothing if heatmap_smoothing is None else heatmap_smoothing)
     if dynamic_zoom and window is not None:
         x_lo, x_hi, y_lo, y_hi = window.as_bounds()
         z, x_axis, y_axis = _bilinear_resample_field(
@@ -1444,23 +1401,21 @@ def _density_display_payload_from_grid(
             y_hi,
             int(_effective_density_display_grid_size(cfg)),
         )
-    else:
-        z = np.asarray(field, dtype=np.float64)
-        x_axis = np.asarray(axis, dtype=np.float64)
-        y_axis = np.asarray(axis, dtype=np.float64)
-        x_lo = -L
-        x_hi = L
-        y_lo = -L
-        y_hi = L
-    if smooth_display:
-        z = _antialias_display_field(z)
+        return {
+            "z": np.asarray(z, dtype=np.float64),
+            "x": np.asarray(x_axis, dtype=np.float64),
+            "y": np.asarray(y_axis, dtype=np.float64),
+            "x_range": [float(x_lo), float(x_hi)],
+            "y_range": [float(y_lo), float(y_hi)],
+            "zoomed": True,
+        }
     return {
-        "z": np.asarray(z, dtype=np.float64),
-        "x": np.asarray(x_axis, dtype=np.float64),
-        "y": np.asarray(y_axis, dtype=np.float64),
-        "x_range": [float(x_lo), float(x_hi)],
-        "y_range": [float(y_lo), float(y_hi)],
-        "zoomed": bool(dynamic_zoom and window is not None),
+        "z": np.asarray(field, dtype=np.float64),
+        "x": np.asarray(axis, dtype=np.float64),
+        "y": np.asarray(axis, dtype=np.float64),
+        "x_range": [-L, L],
+        "y_range": [-L, L],
+        "zoomed": False,
     }
 
 
