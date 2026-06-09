@@ -2333,6 +2333,7 @@ class LMSBall3DWidget:
             return "Perpendicular-variance proxy"
         return "Entropy kernel proxy"
 
+
     def _primary_metric_series_name(self) -> str:
         if self.init_metric_mode == "perp_variance":
             return "perp-variance proxy"

@@ -35,6 +35,16 @@ export_media = [
   "imageio>=2.34",
   "imageio-ffmpeg>=0.4.9",
 ]
+research = [
+  "pyyaml>=6.0",
+  "plotly>=5.0",
+  "matplotlib>=3.8",
+  "imageio>=2.34",
+  "imageio-ffmpeg>=0.4.9",
+]
+
+[project.scripts]
+lmsspp-pp-research = "lmsspp.research_experiments:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

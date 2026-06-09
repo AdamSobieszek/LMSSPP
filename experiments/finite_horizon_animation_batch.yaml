@@ -1,0 +1,34 @@
+experiment: finite_horizon_animation_batch
+output_dir: temp_research/finite_horizon_animation_batch_yaml
+
+params:
+  n_fibers: 10
+  n_per_fiber: 200
+  grid_size: 128
+  domain_radius: 4.0
+  old_fixed_steps: 400
+  adaptive_steps_per_horizon: 4
+  animation_frames: 200
+  fps: 15
+
+cases:
+  - label: seed2026_alpha0p99_tau0p055
+    seed: 2026
+    alpha: 0.99
+    K: 1.0
+    tau: 0.055
+  - label: seed2027_alpha0p99_tau0p045
+    seed: 2027
+    alpha: 0.99
+    K: 1.0
+    tau: 0.045
+  - label: seed2028_alpha0p995_tau0p0275
+    seed: 2028
+    alpha: 0.995
+    K: 1.0
+    tau: 0.0275
+  - label: seed2029_alpha0p98_K1p2_tau0p055
+    seed: 2029
+    alpha: 0.98
+    K: 1.2
+    tau: 0.055

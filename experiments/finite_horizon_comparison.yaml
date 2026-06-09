@@ -1,0 +1,14 @@
+experiment: finite_horizon_comparison
+output_dir: temp_research/finite_horizon_comparison_yaml
+
+params:
+  n_fibers: 10
+  n_per_fiber: 50
+  alpha: 0.99
+  K: 1.0
+  grid_size: 128
+  domain_radius: 4.0
+  tau: 0.055
+  old_fixed_steps: 200
+  adaptive_steps_per_horizon: 4
+  seed: 2026

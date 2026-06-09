@@ -173,6 +173,9 @@ class SimulationConfig:
     time_direction: TimeDirectionChoice = "forward"
     external_field: ExternalFieldChoice = "affine"
     projective_epsilon: float = 0.0
+    prediction_horizon_tau: float = 0.055
+    hamiltonian_q: float = 2.0
+    hamiltonian_epsH: float = 0.0
     adaptive_tol: float = 5.0e-3
     dt_min: float = 1.0e-4
     dt_max: float = 0.09
@@ -343,6 +346,7 @@ class FFTPeszekPoyato2D:
         self.fft_Hxx = np.fft.rfft2(kernels[2])
         self.fft_Hxy = np.fft.rfft2(kernels[3])
         self.fft_Hyy = np.fft.rfft2(kernels[4])
+        self.fft_W = np.fft.rfft2(kernels[5])
 
     def clip_inside(self, x: Array) -> Array:
         margin = 2.1 * self.h
@@ -418,7 +422,12 @@ class FFTPeszekPoyato2D:
     def hessian_grid_from_rho(self, rho_grid: Array) -> tuple[Array, Array, Array]:
         return self.convolve_fields(rho_grid, (self.fft_Hxx, self.fft_Hxy, self.fft_Hyy))  # type: ignore[return-value]
 
-    def _build_kernels(self) -> tuple[Array, Array, Array, Array, Array]:
+    def W_grid_from_particles(self, x: Array) -> tuple[Array, Array]:
+        rho_grid = deposit_mass(x, self.G, self.L)
+        W_grid = self.convolve(rho_grid, self.fft_W)
+        return rho_grid, W_grid
+
+    def _build_kernels(self) -> tuple[Array, Array, Array, Array, Array, Array]:
         coords = make_lag_coords(self.P, self.h)
         Xlag, Ylag = np.meshgrid(coords, coords, indexing="ij")
         R = np.sqrt(Xlag**2 + Ylag**2)
@@ -444,7 +453,12 @@ class FFTPeszekPoyato2D:
         Hxx[mask] = scale_hess[mask] * (1 - self.alpha * ex[mask] * ex[mask])
         Hxy[mask] = scale_hess[mask] * (-self.alpha * ex[mask] * ey[mask])
         Hyy[mask] = scale_hess[mask] * (1 - self.alpha * ey[mask] * ey[mask])
-        return Kx, Ky, Hxx, Hxy, Hyy
+        W = np.zeros((self.P, self.P), dtype=np.float64)
+        if abs(self.alpha - 2.0) < 1e-9:
+            W[mask] = -self.K * np.log(R[mask])
+        else:
+            W[mask] = self.K * (R[mask] ** (2 - self.alpha)) / ((2 - self.alpha) * (1 - self.alpha))
+        return Kx, Ky, Hxx, Hxy, Hyy, W
 
 
 class FFTPeszekPoyatoDensity2D:
@@ -562,6 +576,7 @@ class TorchPeszekPoyato2D:
         self.fft_Hxx = torch.fft.rfft2(kernels[2])
         self.fft_Hxy = torch.fft.rfft2(kernels[3])
         self.fft_Hyy = torch.fft.rfft2(kernels[4])
+        self.fft_W = torch.fft.rfft2(kernels[5])
 
     def asarray(self, x: Array) -> Any:
         return torch.as_tensor(x, dtype=self.dtype, device=self.device)
@@ -656,6 +671,11 @@ class TorchPeszekPoyato2D:
     def hessian_grid_from_rho(self, rho_grid: Any) -> tuple[Any, Any, Any]:
         return self.convolve_fields(rho_grid, (self.fft_Hxx, self.fft_Hxy, self.fft_Hyy))  # type: ignore[return-value]
 
+    def W_grid_from_particles(self, x: Any) -> tuple[Any, Any]:
+        rho_grid = self.deposit_mass(x)
+        W_grid = self.convolve(rho_grid, self.fft_W)
+        return rho_grid, W_grid
+
     def cic_indices_weights(self, x: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
         h = 2 * self.L / self.G
         u = (x[:, 0] + self.L) / h
@@ -682,7 +702,7 @@ class TorchPeszekPoyato2D:
         i, j, w00, w10, w01, w11 = weights
         return field[i, j] * w00 + field[i + 1, j] * w10 + field[i, j + 1] * w01 + field[i + 1, j + 1] * w11
 
-    def _build_kernels(self) -> tuple[Any, Any, Any, Any, Any]:
+    def _build_kernels(self) -> tuple[Any, Any, Any, Any, Any, Any]:
         coords = _torch_lag_coords(self.P, self.h, self.device, self.dtype)
         Xlag, Ylag = torch.meshgrid(coords, coords, indexing="ij")
         R = torch.sqrt(Xlag * Xlag + Ylag * Ylag)
@@ -708,7 +728,12 @@ class TorchPeszekPoyato2D:
         Hxx[mask] = scale_hess[mask] * (1 - self.alpha * ex[mask] * ex[mask])
         Hxy[mask] = scale_hess[mask] * (-self.alpha * ex[mask] * ey[mask])
         Hyy[mask] = scale_hess[mask] * (1 - self.alpha * ey[mask] * ey[mask])
-        return Kx, Ky, Hxx, Hxy, Hyy
+        W = torch.zeros((self.P, self.P), dtype=self.dtype, device=self.device)
+        if abs(self.alpha - 2.0) < 1e-9:
+            W[mask] = -self.K * torch.log(R[mask])
+        else:
+            W[mask] = self.K * torch.pow(R[mask], 2 - self.alpha) / ((2 - self.alpha) * (1 - self.alpha))
+        return Kx, Ky, Hxx, Hxy, Hyy, W
 
 
 def rotate(points: Array, angle: float) -> Array:
@@ -1171,6 +1196,459 @@ def run_simulation(
         residual = drift_final - A_final
     else:
         residual = initial.omega - A_final
+    residual_speed2 = np.sum(residual * residual, axis=1)
+    dt_min_observed, dt_max_observed, dt_mean = _dt_history_summary(dt_history)
+    return SimulationResult(
+        initial=initial,
+        x_initial=x_initial,
+        x_final=x_final,
+        A_final=A_final,
+        residual=residual,
+        rho_grid=rho_grid,
+        diagnostics=np.array(diagnostics, dtype=np.float64),
+        trajectory_x=np.stack(trajectory_x) if trajectory_x else None,
+        trajectory_rho=np.stack(trajectory_rho) if trajectory_rho else None,
+        trajectory_steps=np.array(trajectory_steps, dtype=np.int64) if trajectory_steps else None,
+        trajectory_times=np.array(trajectory_times, dtype=np.float64) if trajectory_times else None,
+        steps=int(accepted_steps),
+        final_time=float(t),
+        runtime_seconds=float(runtime),
+        rms_residual=float(np.sqrt(np.mean(residual_speed2))),
+        max_residual=float(np.sqrt(np.max(residual_speed2))),
+        backend=solver.backend_name,
+        device=solver.device_name,
+        dtype=solver.dtype_name,
+        field_evaluations=int(field_evaluations),
+        accepted_steps=int(accepted_steps),
+        rejected_steps=int(rejected_steps),
+        dt_min_observed=dt_min_observed,
+        dt_max_observed=dt_max_observed,
+        dt_mean=dt_mean,
+        clip_events=int(clip_events),
+        initialization_algorithm=str(initialization_meta["algorithm"]),
+        initialization_steps=int(initialization_meta["steps"]),
+        initialization_time=float(initialization_meta["time"]),
+        initialization_stop_metric=float(initialization_meta["stop_metric"]),
+    )
+
+
+def finite_horizon_gauge_average_field(
+    solver: Any,
+    x: Any,
+    omega: Any,
+    tau: float,
+) -> tuple[Any, Any, Any]:
+    """Finite-horizon gauge-averaged PP field.
+
+    Computes
+
+        V_tau = omega - 1/2 A_rho(x)
+                      - 1/2 A_{rho_tau}(x + tau (omega - A_rho(x))),
+
+    where ``rho_tau`` is represented by depositing the predicted particle
+    positions.  The predicted sample points are clipped to the FFT box for the
+    bounded-grid implementation.
+    """
+
+    A_now, rho_now = solver.A_at_particles(x)
+    tau = float(tau)
+    if tau == 0.0:
+        return omega - A_now, A_now, rho_now
+    x_tau = solver.clip_inside(x + tau * (omega - A_now))
+    A_tau, _ = solver.A_at_particles(x_tau)
+    A_bar = 0.5 * (A_now + A_tau)
+    return omega - A_bar, A_bar, rho_now
+
+
+def hamiltonian_exponent_pp_field(
+    solver: Any,
+    x: Any,
+    omega: Any,
+    q: float,
+    epsH: float,
+) -> tuple[Any, Any, Any, Any]:
+    """Hamiltonian-exponent PP velocity using the existing FFT interaction field.
+
+    Returns ``(velocity, A, residual, clock)`` with
+    ``residual = omega - A`` and
+    ``clock = (|residual|^2 + epsH^2)^((q - 2) / 2)``.
+    """
+
+    A, _ = solver.A_at_particles(x)
+    residual = omega - A
+    exponent = 0.5 * (float(q) - 2.0)
+    eps2 = float(epsH) * float(epsH)
+    if torch is not None and torch.is_tensor(residual):
+        r2 = torch.sum(residual * residual, dim=1, keepdim=True)
+        clock = torch.pow(r2 + eps2, exponent)
+    else:
+        r2 = np.sum(residual * residual, axis=1, keepdims=True)
+        clock = np.power(r2 + eps2, exponent)
+    return clock * residual, A, residual, clock
+
+
+def _pp_empirical_energy_from_grid(solver: FFTPeszekPoyato2D, x: Array, omega: Array) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    omega = np.asarray(omega, dtype=np.float64)
+    rho_grid, W_grid = solver.W_grid_from_particles(x)
+    linear = -float(np.mean(np.sum(omega * x, axis=1)))
+    interaction = 0.5 * float(np.sum(rho_grid * W_grid))
+    return linear + interaction
+
+
+def run_hamiltonian_exponent_simulation(
+    config: SimulationConfig,
+    initial: InitialCondition | None = None,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+) -> SimulationResult:
+    """Evolve PP particles with the Hamiltonian-exponent residual clock."""
+
+    _validate_runtime_config(config)
+    q = float(config.hamiltonian_q)
+    epsH = float(config.hamiltonian_epsH)
+
+    def _raise_if_cancelled() -> None:
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("Hamiltonian-exponent PP simulation cancelled.")
+
+    raw_initial = make_initial_condition(config) if initial is None else validate_initial_condition(initial)
+    initial, initialization_meta = _apply_initialization_algorithm(config, raw_initial)
+    solver = _make_pp_backend(config)
+    x = solver.asarray(initial.x)
+    omega = solver.asarray(initial.omega)
+    x, clip_count = solver.clip_inside_with_count(solver.copy_state(x))
+    x_initial = solver.to_numpy(x).copy()
+    diagnostics: list[tuple[int, float, float, float, float, int, int, int, int]] = []
+    trajectory_x: list[Array] = []
+    trajectory_rho: list[Array] = []
+    trajectory_steps: list[int] = []
+    trajectory_times: list[float] = []
+    trajectory_stride = _trajectory_stride(config)
+    trajectory_limit = _trajectory_frame_limit(config)
+    field_evaluations = 0
+    accepted_steps = 0
+    rejected_steps = 0
+    clip_events = int(clip_count)
+    dt_current = _clamp_dt(float(config.dt), config)
+    dt_history: list[float] = []
+    t = 0.0
+    time_sign = -1.0 if config.time_direction == "backward" else 1.0
+
+    def velocity_fn(state_x: Any) -> tuple[Any, Any, Any, Any]:
+        return hamiltonian_exponent_pp_field(solver, state_x, omega, q, epsH)
+
+    def record_trajectory(step_: int, x_: Any, time_: float, *, force: bool = False) -> None:
+        if not config.make_animation:
+            return
+        if trajectory_steps and not force and step_ % trajectory_stride != 0 and step_ != config.max_steps:
+            return
+        if trajectory_limit is not None and len(trajectory_steps) >= trajectory_limit and not force and step_ != config.max_steps:
+            return
+        density_x = solver.to_numpy(x_)
+        density_grid_size = config.animation_density_grid_size
+        if density_grid_size is None or int(density_grid_size) == solver.G:
+            rho = deposit_mass(density_x, solver.G, solver.L)
+        else:
+            rho = deposit_mass(density_x, int(density_grid_size), solver.L)
+        trajectory_x.append(density_x.astype(np.float32, copy=True))
+        trajectory_rho.append(rho.astype(np.float32, copy=False))
+        trajectory_steps.append(int(step_))
+        trajectory_times.append(float(time_))
+
+    def append_diagnostic(step_: int, time_: float, rms_: float, max_residual_: float, dt_: float) -> None:
+        diagnostics.append(
+            (
+                int(step_),
+                float(time_),
+                float(rms_),
+                float(max_residual_),
+                float(dt_),
+                int(field_evaluations),
+                int(accepted_steps),
+                int(rejected_steps),
+                int(clip_events),
+            )
+        )
+
+    start = time.time()
+
+    if config.integrator == "fixed_rk2":
+        dt_fixed = float(config.dt)
+        for _ in range(config.max_steps + 1):
+            _raise_if_cancelled()
+            record_trajectory(accepted_steps, x, t)
+            vf, _, residual_now, _ = velocity_fn(x)
+            field_evaluations += 1
+            rms, max_residual = solver.speed_stats(residual_now)
+            if accepted_steps % config.record_every == 0:
+                append_diagnostic(accepted_steps, t, rms, max_residual, dt_fixed)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+            x_pred, clipped = solver.clip_inside_with_count(x + time_sign * dt_fixed * vf)
+            clip_events += clipped
+            k2, _, _, _ = velocity_fn(x_pred)
+            field_evaluations += 1
+            x = x + 0.5 * time_sign * dt_fixed * (vf + k2)
+            x = solver.center(x)
+            x, clipped = solver.clip_inside_with_count(x)
+            clip_events += clipped
+            t += dt_fixed
+            accepted_steps += 1
+            dt_history.append(dt_fixed)
+    else:
+        while True:
+            _raise_if_cancelled()
+            record_trajectory(accepted_steps, x, t)
+            vf, _, residual_now, _ = velocity_fn(x)
+            field_evaluations += 1
+            rms, max_residual = solver.speed_stats(residual_now)
+            _, max_speed = solver.speed_stats(vf)
+            if accepted_steps % config.record_every == 0:
+                append_diagnostic(accepted_steps, t, rms, max_residual, dt_current)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+
+            trial_dt = _cfl_limited_dt(dt_current, max_speed, solver.h, config)
+            while True:
+                x_pred, clipped = solver.clip_inside_with_count(x + time_sign * trial_dt * vf)
+                clip_events += clipped
+                k2, _, _, _ = velocity_fn(x_pred)
+                field_evaluations += 1
+                x_euler = x + time_sign * trial_dt * vf
+                x_heun = x + 0.5 * time_sign * trial_dt * (vf + k2)
+                local_err = solver.rms_delta(x_heun, x_euler)
+                if not np.isfinite(local_err):
+                    if trial_dt <= config.dt_min * (1 + 1e-12):
+                        raise FloatingPointError("adaptive RK2 local error is non-finite at dt_min")
+                    rejected_steps += 1
+                    trial_dt = max(float(config.dt_min), trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False))
+                    continue
+                if local_err <= config.adaptive_tol or trial_dt <= config.dt_min * (1 + 1e-12):
+                    break
+                rejected_steps += 1
+                trial_dt = max(float(config.dt_min), trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False))
+
+            x = solver.center(x_heun)
+            x, clipped = solver.clip_inside_with_count(x)
+            clip_events += clipped
+            t += trial_dt
+            accepted_steps += 1
+            dt_history.append(trial_dt)
+            dt_current = _clamp_dt(trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=True), config)
+
+    runtime = time.time() - start
+    if config.make_animation and (not trajectory_steps or trajectory_steps[-1] != accepted_steps):
+        record_trajectory(accepted_steps, x, t, force=True)
+    _, A_final_backend, residual_backend, _ = velocity_fn(x)
+    field_evaluations += 1
+    _, rho_grid_backend = solver.A_at_particles(x)
+    field_evaluations += 1
+    solver.synchronize()
+    x_final = solver.to_numpy(x).copy()
+    A_final = solver.to_numpy(A_final_backend)
+    residual = solver.to_numpy(residual_backend)
+    rho_grid = solver.to_numpy(rho_grid_backend)
+    residual_speed2 = np.sum(residual * residual, axis=1)
+    dt_min_observed, dt_max_observed, dt_mean = _dt_history_summary(dt_history)
+    return SimulationResult(
+        initial=initial,
+        x_initial=x_initial,
+        x_final=x_final,
+        A_final=A_final,
+        residual=residual,
+        rho_grid=rho_grid,
+        diagnostics=np.array(diagnostics, dtype=np.float64),
+        trajectory_x=np.stack(trajectory_x) if trajectory_x else None,
+        trajectory_rho=np.stack(trajectory_rho) if trajectory_rho else None,
+        trajectory_steps=np.array(trajectory_steps, dtype=np.int64) if trajectory_steps else None,
+        trajectory_times=np.array(trajectory_times, dtype=np.float64) if trajectory_times else None,
+        steps=int(accepted_steps),
+        final_time=float(t),
+        runtime_seconds=float(runtime),
+        rms_residual=float(np.sqrt(np.mean(residual_speed2))),
+        max_residual=float(np.sqrt(np.max(residual_speed2))),
+        backend=solver.backend_name,
+        device=solver.device_name,
+        dtype=solver.dtype_name,
+        field_evaluations=int(field_evaluations),
+        accepted_steps=int(accepted_steps),
+        rejected_steps=int(rejected_steps),
+        dt_min_observed=dt_min_observed,
+        dt_max_observed=dt_max_observed,
+        dt_mean=dt_mean,
+        clip_events=int(clip_events),
+        initialization_algorithm=str(initialization_meta["algorithm"]),
+        initialization_steps=int(initialization_meta["steps"]),
+        initialization_time=float(initialization_meta["time"]),
+        initialization_stop_metric=float(initialization_meta["stop_metric"]),
+    )
+
+
+def run_finite_horizon_gauge_averaged_simulation(
+    config: SimulationConfig,
+    initial: InitialCondition | None = None,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+) -> SimulationResult:
+    """Evolve finite-horizon gauge-averaged Peszek--Poyato dynamics.
+
+    The model parameter ``config.prediction_horizon_tau`` is a physical
+    prediction horizon, not the numerical integration step.  The default
+    integrator remains adaptive RK2, so a run can use ``dt << tau``.
+    """
+
+    _validate_runtime_config(config)
+    if float(config.prediction_horizon_tau) < 0.0:
+        raise ValueError("prediction_horizon_tau must be non-negative")
+
+    def _raise_if_cancelled() -> None:
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("finite-horizon PP simulation cancelled.")
+
+    raw_initial = make_initial_condition(config) if initial is None else validate_initial_condition(initial)
+    initial, initialization_meta = _apply_initialization_algorithm(config, raw_initial)
+    solver = _make_pp_backend(config)
+    x = solver.asarray(initial.x)
+    omega = solver.asarray(initial.omega)
+    x, clip_count = solver.clip_inside_with_count(solver.copy_state(x))
+    x_initial = solver.to_numpy(x).copy()
+    diagnostics: list[tuple[int, float, float, float, float, int, int, int, int]] = []
+    trajectory_x: list[Array] = []
+    trajectory_rho: list[Array] = []
+    trajectory_steps: list[int] = []
+    trajectory_times: list[float] = []
+    trajectory_stride = _trajectory_stride(config)
+    trajectory_limit = _trajectory_frame_limit(config)
+    field_evaluations = 0
+    accepted_steps = 0
+    rejected_steps = 0
+    clip_events = int(clip_count)
+    dt_current = _clamp_dt(float(config.dt), config)
+    dt_history: list[float] = []
+    t = 0.0
+    time_sign = -1.0 if config.time_direction == "backward" else 1.0
+    tau = float(config.prediction_horizon_tau)
+
+    def velocity_fn(state_x: Any) -> tuple[Any, Any, Any]:
+        return finite_horizon_gauge_average_field(solver, state_x, omega, tau)
+
+    def record_trajectory(step_: int, x_: Any, time_: float, *, force: bool = False) -> None:
+        if not config.make_animation:
+            return
+        if trajectory_steps and not force and step_ % trajectory_stride != 0 and step_ != config.max_steps:
+            return
+        if trajectory_limit is not None and len(trajectory_steps) >= trajectory_limit and not force and step_ != config.max_steps:
+            return
+        density_x = solver.to_numpy(x_)
+        density_grid_size = config.animation_density_grid_size
+        if density_grid_size is None or int(density_grid_size) == solver.G:
+            rho = deposit_mass(density_x, solver.G, solver.L)
+        else:
+            rho = deposit_mass(density_x, int(density_grid_size), solver.L)
+        trajectory_x.append(density_x.astype(np.float32, copy=True))
+        trajectory_rho.append(rho.astype(np.float32, copy=False))
+        trajectory_steps.append(int(step_))
+        trajectory_times.append(float(time_))
+
+    def append_diagnostic(step_: int, time_: float, rms_: float, maxv_: float, dt_: float) -> None:
+        diagnostics.append(
+            (
+                int(step_),
+                float(time_),
+                float(rms_),
+                float(maxv_),
+                float(dt_),
+                int(field_evaluations),
+                int(accepted_steps),
+                int(rejected_steps),
+                int(clip_events),
+            )
+        )
+
+    start = time.time()
+
+    if config.integrator == "fixed_rk2":
+        dt_fixed = float(config.dt)
+        for _ in range(config.max_steps + 1):
+            _raise_if_cancelled()
+            record_trajectory(accepted_steps, x, t)
+            vf, _, _ = velocity_fn(x)
+            field_evaluations += 2 if tau != 0.0 else 1
+            rms, maxv = solver.speed_stats(vf)
+            if accepted_steps % config.record_every == 0:
+                append_diagnostic(accepted_steps, t, rms, maxv, dt_fixed)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+            x_pred, clipped = solver.clip_inside_with_count(x + time_sign * dt_fixed * vf)
+            clip_events += clipped
+            k2, _, _ = velocity_fn(x_pred)
+            field_evaluations += 2 if tau != 0.0 else 1
+            x = x + 0.5 * time_sign * dt_fixed * (vf + k2)
+            x = solver.center(x)
+            x, clipped = solver.clip_inside_with_count(x)
+            clip_events += clipped
+            t += dt_fixed
+            accepted_steps += 1
+            dt_history.append(dt_fixed)
+    else:
+        while True:
+            _raise_if_cancelled()
+            record_trajectory(accepted_steps, x, t)
+            vf, _, _ = velocity_fn(x)
+            field_evaluations += 2 if tau != 0.0 else 1
+            rms, maxv = solver.speed_stats(vf)
+            if accepted_steps % config.record_every == 0:
+                append_diagnostic(accepted_steps, t, rms, maxv, dt_current)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+
+            trial_dt = _cfl_limited_dt(dt_current, maxv, solver.h, config)
+            while True:
+                x_pred, clipped = solver.clip_inside_with_count(x + time_sign * trial_dt * vf)
+                clip_events += clipped
+                k2, _, _ = velocity_fn(x_pred)
+                field_evaluations += 2 if tau != 0.0 else 1
+                x_euler = x + time_sign * trial_dt * vf
+                x_heun = x + 0.5 * time_sign * trial_dt * (vf + k2)
+                local_err = solver.rms_delta(x_heun, x_euler)
+                if not np.isfinite(local_err):
+                    if trial_dt <= config.dt_min * (1 + 1e-12):
+                        raise FloatingPointError("adaptive RK2 local error is non-finite at dt_min")
+                    rejected_steps += 1
+                    trial_dt = max(float(config.dt_min), trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False))
+                    continue
+                if local_err <= config.adaptive_tol or trial_dt <= config.dt_min * (1 + 1e-12):
+                    break
+                rejected_steps += 1
+                trial_dt = max(float(config.dt_min), trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False))
+
+            x = solver.center(x_heun)
+            x, clipped = solver.clip_inside_with_count(x)
+            clip_events += clipped
+            t += trial_dt
+            accepted_steps += 1
+            dt_history.append(trial_dt)
+            dt_current = _clamp_dt(trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=True), config)
+
+    runtime = time.time() - start
+    if config.make_animation and (not trajectory_steps or trajectory_steps[-1] != accepted_steps):
+        record_trajectory(accepted_steps, x, t, force=True)
+    residual_backend, A_bar_backend, rho_grid_backend = velocity_fn(x)
+    field_evaluations += 2 if tau != 0.0 else 1
+    solver.synchronize()
+    x_final = solver.to_numpy(x).copy()
+    A_final = solver.to_numpy(A_bar_backend)
+    residual = solver.to_numpy(residual_backend)
+    rho_grid = solver.to_numpy(rho_grid_backend)
     residual_speed2 = np.sum(residual * residual, axis=1)
     dt_min_observed, dt_max_observed, dt_mean = _dt_history_summary(dt_history)
     return SimulationResult(
@@ -2074,6 +2552,12 @@ def _validate_runtime_config(config: SimulationConfig) -> None:
         raise ValueError("external_field must be 'affine' or 'projective'")
     if not np.isfinite(config.projective_epsilon) or config.projective_epsilon < 0:
         raise ValueError("projective_epsilon must be a finite, non-negative number")
+    if not np.isfinite(config.prediction_horizon_tau) or config.prediction_horizon_tau < 0:
+        raise ValueError("prediction_horizon_tau must be a finite, non-negative number")
+    if not np.isfinite(config.hamiltonian_q) or not 0.0 <= config.hamiltonian_q <= 2.0:
+        raise ValueError("hamiltonian_q must be a finite number in [0, 2]")
+    if not np.isfinite(config.hamiltonian_epsH) or config.hamiltonian_epsH < 0:
+        raise ValueError("hamiltonian_epsH must be a finite, non-negative number")
     if config.dt <= 0:
         raise ValueError("dt must be positive")
     if config.dt_min <= 0:
@@ -2618,6 +3102,44 @@ def make_dynamics_widget(
     """
 
     return PPDynamicsWidget(config, result=result, width=width, height=height, second_panel=second_panel)
+
+
+def make_finite_horizon_gauge_averaged_widget(
+    config: SimulationConfig,
+    result: SimulationResult | None = None,
+    *,
+    width: int = 1450,
+    height: int = 720,
+    second_panel: SecondPanelChoice = "velocity",
+) -> "FiniteHorizonGaugeAveragedPeszekPoyatoDynamicsWidget":
+    """Build the finite-horizon gauge-averaged PP notebook widget."""
+
+    return FiniteHorizonGaugeAveragedPeszekPoyatoDynamicsWidget(
+        config,
+        result=result,
+        width=width,
+        height=height,
+        second_panel=second_panel,
+    )
+
+
+def make_hamiltonian_exponent_widget(
+    config: SimulationConfig,
+    result: SimulationResult | None = None,
+    *,
+    width: int = 1450,
+    height: int = 980,
+    second_panel: SecondPanelChoice = "velocity",
+) -> "HamiltonianExponentPeszekPoyatoDynamicsWidget":
+    """Build the Hamiltonian-exponent PP notebook widget."""
+
+    return HamiltonianExponentPeszekPoyatoDynamicsWidget(
+        config,
+        result=result,
+        width=width,
+        height=height,
+        second_panel=second_panel,
+    )
 
 
 class _AsyncPrecomputeControlsMixin:
@@ -3609,6 +4131,557 @@ class ProjectivePeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsBaseWidget):
         self._update_projective_enabled()
         self._sync_projective_label()
         self._mark_cache_stale("External gauge changed. Click Interrupt, then Precompute flow.")
+
+
+class FiniteHorizonGaugeAveragedPeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsBaseWidget):
+    """Widget for finite-horizon gauge-averaged Peszek--Poyato dynamics.
+
+    The physical prediction horizon ``tau`` deforms the continuum vector field:
+
+        x_dot_i = omega_i
+                  - 1/2 A_rho(x_i)
+                  - 1/2 A_{rho_tau}(x_i + tau (omega_i - A_rho(x_i))).
+
+    ``tau`` is not the numerical timestep.  The precompute path calls
+    :func:`run_finite_horizon_gauge_averaged_simulation`, which still defaults to
+    adaptive RK2, so users can keep integration ``dt`` much smaller than the
+    prediction horizon.
+    """
+
+    def _layout_header_html(self) -> str:
+        return (
+            "<b>Finite-Horizon Gauge-Averaged Peszek--Poyato dynamics</b><br>"
+            "Agents align to the average of the present gauge field and the field sampled at a finite predicted point. "
+            "The horizon &tau; is a model parameter, not the numerical integration step."
+        )
+
+    def _build_controls(self) -> None:
+        super()._build_controls()
+        tau_default = max(0.0, float(self.config.prediction_horizon_tau))
+        self.prediction_horizon_slider = widgets.FloatSlider(
+            value=tau_default,
+            min=0.0,
+            max=max(0.30, 4.0 * tau_default),
+            step=0.001,
+            description="tau",
+            readout_format=".3f",
+            continuous_update=False,
+            tooltip="Physical prediction horizon tau in the two-point gauge average; keep numerical dt smaller than tau.",
+            layout=widgets.Layout(width="560px"),
+        )
+        self.prediction_status_html = widgets.HTML(value="", layout=widgets.Layout(width="620px"))
+        self.controls.children = tuple(self.controls.children) + (
+            widgets.HBox([self.prediction_horizon_slider, self.prediction_status_html]),
+        )
+        self._sync_prediction_label()
+
+    def _bind_callbacks(self) -> None:
+        super()._bind_callbacks()
+        self.prediction_horizon_slider.observe(self._on_prediction_horizon_change, names="value")
+
+    def _config_from_controls(self, *, make_animation: bool) -> SimulationConfig:
+        cfg = super()._config_from_controls(make_animation=make_animation)
+        return replace(
+            cfg,
+            prediction_horizon_tau=float(self.prediction_horizon_slider.value),
+            external_field="affine",
+            projective_epsilon=0.0,
+        )
+
+    def _run_precompute_job(self, job: dict[str, Any]) -> SimulationResult:
+        seq = int(job["seq"])
+        return run_finite_horizon_gauge_averaged_simulation(
+            job["config"],
+            cancel_check=lambda: self._is_precompute_cancelled(seq),
+        )
+
+    def _compute_trajectory_velocities(self, trajectory_x: Array) -> Array:
+        result = self._result
+        assert result is not None
+        solver = FFTPeszekPoyato2D(
+            self.config.alpha,
+            self.config.K,
+            self.config.grid_size,
+            self.config.domain_radius,
+        )
+        omega = np.asarray(result.initial.omega, dtype=np.float64)
+        tau = float(self.config.prediction_horizon_tau)
+        frames = np.empty_like(trajectory_x)
+        for f in range(trajectory_x.shape[0]):
+            xf = solver.clip_inside(trajectory_x[f])
+            v, _, _ = finite_horizon_gauge_average_field(solver, xf, omega, tau)
+            frames[f] = -v
+        return frames
+
+    def _sync_prediction_label(self) -> None:
+        tau = float(self.prediction_horizon_slider.value)
+        dt = float(self.config.dt)
+        ratio = dt / tau if tau > 0 else float("inf")
+        if tau > 0:
+            self.prediction_status_html.value = (
+                "<b>Finite horizon:</b> "
+                f"&tau;={tau:.4g}; numerical dt/&tau;={ratio:.3g}; "
+                "V=&omega;-&frac12;A<sub>&rho;</sub>(x)-&frac12;A<sub>&rho;<sub>&tau;</sub></sub>(P<sub>&tau;</sub>)"
+            )
+        else:
+            self.prediction_status_html.value = "<b>Finite horizon:</b> &tau;=0, recovering ordinary PP."
+
+    def _sync_config_status(self, result: SimulationResult | None = None) -> None:
+        super()._sync_config_status(result)
+        self._sync_prediction_label()
+
+    def _on_prediction_horizon_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self._sync_prediction_label()
+        self._mark_cache_stale("Prediction horizon changed. Click Interrupt, then Precompute flow.")
+
+
+class HamiltonianExponentPeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsBaseWidget):
+    """PP dynamics widget with an independent Hamiltonian residual exponent.
+
+    The interaction field remains the ordinary FFT Peszek--Poyato
+    ``A_rho = K grad W^alpha * rho``.  This subclass only changes the residual
+    clock in the particle velocity:
+
+        R_i = omega_i - A_rho(x_i),
+        x_dot_i = (|R_i|^2 + epsH^2)^((q - 2) / 2) R_i.
+
+    Thus ``q=2`` recovers the base PP particle dynamics, while ``q<2`` changes
+    the transient fiberwise clock without changing the zero-residual graph.
+    """
+
+    def __init__(
+        self,
+        config: SimulationConfig,
+        result: SimulationResult | None = None,
+        *,
+        width: int = 1450,
+        height: int = 980,
+        second_panel: SecondPanelChoice = "velocity",
+    ) -> None:
+        self._hamiltonian_velocity_frames: Array | None = None
+        self._hamiltonian_timeline: dict[str, Array] | None = None
+        self._energy_cursor_y: list[float] = [0.0, 1.0]
+        self._dissipation_cursor_y: list[float] = [0.0, 1.0]
+        super().__init__(config, result=result, width=width, height=height, second_panel=second_panel)
+
+    def _layout_header_html(self) -> str:
+        return (
+            "<b>Hamiltonian-exponent Peszek--Poyato dynamics</b><br>"
+            "The FFT PP interaction exponent &alpha; is unchanged; q changes the local residual clock "
+            "x&#775;<sub>i</sub>=(|R<sub>i</sub>|<sup>2</sup>+epsH<sup>2</sup>)<sup>(q-2)/2</sup>R<sub>i</sub>, "
+            "R<sub>i</sub>=&omega;<sub>i</sub>&minus;A<sub>&rho;</sub>(x<sub>i</sub>)."
+        )
+
+    def _build_controls(self) -> None:
+        super()._build_controls()
+        q_default = float(np.clip(float(self.config.hamiltonian_q), 0.0, 2.0))
+        eps_default = max(0.0, float(self.config.hamiltonian_epsH))
+        eps_log = float(np.log10(eps_default))
+        self.hamiltonian_q_slider = widgets.FloatSlider(
+            value=q_default,
+            min=0.0,
+            max=2.0,
+            step=0.01,
+            description="q",
+            readout_format=".2f",
+            continuous_update=False,
+            tooltip="Hamiltonian exponent q in the residual clock; q=2 is ordinary PP.",
+            layout=widgets.Layout(width="430px"),
+        )
+        self.hamiltonian_epsH_slider = widgets.FloatLogSlider(
+            value=eps_default,
+            base=10,
+            min=min(0.0, np.floor(eps_log) - 1.0),
+            max=max(-1.0, np.ceil(eps_log) + 1.0),
+            step=0.1,
+            description="epsH",
+            readout_format=".1e",
+            continuous_update=False,
+            tooltip="Positive regularization in the Hamiltonian residual clock.",
+            layout=widgets.Layout(width="430px"),
+        )
+        self.hamiltonian_status_html = widgets.HTML(value="", layout=widgets.Layout(width="760px"))
+        self.controls.children = tuple(self.controls.children) + (
+            widgets.HBox(
+                [
+                    self.hamiltonian_q_slider,
+                    self.hamiltonian_epsH_slider,
+                    self.hamiltonian_status_html,
+                ]
+            ),
+        )
+        self._sync_hamiltonian_label()
+
+    def _build_figure(self) -> None:
+        velocity_panel = self._second_panel == "velocity"
+        second_title = "Negative q-velocity scatter (-x_dot_i)" if velocity_panel else "Precomputed joint density rho_t"
+        second_spec = {"type": "scatter"} if velocity_panel else {"type": "heatmap"}
+        fig = go.FigureWidget(
+            make_subplots(
+                rows=3,
+                cols=2,
+                specs=[
+                    [{"type": "scatter"}, second_spec],
+                    [{"type": "scatter", "colspan": 2}, None],
+                    [{"type": "scatter", "colspan": 2}, None],
+                ],
+                subplot_titles=[
+                    "Per-omega fiber particle dynamics",
+                    second_title,
+                    self._energy_subplot_title(),
+                    self._dissipation_subplot_title(),
+                ],
+                row_heights=[0.58, 0.19, 0.23],
+                horizontal_spacing=0.08,
+                vertical_spacing=0.09,
+            )
+        )
+        self.fig = fig
+        self.tr: dict[str, int] = {}
+        self._fiber_trace_count = 0
+        self._ensure_fiber_traces(self._group_names)
+
+        r = self.config.domain_radius
+        fig.update_xaxes(title_text="x1", range=[-r, r], scaleanchor="y", scaleratio=1, row=1, col=1)
+        fig.update_yaxes(title_text="x2", range=[-r, r], row=1, col=1)
+        if velocity_panel:
+            v = float(self._vmax)
+            fig.update_xaxes(title_text="v1", range=[-v, v], row=1, col=2)
+            fig.update_yaxes(title_text="v2", range=[-v, v], scaleanchor="x2", scaleratio=1, row=1, col=2)
+        else:
+            fig.add_trace(
+                go.Heatmap(
+                    x=[],
+                    y=[],
+                    z=[[0.0]],
+                    colorscale="Viridis",
+                    zmin=0.0,
+                    zmax=1.0,
+                    zsmooth=False,
+                    colorbar=dict(title="mass"),
+                    name="rho_t",
+                ),
+                row=1,
+                col=2,
+            )
+            self.tr["density"] = len(fig.data) - 1
+            fig.update_xaxes(title_text="x1", range=[-r, r], row=1, col=2)
+            fig.update_yaxes(title_text="x2", range=[-r, r], scaleanchor="x2", scaleratio=1, row=1, col=2)
+
+        fig.add_trace(go.Scatter(x=[], y=[], mode="lines", name="E actual", line=dict(color="#1f77b4", width=2)), row=2, col=1)
+        self.tr["energy_actual"] = len(fig.data) - 1
+        fig.add_trace(go.Scatter(x=[], y=[], mode="lines", name="E predicted", line=dict(color="#d62728", width=2)), row=2, col=1)
+        self.tr["energy_pred"] = len(fig.data) - 1
+        fig.add_trace(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="lines",
+                name="energy cursor",
+                line=dict(color="#444444", width=1, dash="dot"),
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            row=2,
+            col=1,
+        )
+        self.tr["energy_cursor"] = len(fig.data) - 1
+
+        fig.add_trace(go.Scatter(x=[], y=[], mode="lines", name="D theory", line=dict(color="#2ca02c", width=2)), row=3, col=1)
+        self.tr["d_theory"] = len(fig.data) - 1
+        fig.add_trace(go.Scatter(x=[], y=[], mode="lines", name="D empirical", line=dict(color="#ff7f0e", width=2)), row=3, col=1)
+        self.tr["d_emp"] = len(fig.data) - 1
+        fig.add_trace(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="lines",
+                name="D2 reference",
+                line=dict(color="#7f7f7f", width=1.5, dash="dash"),
+            ),
+            row=3,
+            col=1,
+        )
+        self.tr["d2"] = len(fig.data) - 1
+        fig.add_trace(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="lines",
+                name="dissipation cursor",
+                line=dict(color="#444444", width=1, dash="dot"),
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            row=3,
+            col=1,
+        )
+        self.tr["dissipation_cursor"] = len(fig.data) - 1
+
+        fig.update_xaxes(title_text="time", row=2, col=1)
+        fig.update_yaxes(title_text="E_N", row=2, col=1)
+        fig.update_xaxes(title_text="time", row=3, col=1)
+        fig.update_yaxes(title_text="rate", row=3, col=1)
+        fig.update_layout(
+            width=self.width,
+            height=self.height,
+            template="plotly_white",
+            legend=dict(groupclick="togglegroup", itemsizing="constant"),
+            margin=dict(l=55, r=35, t=78, b=45),
+        )
+
+    def _bind_callbacks(self) -> None:
+        super()._bind_callbacks()
+        self.hamiltonian_q_slider.observe(self._on_hamiltonian_change, names="value")
+        self.hamiltonian_epsH_slider.observe(self._on_hamiltonian_change, names="value")
+
+    def _config_from_controls(self, *, make_animation: bool) -> SimulationConfig:
+        cfg = super()._config_from_controls(make_animation=make_animation)
+        return replace(
+            cfg,
+            hamiltonian_q=float(self.hamiltonian_q_slider.value),
+            hamiltonian_epsH=float(self.hamiltonian_epsH_slider.value),
+            external_field="affine",
+            projective_epsilon=0.0,
+        )
+
+    def _run_precompute_job(self, job: dict[str, Any]) -> SimulationResult:
+        seq = int(job["seq"])
+        return run_hamiltonian_exponent_simulation(
+            job["config"],
+            cancel_check=lambda: self._is_precompute_cancelled(seq),
+        )
+
+    def _build_frame_payloads(self) -> list[dict[str, Any]]:
+        result = self._result
+        assert result is not None
+        trajectory_x = np.asarray(result.trajectory_x, dtype=np.float64)
+        self._hamiltonian_velocity_frames, self._hamiltonian_timeline = self._compute_hamiltonian_frame_diagnostics(
+            trajectory_x
+        )
+        payloads = super()._build_frame_payloads()
+        timeline = self._hamiltonian_timeline
+        if timeline is not None:
+            energy = timeline["energy_actual"]
+            d_theory = timeline["D_theory"]
+            d_emp = timeline["D_emp"]
+            for f, payload in enumerate(payloads):
+                emp_text = f"{d_emp[f]:.4g}" if np.isfinite(d_emp[f]) else "n/a"
+                payload["stats"] = (
+                    f"{payload['stats']}; q={float(self.config.hamiltonian_q):.2f}; "
+                    f"epsH={float(self.config.hamiltonian_epsH):.1e}; "
+                    f"E={energy[f]:.5g}; Dq={d_theory[f]:.4g}; Demp={emp_text}"
+                )
+        return payloads
+
+    def _compute_trajectory_velocities(self, trajectory_x: Array) -> Array:
+        frames = self._hamiltonian_velocity_frames
+        if frames is not None and frames.shape == trajectory_x.shape:
+            return frames
+        frames, self._hamiltonian_timeline = self._compute_hamiltonian_frame_diagnostics(trajectory_x)
+        self._hamiltonian_velocity_frames = frames
+        return frames
+
+    def _compute_hamiltonian_frame_diagnostics(self, trajectory_x: Array) -> tuple[Array, dict[str, Array]]:
+        result = self._result
+        assert result is not None
+        solver = FFTPeszekPoyato2D(
+            self.config.alpha,
+            self.config.K,
+            self.config.grid_size,
+            self.config.domain_radius,
+        )
+        omega = np.asarray(result.initial.omega, dtype=np.float64)
+        times = np.asarray(result.trajectory_times, dtype=np.float64)
+        q = float(self.config.hamiltonian_q)
+        epsH = float(self.config.hamiltonian_epsH)
+        exponent = 0.5 * (q - 2.0)
+        time_sign = -1.0 if self.config.time_direction == "backward" else 1.0
+        frame_count = trajectory_x.shape[0]
+        velocity_frames = np.empty_like(trajectory_x)
+        energy = np.empty(frame_count, dtype=np.float64)
+        d_forward = np.empty(frame_count, dtype=np.float64)
+        d2_forward = np.empty(frame_count, dtype=np.float64)
+        r_l2 = np.empty(frame_count, dtype=np.float64)
+        r_lq = np.empty(frame_count, dtype=np.float64)
+        r_max = np.empty(frame_count, dtype=np.float64)
+        r_min_nonzero = np.empty(frame_count, dtype=np.float64)
+        active_fraction = np.empty(frame_count, dtype=np.float64)
+        clock_mean = np.empty(frame_count, dtype=np.float64)
+        clock_max = np.empty(frame_count, dtype=np.float64)
+        clock_min = np.empty(frame_count, dtype=np.float64)
+        threshold = max(float(epsH), 1.0e-12)
+
+        for f in range(frame_count):
+            xf = solver.clip_inside(trajectory_x[f])
+            A, _ = solver.A_at_particles(xf)
+            residual = omega - A
+            r2 = np.sum(residual * residual, axis=1)
+            r_abs = np.sqrt(r2)
+            clock = np.power(r2 + epsH * epsH, exponent)
+            velocity = clock[:, None] * residual
+            velocity_frames[f] = -velocity
+            energy[f] = _pp_empirical_energy_from_grid(solver, xf, omega)
+            d_forward[f] = float(np.mean(clock * r2))
+            d2_forward[f] = float(np.mean(r2))
+            r_l2[f] = float(np.sqrt(np.mean(r2)))
+            if q > 0.0:
+                r_lq[f] = float(np.power(np.mean(np.power(r_abs, q)), 1.0 / q))
+            else:
+                r_lq[f] = np.nan
+            r_max[f] = float(np.max(r_abs))
+            active = r_abs > threshold
+            r_min_nonzero[f] = float(np.min(r_abs[active])) if np.any(active) else 0.0
+            active_fraction[f] = float(np.mean(active))
+            clock_mean[f] = float(np.mean(clock))
+            clock_max[f] = float(np.max(clock))
+            clock_min[f] = float(np.min(clock))
+
+        d_theory = time_sign * d_forward
+        d2 = time_sign * d2_forward
+        d_emp = np.full(frame_count, np.nan, dtype=np.float64)
+        if frame_count > 1:
+            dt = np.diff(times)
+            valid = dt > 0.0
+            d_emp_tail = d_emp[1:]
+            d_emp_tail[valid] = -np.diff(energy)[valid] / dt[valid]
+
+        e_pred = np.empty(frame_count, dtype=np.float64)
+        if frame_count:
+            e_pred[0] = energy[0]
+            for f in range(1, frame_count):
+                dt = max(0.0, float(times[f] - times[f - 1]))
+                e_pred[f] = e_pred[f - 1] - dt * d_theory[f - 1]
+
+        return velocity_frames, {
+            "time": times,
+            "energy_actual": energy,
+            "energy_pred": e_pred,
+            "D_theory": d_theory,
+            "D_emp": d_emp,
+            "D2": d2,
+            "R_l2": r_l2,
+            "R_lq": r_lq,
+            "R_max": r_max,
+            "R_min_nonzero": r_min_nonzero,
+            "active_fraction": active_fraction,
+            "clock_mean": clock_mean,
+            "clock_max": clock_max,
+            "clock_min": clock_min,
+        }
+
+    def _apply_static_payload_to_figure(self) -> None:
+        super()._apply_static_payload_to_figure()
+        timeline = self._hamiltonian_timeline
+        if timeline is None:
+            return
+        t = timeline["time"]
+        self._energy_cursor_y = list(self._finite_range(timeline["energy_actual"], timeline["energy_pred"]))
+        self._dissipation_cursor_y = list(self._finite_range(timeline["D_theory"], timeline["D_emp"], timeline["D2"]))
+        with self.fig.batch_update():
+            self.fig.data[self.tr["energy_actual"]].x = _plotly_values(t)
+            self.fig.data[self.tr["energy_actual"]].y = _plotly_values(timeline["energy_actual"])
+            self.fig.data[self.tr["energy_pred"]].x = _plotly_values(t)
+            self.fig.data[self.tr["energy_pred"]].y = _plotly_values(timeline["energy_pred"])
+            self.fig.data[self.tr["d_theory"]].x = _plotly_values(t)
+            self.fig.data[self.tr["d_theory"]].y = _plotly_values(timeline["D_theory"])
+            self.fig.data[self.tr["d_emp"]].x = _plotly_values(t)
+            self.fig.data[self.tr["d_emp"]].y = _plotly_values(timeline["D_emp"])
+            self.fig.data[self.tr["d2"]].x = _plotly_values(t)
+            self.fig.data[self.tr["d2"]].y = _plotly_values(timeline["D2"])
+            self.fig.update_yaxes(range=self._energy_cursor_y, row=2, col=1)
+            self.fig.update_yaxes(range=self._dissipation_cursor_y, row=3, col=1)
+            self._update_timeline_subplot_titles()
+
+    def _apply_cached_frame(self, frame_idx: int) -> None:
+        super()._apply_cached_frame(frame_idx)
+        self._apply_timeline_cursor(frame_idx)
+
+    def _apply_timeline_cursor(self, frame_idx: int) -> None:
+        timeline = self._hamiltonian_timeline
+        if timeline is None or len(timeline["time"]) == 0:
+            return
+        idx = int(np.clip(int(frame_idx), 0, len(timeline["time"]) - 1))
+        time_value = float(timeline["time"][idx])
+        with self.fig.batch_update():
+            self.fig.data[self.tr["energy_cursor"]].x = [time_value, time_value]
+            self.fig.data[self.tr["energy_cursor"]].y = self._energy_cursor_y
+            self.fig.data[self.tr["dissipation_cursor"]].x = [time_value, time_value]
+            self.fig.data[self.tr["dissipation_cursor"]].y = self._dissipation_cursor_y
+
+    def _sync_config_status(self, result: SimulationResult | None = None) -> None:
+        super()._sync_config_status(result)
+        self._sync_hamiltonian_label()
+
+    def _sync_hamiltonian_label(self) -> None:
+        q = float(self.hamiltonian_q_slider.value)
+        epsH = float(self.hamiltonian_epsH_slider.value)
+        self.hamiltonian_status_html.value = (
+            "<b>Hamiltonian clock:</b> "
+            f"q={q:.2f}; epsH={epsH:.1e}; "
+            "s<sub>i</sub>=(|R<sub>i</sub>|<sup>2</sup>+epsH<sup>2</sup>)<sup>(q-2)/2</sup>"
+        )
+        self._update_timeline_subplot_titles()
+
+    def _on_hamiltonian_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self._sync_hamiltonian_label()
+        self._mark_cache_stale("Hamiltonian exponent changed. Click Interrupt, then Precompute flow.")
+
+    def _energy_subplot_title(self) -> str:
+        alpha = float(self.alpha_slider.value) if hasattr(self, "alpha_slider") else float(self.config.alpha)
+        q = float(self.hamiltonian_q_slider.value) if hasattr(self, "hamiltonian_q_slider") else float(self.config.hamiltonian_q)
+        epsH = (
+            float(self.hamiltonian_epsH_slider.value)
+            if hasattr(self, "hamiltonian_epsH_slider")
+            else float(self.config.hamiltonian_epsH)
+        )
+        return f"Energy: alpha={alpha:.2f}, q={q:.2f}, epsH={epsH:.1e}"
+
+    def _dissipation_subplot_title(self) -> str:
+        alpha = float(self.alpha_slider.value) if hasattr(self, "alpha_slider") else float(self.config.alpha)
+        q = float(self.hamiltonian_q_slider.value) if hasattr(self, "hamiltonian_q_slider") else float(self.config.hamiltonian_q)
+        epsH = (
+            float(self.hamiltonian_epsH_slider.value)
+            if hasattr(self, "hamiltonian_epsH_slider")
+            else float(self.config.hamiltonian_epsH)
+        )
+        return (
+            f"Dissipation: Dq = mean |R|^2(|R|^2+epsH^2)^((q-2)/2), "
+            f"alpha={alpha:.2f}, q={q:.2f}, epsH={epsH:.1e}"
+        )
+
+    def _update_timeline_subplot_titles(self) -> None:
+        if not hasattr(self, "fig"):
+            return
+        annotations = self.fig.layout.annotations
+        if len(annotations) >= 4:
+            annotations[2].text = self._energy_subplot_title()
+            annotations[3].text = self._dissipation_subplot_title()
+
+    @staticmethod
+    def _finite_range(*arrays: Array) -> tuple[float, float]:
+        finite_parts = []
+        for arr in arrays:
+            values = np.asarray(arr, dtype=np.float64)
+            finite = values[np.isfinite(values)]
+            if finite.size:
+                finite_parts.append(finite)
+        if not finite_parts:
+            return 0.0, 1.0
+        values = np.concatenate(finite_parts)
+        lo = float(np.min(values))
+        hi = float(np.max(values))
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            return 0.0, 1.0
+        if abs(hi - lo) < 1.0e-12:
+            pad = max(1.0e-6, 0.05 * max(abs(lo), 1.0))
+        else:
+            pad = 0.06 * abs(hi - lo)
+        return lo - pad, hi + pad
 
 
 class PeszekPoyatoContinuousDensityWidget(_AsyncPrecomputeControlsMixin):

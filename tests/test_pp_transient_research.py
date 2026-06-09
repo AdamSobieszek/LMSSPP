@@ -5,7 +5,13 @@ from pathlib import Path
 
 import numpy as np
 
-from lmsspp.dynamics.pp_cs_equilibria import InitialCondition
+from lmsspp.dynamics.pp_cs_equilibria import (
+    InitialCondition,
+    SimulationConfig,
+    make_initial_condition,
+    run_finite_horizon_gauge_averaged_simulation,
+    run_simulation,
+)
 from lmsspp.dynamics.pp_transient_research import (
     RESEARCH_DIAGNOSTIC_FIELDS,
     DirectPeszekPoyato2D,
@@ -13,6 +19,7 @@ from lmsspp.dynamics.pp_transient_research import (
     compute_morphology_metrics,
     evaluate_A_and_H_at_particles,
     nearest_neighbor_quantiles,
+    run_finite_horizon_comparison,
     run_pp_research_sweep,
     run_research_simulation,
 )
@@ -28,6 +35,30 @@ def _direct_A(query: np.ndarray, sources: np.ndarray, alpha: float, K: float) ->
 
 
 class PPTransientResearchTests(unittest.TestCase):
+    def test_finite_horizon_tau_zero_recovers_ordinary_pp(self) -> None:
+        config = SimulationConfig(
+            n_fibers=2,
+            n_per_fiber=4,
+            grid_size=16,
+            domain_radius=3.0,
+            alpha=0.45,
+            K=0.7,
+            max_steps=2,
+            min_steps=100,
+            dt=0.01,
+            backend="numpy",
+            integrator="fixed_rk2",
+            prediction_horizon_tau=0.0,
+            make_dashboard=False,
+            make_animation=False,
+            seed=21,
+        )
+        initial = make_initial_condition(config)
+        ordinary = run_simulation(config, initial)
+        finite_horizon = run_finite_horizon_gauge_averaged_simulation(config, initial)
+        np.testing.assert_allclose(finite_horizon.x_final, ordinary.x_final, rtol=0.0, atol=1e-13)
+        np.testing.assert_allclose(finite_horizon.residual, ordinary.residual, rtol=0.0, atol=1e-13)
+
     def test_direct_backend_matches_direct_formula_and_runs(self) -> None:
         rng = np.random.default_rng(17)
         x = rng.normal(scale=0.5, size=(24, 2))
@@ -151,6 +182,26 @@ class PPTransientResearchTests(unittest.TestCase):
             self.assertTrue((Path(tmp) / "sweep_metrics.json").exists())
             self.assertTrue((Path(tmp) / "sweep_summary.html").exists())
             self.assertTrue((Path(tmp) / "case_00_0p01" / "research_diagnostics.csv").exists())
+
+    def test_tiny_finite_horizon_comparison_writes_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics = run_finite_horizon_comparison(
+                tmp,
+                n_fibers=2,
+                n_per_fiber=3,
+                alpha=0.45,
+                K=0.2,
+                grid_size=16,
+                domain_radius=3.0,
+                tau=0.01,
+                old_fixed_steps=1,
+                adaptive_steps_per_horizon=1,
+                seed=22,
+            )
+            self.assertIn("new_model_residual_rms", metrics)
+            self.assertTrue((Path(tmp) / "comparison_metrics.json").exists())
+            self.assertTrue((Path(tmp) / "finite_horizon_vs_fixed_rk2.html").exists())
+            self.assertTrue((Path(tmp) / "finite_horizon_residual_split.html").exists())
 
 
 if __name__ == "__main__":
