@@ -151,7 +151,7 @@ class SimulationConfig:
     shape_names: Sequence[str] = DEFAULT_SHAPES
     omega_atoms: Array | None = None
     seed: int = 2026
-    color_scheme: ColorSchemeChoice = "palette"
+    color_scheme: ColorSchemeChoice = "phase_color"
     initialization_algorithm: InitializationAlgorithmChoice = "raw"
     initializer_config: InitializerConfig | None = None
     initialization_fast_steps: int = 40
