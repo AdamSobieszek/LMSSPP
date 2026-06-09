@@ -2660,6 +2660,34 @@ class _AsyncPrecomputeControlsMixin:
             return
         self.precompute()
 
+    def _mark_cache_stale(self, message: str) -> None:
+        self._cache_valid = False
+        if self._precompute_busy:
+            self._precompute_stale_message = message
+            self.cache_status_html.value = "<span style='color:#666'>Computing all cached frames...</span>"
+            self.btn_precompute.description = "Interrupt"
+            self.btn_precompute.button_style = "info"
+            self.btn_precompute.disabled = False
+            self._sync_config_status()
+            self._sync_frame_controls(self._frame_index)
+            return
+        self.btn_precompute.description = "Precompute flow"
+        self.btn_precompute.button_style = "warning"
+        self.btn_precompute.disabled = False
+        self.cache_status_html.value = f"<span style='color:#9a6700'>{message}</span>"
+        self._sync_config_status()
+        self._sync_frame_controls(self._frame_index)
+
+    def _mark_cache_ready(self, message: str) -> None:
+        self._cache_valid = True
+        self._precompute_busy = False
+        self.btn_precompute.description = "Precompute flow"
+        self.btn_precompute.button_style = "success"
+        self.btn_precompute.disabled = False
+        self.cache_status_html.value = f"<span style='color:#188038'>{message}</span>"
+        self._sync_config_status()
+        self._sync_frame_controls(self._frame_index)
+
 
 class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
     """Interactive ``go.FigureWidget`` animation of fiber + joint-density dynamics.
@@ -3282,37 +3310,6 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
         finally:
             self._updating = False
 
-    def _mark_cache_stale(self, message: str) -> None:
-        self._cache_valid = False
-        if self._precompute_busy:
-            self._precompute_stale_message = message
-            self.cache_status_html.value = "<span style='color:#666'>Computing all cached frames...</span>"
-            self.btn_precompute.description = "Interrupt"
-            self.btn_precompute.button_style = "info"
-            self.btn_precompute.disabled = False
-            self._sync_config_status()
-            self._sync_frame_controls(self._frame_index)
-            return
-        self.btn_precompute.description = "Precompute flow"
-        self.btn_precompute.disabled = False
-        self.btn_precompute.button_style = "warning"
-        self.cache_status_html.value = f"<span style='color:#9a6700'>{message}</span>"
-        self._sync_config_status()
-        self._sync_frame_controls(self._frame_index)
-
-    def _mark_cache_ready(self, message: str) -> None:
-        self._cache_valid = True
-        self._precompute_busy = False
-        count = len(self._frame_payloads)
-        self.btn_precompute.description = "Precompute flow"
-        self.btn_precompute.disabled = False
-        self.btn_precompute.button_style = "success"
-        self.btn_step.disabled = count <= 1
-        self.play.disabled = count <= 1
-        self.frame_slider.disabled = count <= 1
-        self.cache_status_html.value = f"<span style='color:#188038'>{message}</span>"
-        self._sync_frame_controls(self._frame_index)
-
     # -- callbacks ----------------------------------------------------------
 
     def _on_control_change(self, change: dict[str, Any]) -> None:
@@ -3842,35 +3839,6 @@ class PeszekPoyatoContinuousDensityWidget(_AsyncPrecomputeControlsMixin):
     def _ingest_precompute_result(self, result: DensitySimulationResult) -> None:
         self._ingest_result(result)
 
-    def _mark_cache_stale(self, message: str) -> None:
-        self._cache_valid = False
-        if self._precompute_busy:
-            self._precompute_stale_message = message
-            self.cache_status_html.value = "<span style='color:#666'>Computing all cached frames...</span>"
-            self.btn_precompute.description = "Interrupt"
-            self.btn_precompute.button_style = "info"
-            self.btn_precompute.disabled = False
-            self._sync_config_status()
-            self._sync_frame_controls(self._frame_index)
-            return
-        self.btn_precompute.description = "Precompute flow"
-        self.btn_precompute.button_style = "warning"
-        self.btn_precompute.disabled = False
-        self.cache_status_html.value = f"<span style='color:#9a6700'>{message}</span>"
-        self._sync_config_status()
-        self._sync_frame_controls(self._frame_index)
-
-    def _mark_cache_ready(self, message: str) -> None:
-        self._cache_valid = True
-        self._precompute_busy = False
-        count = len(self._frame_payloads)
-        self.btn_precompute.description = "Precompute flow"
-        self.btn_precompute.button_style = "success"
-        self.btn_precompute.disabled = False
-        self.cache_status_html.value = f"<span style='color:#188038'>{message}</span>"
-        self._sync_config_status()
-        self._sync_frame_controls(self._frame_index)
-
     def _sync_frame_controls(self, frame_index: int) -> None:
         max_frame = max(0, len(self._frame_payloads) - 1)
         frame_index = int(np.clip(frame_index, 0, max_frame))
@@ -4074,6 +4042,7 @@ class PeszekPoyatoContinuousDensityWidget(_AsyncPrecomputeControlsMixin):
         self._frame_index = 0
         if self._frame_payloads:
             self._apply_cached_frame(self._frame_payloads[0])
+        self._sync_config_status(result)
         self._mark_cache_ready(f"Cache ready: {len(self._frame_payloads)} frames.")
 
     def _on_control_change(self, change: dict[str, Any]) -> None:
@@ -4088,8 +4057,9 @@ class PeszekPoyatoContinuousDensityWidget(_AsyncPrecomputeControlsMixin):
         ) and self._result is not None:
             self._sync_zoom_toggle_labels()
             self._frame_payloads = self._build_frame_payloads(self._result, self._config_from_controls(make_animation=True))
-            self._cache_valid = bool(self._frame_payloads)
-            self._set_frame_index(self._frame_index)
+            if self._frame_payloads:
+                self._set_frame_index(self._frame_index)
+            self._sync_frame_controls(self._frame_index)
             return
         if change.get("owner") is self.n_fibers_slider:
             n_fibers = int(self.n_fibers_slider.value)

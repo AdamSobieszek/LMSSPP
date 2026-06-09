@@ -290,6 +290,85 @@ class PPBackendTests(unittest.TestCase):
             run_simulation(config, cancel_check=cancel_check)
         self.assertGreater(calls["n"], 3)
 
+    def test_run_density_simulation_cancel_check_interrupts_long_run(self) -> None:
+        config = _small_density_config(max_steps=10_000, min_steps=10_000, tol_rms=0.0)
+        calls = {"n": 0}
+
+        def cancel_check() -> bool:
+            calls["n"] += 1
+            return calls["n"] > 3
+
+        with self.assertRaises(InterruptedError):
+            run_density_simulation(config, cancel_check=cancel_check)
+        self.assertGreater(calls["n"], 3)
+
+    @unittest.skipIf(widgets is None, "ipywidgets optional dependency is unavailable")
+    def test_continuous_density_widget_async_precompute_and_interrupt(self) -> None:
+        config = _small_density_config(max_steps=200, make_animation=True, trajectory_frame_count=5)
+        try:
+            widget = make_continuous_density_widget(config, width=500, height=320)
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        widget._on_precompute_clicked(None)
+        self.assertTrue(widget._precompute_busy)
+        self.assertEqual(widget.btn_precompute.description, "Interrupt")
+        deadline = time.time() + 30.0
+        while widget._precompute_busy and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(widget._cache_valid)
+        self.assertGreater(len(widget._frame_payloads), 0)
+
+    @unittest.skipIf(widgets is None, "ipywidgets optional dependency is unavailable")
+    def test_continuous_density_stale_cache_keeps_playback_controls_enabled(self) -> None:
+        config = _small_density_config(max_steps=40, make_animation=True, trajectory_frame_count=8)
+        try:
+            widget = make_continuous_density_widget(config, width=500, height=320)
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        widget._on_precompute_clicked(None)
+        deadline = time.time() + 30.0
+        while widget._precompute_busy and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertGreater(len(widget._frame_payloads), 1)
+        widget._mark_cache_stale("Parameters changed.")
+        self.assertFalse(widget._cache_valid)
+        self.assertFalse(widget.play.disabled)
+        self.assertFalse(widget.frame_slider.disabled)
+        self.assertFalse(widget.btn_step.disabled)
+
+    @unittest.skipIf(widgets is None, "ipywidgets optional dependency is unavailable")
+    def test_continuous_density_display_controls_preserve_stale_cache(self) -> None:
+        config = _small_density_config(max_steps=40, make_animation=True, trajectory_frame_count=8)
+        try:
+            widget = make_continuous_density_widget(config, width=500, height=320)
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        widget._on_precompute_clicked(None)
+        deadline = time.time() + 30.0
+        while widget._precompute_busy and time.time() < deadline:
+            time.sleep(0.05)
+        widget._mark_cache_stale("Parameters changed.")
+        widget.panel_dropdown.value = "velocity_mag"
+        widget._on_control_change(
+            {"name": "value", "owner": widget.panel_dropdown, "new": "velocity_mag"}
+        )
+        self.assertFalse(widget._cache_valid)
+        self.assertEqual(widget.btn_precompute.button_style, "warning")
+        self.assertFalse(widget.play.disabled)
+
+    @unittest.skipIf(widgets is None, "ipywidgets optional dependency is unavailable")
+    def test_continuous_density_precompute_interrupt_resets_button(self) -> None:
+        config = _small_density_config(max_steps=10_000, min_steps=10_000, make_animation=True, trajectory_frame_count=5)
+        try:
+            widget = make_continuous_density_widget(config, width=500, height=320)
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        widget._on_precompute_clicked(None)
+        self.assertTrue(widget._precompute_busy)
+        widget._on_precompute_clicked(None)
+        self.assertEqual(widget.btn_precompute.description, "Precompute flow")
+        self.assertEqual(widget.btn_precompute.button_style, "warning")
+
     def test_legacy_fast_phase_initializer_discards_warmup_history(self) -> None:
         config = SimulationConfig(
             n_fibers=3,
