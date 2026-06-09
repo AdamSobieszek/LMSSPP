@@ -601,11 +601,22 @@ class ContinuousDensityTests(unittest.TestCase):
         trace_div_a = float(result.diagnostics[-1, trace_idx])
         np.testing.assert_allclose(trace_div_a, 2.0 * config.K, rtol=0.0, atol=0.25)
 
-    def test_rejects_unimplemented_density_solvers(self) -> None:
-        for solver in ("split_implicit_diffusion", "chang_cooper"):
-            config = _small_density_config(density_solver=solver)
-            with self.assertRaises(ValueError):
-                run_density_simulation(config)
+    def test_rejects_unknown_density_solver(self) -> None:
+        config = _small_density_config()
+        with self.assertRaisesRegex(ValueError, "unknown density_solver"):
+            run_density_simulation(replace(config, density_solver="bogus"))  # type: ignore[arg-type]
+
+    def test_chang_cooper_and_split_implicit_run(self) -> None:
+        for solver in ("chang_cooper", "split_implicit_diffusion"):
+            config = _small_density_config(
+                density_solver=solver,
+                eps_entropy=0.05,
+                max_steps=8,
+                dt=0.004,
+            )
+            result = run_density_simulation(config)
+            self.assertGreaterEqual(result.steps, 1)
+            self.assertGreaterEqual(float(np.max(result.r_fiber)), 0.0)
 
     def test_rejects_backward_time_with_entropy(self) -> None:
         config = _small_density_config(eps_entropy=0.01, time_direction="backward")
@@ -634,7 +645,7 @@ class ContinuousDensityTests(unittest.TestCase):
         self.assertAlmostEqual(runtime.eps_entropy, 0.04)
         self.assertEqual(runtime.n_fibers, 4)
         self.assertEqual(runtime.trajectory_frame_count, 120)
-        self.assertEqual(runtime.density_solver, "explicit_fv")
+        self.assertEqual(runtime.density_solver, "split_implicit_diffusion")
 
 
 class DensityDynamicZoomTests(unittest.TestCase):
@@ -698,10 +709,11 @@ class DensityDynamicZoomTests(unittest.TestCase):
             grid_size=128,
             domain_radius=5.0,
             dt=0.008,
-            max_steps=50,
+            max_steps=500,
             make_animation=False,
             seed=2026,
             integrator="fixed_rk2",
+            density_solver="split_implicit_diffusion",
         )
         initial = make_density_initial_condition(config)
         axis = _density_grid_axis(config.grid_size, config.domain_radius)
@@ -710,7 +722,7 @@ class DensityDynamicZoomTests(unittest.TestCase):
         rho0 = np.tensordot(initial.nu, initial.r_fiber, axes=(0, 0))
         result = run_density_simulation(config, initial)
         self.assertLess(float(result.rho_grid[far].max()), 1.5 * float(rho0[far].max()) + 0.05)
-        self.assertLess(float(np.max(result.r_fiber)), 6.0)
+        self.assertLess(float(np.max(result.r_fiber)), 2.0)
 
     def test_display_payload_zoom_off_uses_full_grid(self) -> None:
         G = 16

@@ -194,7 +194,7 @@ class SimulationConfig:
     animation_transition_ms: int = 0
     out_dir: Path | str = Path("pp_largeN_fft_hessian_output")
 
-    density_solver: DensitySolverChoice = "explicit_fv"
+    density_solver: DensitySolverChoice = "split_implicit_diffusion"
     eps_entropy: float = 0.0
     density_boundary: DensityBoundaryChoice = "noflux"
     density_cfl_adv: float = 0.45
@@ -1018,7 +1018,6 @@ def run_simulation(
     raw_initial = make_initial_condition(config) if initial is None else validate_initial_condition(initial)
     initial, initialization_meta = _apply_initialization_algorithm(config, raw_initial)
     solver = _make_pp_backend(config)
-
     x = solver.asarray(initial.x)
     omega = solver.asarray(initial.omega)
     x, clip_count = solver.clip_inside_with_count(solver.copy_state(x))
@@ -1230,12 +1229,15 @@ DENSITY_DIAGNOSTIC_FIELDS = (
 
 
 def _validate_density_config(config: SimulationConfig) -> None:
-    if config.density_solver == "split_implicit_diffusion":
-        raise ValueError("density_solver='split_implicit_diffusion' is not implemented; use 'explicit_fv'")
-    if config.density_solver == "chang_cooper":
-        raise ValueError("density_solver='chang_cooper' is not implemented; use 'explicit_fv'")
-    if config.density_solver != "explicit_fv":
+    if config.density_solver not in ("explicit_fv", "split_implicit_diffusion", "chang_cooper"):
         raise ValueError(f"unknown density_solver: {config.density_solver!r}")
+    if config.density_solver == "explicit_fv" and config.eps_entropy > 0.0:
+        warnings.warn(
+            "density_solver='explicit_fv' with eps_entropy > 0 can develop spurious nonlocal mass; "
+            "prefer 'chang_cooper' or 'split_implicit_diffusion'.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     if not 0.0 <= config.alpha < 1.0:
         raise ValueError("continuous density requires 0 <= alpha < 1")
     if config.density_boundary == "periodic":
@@ -1531,6 +1533,103 @@ def _divergence_from_face_fluxes(fx: Array, fy: Array, h: float) -> Array:
     return div
 
 
+def _chang_cooper_bernoulli(z: Array) -> Array:
+    """Bernoulli function B(z) = z / (exp(z) - 1), with B(0) = 1."""
+
+    values = np.asarray(z, dtype=np.float64)
+    out = np.ones_like(values)
+    mask = np.abs(values) > 1e-10
+    scaled = values[mask]
+    out[mask] = scaled / np.expm1(scaled)
+    return out
+
+
+def _chang_cooper_face_flux(
+    r0: Array,
+    r1: Array,
+    phi0: Array,
+    phi1: Array,
+    eps: float,
+    h: float,
+) -> Array:
+    """Scharfetter--Gummel / Chang--Cooper flux for J = r grad Phi + eps grad r across one face."""
+
+    delta_phi = phi1 - phi0
+    if eps <= 0.0:
+        velocity = -delta_phi / h
+        return np.where(velocity >= 0.0, r0 * velocity, r1 * velocity)
+    coeff = float(eps) / h
+    z = delta_phi / float(eps)
+    return coeff * (_chang_cooper_bernoulli(z) * r1 - _chang_cooper_bernoulli(-z) * r0)
+
+
+def _fiber_potential_grid(
+    solver: FFTPeszekPoyatoDensity2D,
+    rho: Array,
+    omega_k: Array,
+    x1: Array,
+    x2: Array,
+) -> Array:
+    """Phi_k = K(W^alpha * rho) - omega_k . x for the entropic Fokker--Planck potential."""
+
+    w_field = solver.W_grid_from_rho(rho)
+    return w_field - float(omega_k[0]) * x1 - float(omega_k[1]) * x2
+
+
+def _density_chang_cooper_step(
+    r: Array,
+    phi: Array,
+    eps: float,
+    dt: float,
+    h: float,
+) -> Array:
+    """Conservative Fokker--Planck step for d_t r = div(r grad Phi + eps grad r) with no-flux boundaries."""
+
+    jx = _chang_cooper_face_flux(r[:-1, :], r[1:, :], phi[:-1, :], phi[1:, :], eps, h)
+    jy = _chang_cooper_face_flux(r[:, :-1], r[:, 1:], phi[:, :-1], phi[:, 1:], eps, h)
+    return r - float(dt) * _divergence_from_face_fluxes(jx, jy, h)
+
+
+def _implicit_diffusion_noflux_step(
+    r: Array,
+    eps: float,
+    dt: float,
+    h: float,
+    *,
+    iterations: int = 30,
+) -> Array:
+    """Solve (I - dt * eps * Lap) r_new = r with homogeneous Neumann (no-flux) boundaries."""
+
+    if eps <= 0.0 or dt <= 0.0:
+        return np.array(r, dtype=np.float64, copy=True)
+    nu = float(dt) * float(eps) / (float(h) * float(h))
+    if nu <= 0.0:
+        return np.array(r, dtype=np.float64, copy=True)
+    out = np.array(r, dtype=np.float64, copy=True)
+    for _ in range(max(1, int(iterations))):
+        padded = np.pad(out, ((1, 1), (1, 1)), mode="edge")
+        neighbors = padded[:-2, 1:-1] + padded[2:, 1:-1] + padded[1:-1, :-2] + padded[1:-1, 2:]
+        out = (out + nu * neighbors) / (1.0 + 4.0 * nu)
+    return out
+
+
+def _density_split_implicit_step(
+    r: Array,
+    phi: Array,
+    eps: float,
+    dt: float,
+    h: float,
+) -> Array:
+    """Strang split: half implicit diffusion, full potential advection, half implicit diffusion."""
+
+    if eps <= 0.0:
+        return _density_chang_cooper_step(r, phi, 0.0, dt, h)
+    half_dt = 0.5 * float(dt)
+    out = _implicit_diffusion_noflux_step(r, eps, half_dt, h)
+    out = _density_chang_cooper_step(out, phi, 0.0, dt, h)
+    return _implicit_diffusion_noflux_step(out, eps, half_dt, h)
+
+
 def _density_fv_step_single(
     r: Array,
     omega_k: Array,
@@ -1567,8 +1666,48 @@ def _density_cfl_dt(
             float(np.max(np.abs(time_sign * (float(omega[k, 1]) - Ay_f)))),
         )
     dt_adv = float(config.density_cfl_adv) * h / max(max_speed, 1e-14)
-    dt_diff = float(config.density_cfl_diff) * h * h / float(eps) if eps > 0.0 else float("inf")
-    return _clamp_dt(min(dt_adv, dt_diff), config)
+    if config.density_solver == "explicit_fv" and eps > 0.0:
+        dt_diff = float(config.density_cfl_diff) * h * h / float(eps)
+        return _clamp_dt(min(dt_adv, dt_diff), config)
+    return _clamp_dt(dt_adv, config)
+
+
+def _density_cfl_dt_from_potential(
+    phi_fields: Sequence[Array],
+    h: float,
+    config: SimulationConfig,
+) -> float:
+    max_grad = 0.0
+    for phi in phi_fields:
+        grad_x = np.gradient(phi, h, axis=0)
+        grad_y = np.gradient(phi, h, axis=1)
+        max_grad = max(max_grad, float(np.max(np.abs(grad_x))), float(np.max(np.abs(grad_y))))
+    dt_adv = float(config.density_cfl_adv) * h / max(max_grad, 1e-14)
+    return _clamp_dt(dt_adv, config)
+
+
+def _density_step_single(
+    r: Array,
+    phi: Array,
+    omega_k: Array,
+    Ax: Array,
+    Ay: Array,
+    eps: float,
+    dt: float,
+    h: float,
+    time_sign: float,
+    solver_mode: DensitySolverChoice,
+) -> Array:
+    signed_phi = time_sign * phi
+    if solver_mode == "chang_cooper":
+        # Unified SG is used for eps=0; entropic runs use Strang split for stability with
+        # nonlocal interaction potentials on bounded grids.
+        if eps > 0.0:
+            return _density_split_implicit_step(r, signed_phi, eps, dt, h)
+        return _density_chang_cooper_step(r, signed_phi, 0.0, dt, h)
+    if solver_mode == "split_implicit_diffusion":
+        return _density_split_implicit_step(r, signed_phi, eps, dt, h)
+    return _density_fv_step_single(r, omega_k, Ax, Ay, eps, dt, h, time_sign)
 
 
 def _repair_fiber_densities(
@@ -1668,7 +1807,7 @@ def run_density_simulation(
     *,
     cancel_check: Callable[[], bool] | None = None,
 ) -> DensitySimulationResult:
-    """Evolve conditional fiber densities with explicit finite-volume advection-diffusion."""
+    """Evolve conditional fiber densities with conservative Fokker--Planck discretizations."""
 
     _validate_density_config(config)
 
@@ -1699,6 +1838,9 @@ def run_density_simulation(
     rejected_steps = 0
     t = 0.0
     use_fixed_dt = config.integrator == "fixed_rk2"
+    solver_mode = config.density_solver
+    axis = _density_grid_axis(solver.G, solver.L)
+    x1, x2 = np.meshgrid(axis, axis, indexing="ij")
 
     def record_trajectory(step_: int, time_: float, *, force: bool = False) -> None:
         if not config.make_animation:
@@ -1719,7 +1861,15 @@ def run_density_simulation(
         record_trajectory(accepted_steps, t)
         rho = solver.marginal_from_fibers(r_fiber, nu)
         Ax, Ay = solver.A_grid_from_rho(rho)
-        step_dt = float(config.dt) if use_fixed_dt else min(_density_cfl_dt(Ax, Ay, omega, eps, solver.h, config, time_sign), dt_current)
+        phi_fields = tuple(_fiber_potential_grid(solver, rho, omega[k], x1, x2) for k in range(omega.shape[0]))
+        if solver_mode in ("chang_cooper", "split_implicit_diffusion"):
+            cfl_dt = _density_cfl_dt_from_potential(phi_fields, solver.h, config)
+        else:
+            cfl_dt = _density_cfl_dt(Ax, Ay, omega, eps, solver.h, config, time_sign)
+        if use_fixed_dt:
+            step_dt = min(float(config.dt), cfl_dt)
+        else:
+            step_dt = min(cfl_dt, dt_current)
         row = _density_diagnostic_row(
             step=accepted_steps,
             time=t,
@@ -1744,7 +1894,18 @@ def run_density_simulation(
 
         r_next = np.empty_like(r_fiber)
         for k in range(r_fiber.shape[0]):
-            r_next[k] = _density_fv_step_single(r_fiber[k], omega[k], Ax, Ay, eps, step_dt, solver.h, time_sign)
+            r_next[k] = _density_step_single(
+                r_fiber[k],
+                phi_fields[k],
+                omega[k],
+                Ax,
+                Ay,
+                eps,
+                step_dt,
+                solver.h,
+                time_sign,
+                solver_mode,
+            )
 
         r_fiber, renorm_correction, negative_count = _repair_fiber_densities(
             r_next,
@@ -3743,7 +3904,7 @@ class PeszekPoyatoContinuousDensityWidget(_AsyncPrecomputeControlsMixin):
             make_animation=make_animation,
             trajectory_frame_count=int(self.frame_cap_slider.value),
             integrator="fixed_rk2",
-            density_solver="explicit_fv",
+            density_solver=self.config.density_solver,
             density_boundary="noflux",
             record_free_energy=True,
             record_entropy_balance=True,
@@ -4313,6 +4474,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dt-min", type=float, default=1.0e-4)
     parser.add_argument("--dt-max", type=float, default=0.09)
     parser.add_argument("--max-displacement-per-step", type=float, default=0.75)
+    parser.add_argument("--record-every", type=int, default=5)
     parser.add_argument("--farfield-shells", type=int, default=18)
     parser.add_argument("--angles-per-shell", type=int, default=64)
     parser.add_argument("--seed", type=int, default=None, help="random seed; omitted means choose a fresh seed for this run")
@@ -4369,6 +4531,7 @@ def config_from_args(args: argparse.Namespace) -> SimulationConfig:
         dt_min=args.dt_min,
         dt_max=args.dt_max,
         max_displacement_per_step=args.max_displacement_per_step,
+        record_every=args.record_every,
         farfield_shells=args.farfield_shells,
         angles_per_shell=args.angles_per_shell,
         out_dir=args.out_dir,
