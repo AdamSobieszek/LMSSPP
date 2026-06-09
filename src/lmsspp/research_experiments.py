@@ -6,11 +6,11 @@ module provides a reproducible experiment runner around those functions.
 
 Recommended repository-level entry point:
 
-    python scripts/run_experiment.py finite_horizon_animation_batch
+    python scripts/run_experiment.py pp_finite_horizon_animation_batch
 
 Optional dotted overrides use Hydra-style syntax:
 
-    python scripts/run_experiment.py finite_horizon_animation_batch params.n_per_fiber=80 cases.0.seed=2031
+    python scripts/run_experiment.py pp_finite_horizon_animation_batch params.n_per_fiber=80 cases.0.seed=2031
 
 This module remains the importable orchestration library used by the script and
 tests. Running it directly with ``python -m`` requires the package to be
@@ -30,6 +30,7 @@ from .dynamics.pp_transient_research import (
     TransientResearchConfig,
     run_finite_horizon_animation_batch,
     run_finite_horizon_comparison,
+    run_long_cross_reference,
     run_pp_research_sweep,
     run_research_simulation,
     run_toy_transient_suite,
@@ -48,6 +49,7 @@ else:
 SUPPORTED_EXPERIMENTS = (
     "finite_horizon_animation_batch",
     "finite_horizon_comparison",
+    "long_cross_reference",
     "research_sweep",
     "research_run",
     "toy_suite",
@@ -192,6 +194,10 @@ def run_experiment_config(
 
     if kind == "finite_horizon_comparison":
         metrics = run_finite_horizon_comparison(out_dir, **params)
+        return metrics
+
+    if kind == "long_cross_reference":
+        metrics = run_long_cross_reference(out_dir, **params)
         return metrics
 
     if kind == "toy_suite":

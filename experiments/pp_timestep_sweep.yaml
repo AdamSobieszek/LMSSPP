@@ -1,5 +1,5 @@
 experiment: research_sweep
-output_dir: temp_research/timestep_sweep_yaml
+output_dir: temp_research/pp_timestep_sweep_yaml
 sweep: timestep
 values: [0.09, 0.055, 0.03, 0.015, 0.0075]
 

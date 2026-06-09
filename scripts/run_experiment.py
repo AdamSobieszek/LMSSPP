@@ -2,8 +2,8 @@
 
 Examples:
 
-    python scripts/run_experiment.py finite_horizon_comparison
-    python scripts/run_experiment.py experiments/finite_horizon_animation_batch.yaml params.n_per_fiber=80
+    python scripts/run_experiment.py pp_finite_horizon_comparison
+    python scripts/run_experiment.py experiments/pp_finite_horizon_animation_batch.yaml params.n_per_fiber=80
 
 The script is intentionally outside ``src/lmsspp`` so it can resolve both the
 repo-local ``experiments/`` directory and the ``src`` package without requiring

@@ -19,7 +19,9 @@ from lmsspp.dynamics.pp_transient_research import (
     compute_morphology_metrics,
     evaluate_A_and_H_at_particles,
     nearest_neighbor_quantiles,
+    run_finite_horizon_animation_batch,
     run_finite_horizon_comparison,
+    run_long_cross_reference,
     run_pp_research_sweep,
     run_research_simulation,
 )
@@ -202,6 +204,65 @@ class PPTransientResearchTests(unittest.TestCase):
             self.assertTrue((Path(tmp) / "comparison_metrics.json").exists())
             self.assertTrue((Path(tmp) / "finite_horizon_vs_fixed_rk2.html").exists())
             self.assertTrue((Path(tmp) / "finite_horizon_residual_split.html").exists())
+
+    def test_tiny_animation_batch_supports_adaptive_pp_right_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summaries = run_finite_horizon_animation_batch(
+                tmp,
+                right_model="ordinary_pp_adaptive",
+                right_dynamic_zoom=True,
+                n_fibers=2,
+                n_per_fiber=3,
+                grid_size=16,
+                domain_radius=3.0,
+                old_fixed_steps=1,
+                adaptive_steps=1,
+                animation_frames=2,
+                fps=2,
+                record_every=1,
+                research_diagnostics_every=1,
+                research_diagnostic_sample_size=20,
+                research_energy_sample_size=20,
+                research_nn_chunk=32,
+                cases=[{"label": "tiny_pp_adaptive", "seed": 25, "alpha": 0.45, "K": 0.2, "tau": 0.01}],
+            )
+            case_dir = Path(tmp) / "tiny_pp_adaptive"
+            self.assertEqual(summaries[0]["right_model"], "ordinary_pp_adaptive")
+            self.assertTrue((case_dir / "time_aligned_fixed_vs_adaptive_pp.mp4").exists())
+            self.assertTrue((case_dir / "fixed_vs_adaptive_pp.png").exists())
+            self.assertTrue((case_dir / "adaptive_pp_residual_split.html").exists())
+            self.assertTrue((case_dir / "adaptive_rk2_pp" / "metrics.json").exists())
+
+    def test_tiny_long_cross_reference_writes_zoom_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics = run_long_cross_reference(
+                tmp,
+                n_fibers=2,
+                n_per_fiber=3,
+                alpha=0.45,
+                K=0.2,
+                grid_size=16,
+                domain_radius=3.0,
+                dt=0.01,
+                dt_min=0.01,
+                dt_max=0.01,
+                max_steps=1,
+                min_steps=2,
+                seed=23,
+                trajectory_frame_count=2,
+                record_every=1,
+                research_diagnostics_every=1,
+                research_diagnostic_sample_size=20,
+                research_energy_sample_size=20,
+                research_nn_chunk=32,
+            )
+            self.assertEqual(metrics["experiment"], "long_cross_reference")
+            self.assertTrue((Path(tmp) / "REPORT_LONG_1.md").exists())
+            self.assertTrue((Path(tmp) / "fig_long_1_final_full_and_zoom.png").exists())
+            self.assertTrue((Path(tmp) / "fig_long_1_montage_fixed_rk2.png").exists())
+            self.assertTrue((Path(tmp) / "fig_long_1_montage_adaptive_rk2.png").exists())
+            self.assertTrue((Path(tmp) / "fig_long_1_adaptive_cross_details.png").exists())
+            self.assertTrue((Path(tmp) / "long_cross_reference_metrics.json").exists())
 
 
 if __name__ == "__main__":

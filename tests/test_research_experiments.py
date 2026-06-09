@@ -28,13 +28,13 @@ class ResearchExperimentOrchestrationTests(unittest.TestCase):
         self.assertEqual(resolved["cases"][0]["tau"], 0.045)
 
     def test_repo_level_script_resolves_experiment_names(self) -> None:
-        resolved = run_experiment_script.resolve_config_path("finite_horizon_comparison", cwd=Path("/tmp"))
-        self.assertEqual(resolved, REPO_ROOT / "experiments" / "finite_horizon_comparison.yaml")
+        resolved = run_experiment_script.resolve_config_path("pp_finite_horizon_comparison", cwd=Path("/tmp"))
+        self.assertEqual(resolved, REPO_ROOT / "experiments" / "pp_finite_horizon_comparison.yaml")
 
     def test_yaml_finite_horizon_comparison_runs_and_writes_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "comparison"
-            config_path = Path(tmp) / "comparison.yaml"
+            config_path = Path(tmp) / "pp_comparison.yaml"
             config_path.write_text(
                 "\n".join(
                     [
@@ -59,6 +59,43 @@ class ResearchExperimentOrchestrationTests(unittest.TestCase):
             self.assertTrue((out_dir / "resolved_experiment.yaml").exists())
             self.assertTrue((out_dir / "orchestration_result.json").exists())
             self.assertTrue((out_dir / "finite_horizon_vs_fixed_rk2.png").exists())
+
+    def test_yaml_long_cross_reference_runs_and_writes_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "long_cross"
+            config_path = Path(tmp) / "pp_long_cross.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "experiment: long_cross_reference",
+                        f"output_dir: {out_dir}",
+                        "params:",
+                        "  n_fibers: 2",
+                        "  n_per_fiber: 3",
+                        "  alpha: 0.45",
+                        "  K: 0.2",
+                        "  grid_size: 16",
+                        "  domain_radius: 3.0",
+                        "  dt: 0.01",
+                        "  dt_min: 0.01",
+                        "  dt_max: 0.01",
+                        "  max_steps: 1",
+                        "  min_steps: 2",
+                        "  seed: 24",
+                        "  trajectory_frame_count: 2",
+                        "  record_every: 1",
+                        "  research_diagnostics_every: 1",
+                        "  research_diagnostic_sample_size: 20",
+                        "  research_energy_sample_size: 20",
+                        "  research_nn_chunk: 32",
+                    ]
+                )
+            )
+            result = run_experiment_file(config_path)
+            self.assertEqual(result["experiment"], "long_cross_reference")
+            self.assertTrue((out_dir / "resolved_experiment.yaml").exists())
+            self.assertTrue((out_dir / "orchestration_result.json").exists())
+            self.assertTrue((out_dir / "fig_long_1_final_full_and_zoom.png").exists())
 
 
 if __name__ == "__main__":

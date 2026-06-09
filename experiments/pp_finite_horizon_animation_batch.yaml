@@ -1,5 +1,5 @@
 experiment: finite_horizon_animation_batch
-output_dir: temp_research/finite_horizon_animation_batch_yaml
+output_dir: temp_research/pp_finite_horizon_animation_batch_yaml
 
 params:
   n_fibers: 10

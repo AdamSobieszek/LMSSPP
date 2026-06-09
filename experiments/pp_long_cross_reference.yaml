@@ -1,0 +1,30 @@
+experiment: long_cross_reference
+output_dir: temp_research/pp_long_cross_reference_yaml
+
+params:
+  n_fibers: 10
+  n_per_fiber: 100
+  alpha: 0.99
+  K: 1.0
+  grid_size: 256
+  domain_radius: 4.0
+  dt: 0.055
+  dt_min: 0.00025
+  dt_max: 0.09
+  max_steps: 2000
+  min_steps: 2010
+  tol_rms: 0.0
+  max_displacement_per_step: 0.75
+  seed: 2026
+  trajectory_frame_count: 25
+  make_animation: true
+  record_every: 100
+  research_diagnostics_every: 100
+  research_diagnostic_sample_size: 900
+  research_energy_sample_size: 900
+  research_nn_chunk: 384
+  max_plot_points_per_group: 1200
+  max_animation_points_per_group: 1200
+  zoom_quantile: 0.9975
+  zoom_pad: 1.35
+  cross_detail_zoom_pad: 1.45
