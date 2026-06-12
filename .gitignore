@@ -16,3 +16,5 @@ build/
 deploy/iframe_app/static/trajectory.json
 deploy/iframe_app/static/export_meta.json
 
+# Research outputs
+/temp_research
