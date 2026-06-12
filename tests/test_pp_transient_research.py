@@ -9,6 +9,11 @@ from lmsspp.dynamics.pp_cs_equilibria import (
     FFTPeszekPoyato2D,
     InitialCondition,
     SimulationConfig,
+    _adaptive_step_factor,
+    _cfl_limited_dt,
+    _clamp_dt,
+    _dt_history_summary,
+    _predictive_tau_theta_from_config,
     _predictive_theta_from_config,
     compute_finite_horizon_negative_velocities,
     finite_horizon_gauge_average_field,
@@ -41,6 +46,99 @@ def _direct_A(query: np.ndarray, sources: np.ndarray, alpha: float, K: float) ->
     scale = np.zeros_like(r)
     scale[mask] = K * (r[mask] ** (-alpha)) / (1 - alpha) / len(sources)
     return (diff * scale[..., None]).sum(axis=1)
+
+
+def _reference_finite_horizon_field(
+    solver: FFTPeszekPoyato2D,
+    x: np.ndarray,
+    omega: np.ndarray,
+    tau: float,
+    theta: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    A_now, rho_now = solver.A_at_particles(x)
+    if tau == 0.0 or theta == 0.0:
+        return omega - A_now, A_now, rho_now
+    x_tau = solver.clip_inside(x + tau * (omega - A_now))
+    A_tau, _ = solver.A_at_particles(x_tau)
+    A_model = (1.0 - theta) * A_now + theta * A_tau
+    return omega - A_model, A_model, rho_now
+
+
+def _reference_finite_horizon_numpy_run(
+    config: SimulationConfig,
+    initial: InitialCondition,
+) -> dict[str, np.ndarray | int | float]:
+    solver = FFTPeszekPoyato2D(config.alpha, config.K, config.grid_size, config.domain_radius)
+    x = solver.clip_inside(np.asarray(initial.x, dtype=np.float64).copy())
+    omega = np.asarray(initial.omega, dtype=np.float64)
+    tau, theta = _predictive_tau_theta_from_config(config)
+    time_sign = -1.0 if config.time_direction == "backward" else 1.0
+    accepted_steps = 0
+    rejected_steps = 0
+    dt_current = _clamp_dt(float(config.dt), config)
+    dt_history: list[float] = []
+    t = 0.0
+
+    if config.integrator == "fixed_rk2":
+        dt_fixed = float(config.dt)
+        for _ in range(config.max_steps + 1):
+            vf, _, _ = _reference_finite_horizon_field(solver, x, omega, tau, theta)
+            rms, _ = solver.speed_stats(vf)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+            x_pred = solver.clip_inside(x + time_sign * dt_fixed * vf)
+            k2, _, _ = _reference_finite_horizon_field(solver, x_pred, omega, tau, theta)
+            x = solver.center(x + 0.5 * time_sign * dt_fixed * (vf + k2))
+            x = solver.clip_inside(x)
+            t += dt_fixed
+            accepted_steps += 1
+            dt_history.append(dt_fixed)
+    else:
+        while True:
+            vf, _, _ = _reference_finite_horizon_field(solver, x, omega, tau, theta)
+            rms, maxv = solver.speed_stats(vf)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+            trial_dt = _cfl_limited_dt(dt_current, maxv, solver.h, config)
+            while True:
+                x_pred = solver.clip_inside(x + time_sign * trial_dt * vf)
+                k2, _, _ = _reference_finite_horizon_field(solver, x_pred, omega, tau, theta)
+                x_euler = x + time_sign * trial_dt * vf
+                x_heun = x + 0.5 * time_sign * trial_dt * (vf + k2)
+                local_err = solver.rms_delta(x_heun, x_euler)
+                if not np.isfinite(local_err):
+                    rejected_steps += 1
+                    trial_dt = max(float(config.dt_min), trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False))
+                    continue
+                if local_err <= config.adaptive_tol or trial_dt <= config.dt_min * (1 + 1e-12):
+                    break
+                rejected_steps += 1
+                trial_dt = max(float(config.dt_min), trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False))
+            x = solver.center(x_heun)
+            x = solver.clip_inside(x)
+            t += trial_dt
+            accepted_steps += 1
+            dt_history.append(trial_dt)
+            dt_current = _clamp_dt(trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=True), config)
+
+    residual, A_bar, rho_grid = _reference_finite_horizon_field(solver, x, omega, tau, theta)
+    dt_min, dt_max, dt_mean = _dt_history_summary(dt_history)
+    return {
+        "x_final": x,
+        "A_final": A_bar,
+        "residual": residual,
+        "rho_grid": rho_grid,
+        "steps": accepted_steps,
+        "rejected_steps": rejected_steps,
+        "final_time": t,
+        "dt_min": dt_min,
+        "dt_max": dt_max,
+        "dt_mean": dt_mean,
+    }
 
 
 class PPTransientResearchTests(unittest.TestCase):
@@ -103,10 +201,64 @@ class PPTransientResearchTests(unittest.TestCase):
         self.assertAlmostEqual(_predictive_theta_from_config(replace(base, predictive_pp_weight="1/2")), 0.5)
         self.assertAlmostEqual(_predictive_theta_from_config(replace(base, predictive_pp_weight=0.25)), 0.25)
         self.assertAlmostEqual(_predictive_theta_from_config(replace(base, predictive_pp_weight="0.75")), 0.75)
-        with self.assertRaisesRegex(ValueError, "\\[0, 1\\]"):
+        self.assertAlmostEqual(_predictive_theta_from_config(replace(base, predictive_pp_weight=-0.25)), 0.25)
+        self.assertEqual(
+            _predictive_tau_theta_from_config(replace(base, prediction_horizon_tau=0.2, predictive_pp_weight=-0.25)),
+            (-0.2, 0.25),
+        )
+        with self.assertRaisesRegex(ValueError, "\\[-1, 1\\]"):
             _predictive_theta_from_config(replace(base, predictive_pp_weight=1.5))
         with self.assertRaisesRegex(TypeError, "numeric"):
             _predictive_theta_from_config(replace(base, predictive_pp_weight="not-a-number"))
+
+    def test_convolve_fields_matches_scalar_fft_reference(self) -> None:
+        rng = np.random.default_rng(19)
+        x = rng.normal(scale=0.35, size=(10, 2))
+        solver = FFTPeszekPoyato2D(alpha=0.45, K=0.7, grid_size=24, domain_radius=3.0)
+        rho = solver.A_grid_from_particles(x)[0]
+        padded = np.zeros((solver.P, solver.P), dtype=np.float64)
+        padded[: solver.G, : solver.G] = rho
+        rho_hat = np.fft.rfft2(padded)
+
+        fields = solver.convolve_fields(rho, (solver.fft_Kx, solver.fft_Ky, solver.fft_Hxx))
+        reference = tuple(
+            np.fft.irfft2(rho_hat * kernel, s=(solver.P, solver.P))[: solver.G, : solver.G]
+            for kernel in (solver.fft_Kx, solver.fft_Ky, solver.fft_Hxx)
+        )
+        for actual, expected in zip(fields, reference):
+            np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+
+    def test_finite_horizon_integration_matches_reference_loop(self) -> None:
+        base = SimulationConfig(
+            n_fibers=2,
+            n_per_fiber=5,
+            grid_size=16,
+            domain_radius=3.0,
+            alpha=0.45,
+            K=0.7,
+            max_steps=3,
+            min_steps=100,
+            dt=0.01,
+            backend="numpy",
+            prediction_horizon_tau=0.03,
+            predictive_pp_weight=0.65,
+            make_dashboard=False,
+            make_animation=False,
+            seed=22,
+        )
+        initial = make_initial_condition(base)
+        for integrator in ("fixed_rk2", "adaptive_rk2"):
+            config = replace(base, integrator=integrator)
+            result = run_finite_horizon_gauge_averaged_simulation(config, initial)
+            reference = _reference_finite_horizon_numpy_run(config, initial)
+            np.testing.assert_allclose(result.x_final, reference["x_final"], rtol=0.0, atol=1e-13)
+            np.testing.assert_allclose(result.A_final, reference["A_final"], rtol=0.0, atol=1e-13)
+            np.testing.assert_allclose(result.residual, reference["residual"], rtol=0.0, atol=1e-13)
+            np.testing.assert_allclose(result.rho_grid, reference["rho_grid"], rtol=0.0, atol=1e-13)
+            self.assertEqual(result.steps, reference["steps"])
+            self.assertEqual(result.rejected_steps, reference["rejected_steps"])
+            self.assertAlmostEqual(result.final_time, float(reference["final_time"]))
+            self.assertAlmostEqual(result.dt_mean, float(reference["dt_mean"]))
 
     def test_finite_horizon_tau_zero_recovers_ordinary_pp(self) -> None:
         config = SimulationConfig(
@@ -335,7 +487,11 @@ class PPTransientResearchTests(unittest.TestCase):
         )
         trajectory = np.stack([x, x + 0.01], axis=0)
         batch = compute_finite_horizon_negative_velocities(config, trajectory, omega)
-        np.testing.assert_allclose(batch[0], -velocity, rtol=0.0, atol=1e-13)
+        expected_batch = np.stack(
+            [finite_horizon_negative_velocity_at(config, trajectory[f], omega) for f in range(trajectory.shape[0])],
+            axis=0,
+        )
+        np.testing.assert_allclose(batch, expected_batch, rtol=0.0, atol=1e-13)
 
     def test_tiny_predictive_velocity_animation_batch_writes_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

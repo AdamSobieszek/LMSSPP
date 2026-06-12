@@ -1,0 +1,938 @@
+diff --git a/src/lmsspp/lms_ball3d_widget.py b/src/lmsspp/lms_ball3d_widget.py
+index 6403080..5761166 100644
+--- a/src/lmsspp/lms_ball3d_widget.py
++++ b/src/lmsspp/lms_ball3d_widget.py
+@@ -25,7 +25,7 @@ try:
+     from .core.canonical_gauge import (
+         ball_to_rapidity,
+         busemann_cloud_potential,
+-        canonical_center,
++        canonical_cloud,
+         canonical_residual,
+         local_busemann_initializer,
+         rapidity_to_ball,
+@@ -43,7 +43,7 @@ except Exception:
+     from core.canonical_gauge import (  # type: ignore
+         ball_to_rapidity,
+         busemann_cloud_potential,
+-        canonical_center,
++        canonical_cloud,
+         canonical_residual,
+         local_busemann_initializer,
+         rapidity_to_ball,
+@@ -148,7 +148,7 @@ InitMetricMode = Literal["entropy", "perp_variance"]
+ EnergyStateMode = Literal["min_energy", "poisson", "max_energy"]
+ EntropyCoordinateMode = Literal["kernel", "continuum_poisson"]
+ ShellConstraintMode = Literal["constant_entropy", "constant_energy"]
+-CenterEstimationMode = Literal["poisson_shrink", "busemann_exact"]
++CenterEstimationMode = Literal["busemann_exact"]
+ 
+ 
+ class _HydroRecomputeCancelled(Exception):
+@@ -301,7 +301,7 @@ class LMSBall3DWidget:
+         *,
+         controls: tuple[LMS3DControlSpec, ...] = DEFAULT_CONTROLS,
+         w_mode: str = "autograd",
+-        center_estimation_mode: CenterEstimationMode = "poisson_shrink",
++        center_estimation_mode: CenterEstimationMode = "busemann_exact",
+         rng_seed: int = 0,
+         point_size: int = 5,
+         title: str = "Reduced LMS dynamics on S² (points) / B³ (order parameters)",
+@@ -359,6 +359,10 @@ class LMSBall3DWidget:
+         self._last_rendered_frame = 0
+         self._init_state_mode: InitMode = self._active_mode_order()[0]
+         self._job_center_estimation_mode: CenterEstimationMode | None = None
++        self._last_gauge_residual_norm = float("nan")
++        self._last_gauge_center_error = float("nan")
++        self._last_gauge_converged = False
++        self._projection_chart_mode: Literal["rescaled", "unscaled"] = "rescaled"
+         # Inversion mapping remains available in code, but is not user-exposed in widget controls.
+         self._inversion_enabled = False
+ 
+@@ -380,6 +384,10 @@ class LMSBall3DWidget:
+             ],
+             layout=widgets.Layout(width="980px"),
+         )
++        self.visual_tabs = widgets.Tab(children=(self.sphere_fig, self.projection_box))
++        self.visual_tabs.set_title(0, "3D Sphere")
++        self.visual_tabs.set_title(1, "2D Inversive Chart")
++        self.visual_tabs.observe(self._on_visual_tab_change, names="selected_index")
+         self.layout = widgets.Box()
+         self._apply_root_layout()
+ 
+@@ -433,14 +441,12 @@ class LMSBall3DWidget:
+             style={"description_width": "initial"},
+         )
+         self.center_estimation_dropdown = widgets.Dropdown(
+-            options=[
+-                ("Poisson shrink", "poisson_shrink"),
+-                ("Exact Busemann", "busemann_exact"),
+-            ],
+-            value=self.center_estimation_mode,
++            options=[("Exact Busemann", "busemann_exact")],
++            value="busemann_exact",
+             description="Center inversion",
+             layout=widgets.Layout(width="260px"),
+             style={"description_width": "initial"},
++            disabled=True,
+         )
+         self.layout_dropdown = widgets.Dropdown(
+             options=[
+@@ -519,6 +525,7 @@ class LMSBall3DWidget:
+         self.btn_export_webm = widgets.Button(description="Export WebM set")
+         self.toggle_init_state = widgets.Button(description="Initial State: High Entropy")
+         self.btn_toggle_frame = widgets.Button(description="Frame: Lab")
++        self.btn_projection_chart = widgets.Button(description="2D Chart: Rescaled")
+         self.btn_speed_half = widgets.Button(description="0.5x speed (1.0)")
+         self.btn_speed_double = widgets.Button(description="2x speed (1.0)")
+         self._register_export_widget(self.btn_play_forward, control_id="btn_play_forward")
+@@ -562,6 +569,7 @@ class LMSBall3DWidget:
+             self.btn_export_webm,
+             self.toggle_init_state,
+             self.btn_toggle_frame,
++            self.btn_projection_chart,
+             self.btn_speed_half,
+             self.btn_speed_double,
+         ):
+@@ -607,6 +615,7 @@ class LMSBall3DWidget:
+         self._sync_entropy_button_label()
+         self._sync_time_direction_button_label()
+         self._sync_init_state_button_label()
++        self._sync_projection_chart_button_label()
+ 
+     @staticmethod
+     def _make_slider_reference_marker(spec: LMS3DControlSpec) -> widgets.HTML | None:
+@@ -792,6 +801,70 @@ class LMSBall3DWidget:
+         self._camera_cache = self._camera_to_json()
+         self._apply_projection_visual_mode()
+ 
++        self.projection_status_html = widgets.HTML("")
++        self.projection_fig = go.FigureWidget()
++        self.projection_fig.add_trace(
++            go.Scatter(
++                x=[],
++                y=[],
++                mode="lines",
++                line=dict(color="rgba(120,120,120,0.42)", width=1),
++                name="spherical chart grid",
++                showlegend=False,
++            )
++        )
++        self.projection_fig.add_trace(
++            go.Scatter(
++                x=[],
++                y=[],
++                mode="lines",
++                line=dict(color="rgba(65,105,225,0.20)", width=1),
++                name="point paths",
++                showlegend=False,
++            )
++        )
++        self.projection_fig.add_trace(
++            go.Scatter(
++                x=[],
++                y=[],
++                mode="markers",
++                marker=dict(size=max(3, self.point_size), color="royalblue"),
++                name="xᵢ(t)",
++                showlegend=True,
++            )
++        )
++        self.projection_fig.add_trace(
++            go.Scatter(
++                x=[],
++                y=[],
++                mode="markers",
++                marker=dict(size=9, color="black", symbol="x"),
++                name="chart antipode",
++                showlegend=True,
++            )
++        )
++        self.projection_fig.update_layout(
++            title="Spherical inversion chart of boundary points",
++            width=760,
++            height=760,
++            margin=dict(l=35, r=20, t=52, b=35),
++            template="plotly_white",
++            showlegend=True,
++            legend=dict(x=0.02, y=0.98, bgcolor="rgba(255,255,255,0.75)"),
++            xaxis=dict(title="", scaleanchor="y", scaleratio=1.0, zeroline=True),
++            yaxis=dict(title="", zeroline=True),
++            uirevision="lms-ball3d-inversive-2d",
++        )
++        self.projection_box = widgets.VBox(
++            [
++                widgets.HBox(
++                    [self.btn_projection_chart, self.projection_status_html],
++                    layout=widgets.Layout(align_items="center", gap="12px"),
++                ),
++                self.projection_fig,
++            ]
++        )
++
+         self.metrics_fig = go.FigureWidget(
+             make_subplots(
+                 rows=3,
+@@ -1153,6 +1226,8 @@ class LMSBall3DWidget:
+         self._set_export_action(self.play, action_kind="play", state_key="frame", label_binding="play_button")
+         self.sphere_fig.layout.scene.on_change(self._on_camera_changed, "camera")
+         self.sphere_fig.on_edits_completed(self._on_plot_edits_completed)
++        if hasattr(self, "visual_tabs"):
++            self.visual_tabs.observe(self._on_visual_tab_change, names="selected_index")
+         self._bind_export_click(self.btn_play_forward, self._on_play_forward_clicked, action_kind="play_forward")
+         self._bind_export_click(self.btn_play_backward, self._on_play_backward_clicked, action_kind="play_backward")
+         self._bind_export_observe(
+@@ -1174,6 +1249,12 @@ class LMSBall3DWidget:
+             state_key="frame_name",
+             label_binding="frame_name_button",
+         )
++        self._bind_export_click(
++            self.btn_projection_chart,
++            self._on_projection_chart_clicked,
++            action_kind="projection_chart_toggle",
++            state_key="projection_chart",
++        )
+         self._bind_export_click(
+             self.btn_speed_half,
+             self._on_speed_half_clicked,
+@@ -1211,18 +1292,11 @@ class LMSBall3DWidget:
+ 
+     @staticmethod
+     def _canonical_center_estimation_mode(mode: str) -> CenterEstimationMode:
+-        value = str(mode).strip().lower()
+-        if value in {"busemann", "exact", "finite_n_busemann", "busemann_exact", "finite-n-busemann"}:
+-            return "busemann_exact"
+-        return "poisson_shrink"
++        _ = mode
++        return "busemann_exact"
+ 
+     def _current_center_estimation_mode(self) -> CenterEstimationMode:
+-        if self._job_center_estimation_mode is not None:
+-            return self._job_center_estimation_mode
+-        dropdown = getattr(self, "center_estimation_dropdown", None)
+-        if dropdown is not None:
+-            return self._canonical_center_estimation_mode(str(dropdown.value))
+-        return self._canonical_center_estimation_mode(str(getattr(self, "center_estimation_mode", "poisson_shrink")))
++        return "busemann_exact"
+ 
+     @staticmethod
+     def _json_ready(value: Any) -> Any:
+@@ -1575,6 +1649,90 @@ class LMSBall3DWidget:
+         finally:
+             self._in_frame_update = False
+ 
++    def _apply_inversive_projection_to_widget(
++        self,
++        state: dict[str, Any],
++        *,
++        traj_cache: dict[str, np.ndarray],
++        base_points: np.ndarray,
++        display_idx: np.ndarray | None,
++    ) -> None:
++        if not hasattr(self, "projection_fig"):
++            return
++        frame_name = self._coerce_frame_name(str(state.get("frame_name", "lab")))
++        t = int(state.get("frame", 0))
++        pole = self._projection_pole_from_state(state)
++        omega = self._projection_chart_omega(state)
++        chart_scale = self._projection_chart_scale(state)
++        base_arr = np.asarray(base_points, dtype=np.float64)
++        disp = None if display_idx is None else np.asarray(display_idx, dtype=np.int64)
++        if disp is not None and disp.size > 0 and disp.size < base_arr.shape[0]:
++            base_display = np.asarray(base_arr[disp], dtype=np.float64)
++        else:
++            base_display = base_arr
++            disp = None
++
++        points = self._points_from_series_or_reduced_state(
++            t=t,
++            frame_name=frame_name,
++            traj_cache=traj_cache,
++            base_points_display=base_display,
++            display_idx=disp,
++        )
++        uv = self._spherical_inversion_project_2d(points, pole=pole, omega=chart_scale)
++        finite = np.isfinite(uv).all(axis=1)
++        uv_plot = uv[finite]
++
++        grid_x, grid_y = self._spherical_inversion_grid_2d(pole=pole, omega=chart_scale)
++        if bool(state.get("show_paths", True)):
++            path_x, path_y = self._projected_point_paths_2d(
++                t=t,
++                frame_name=frame_name,
++                base_points=base_arr,
++                display_idx=display_idx,
++                traj_cache=traj_cache,
++                pole=pole,
++                omega=chart_scale,
++            )
++        else:
++            path_x, path_y = [], []
++
++        range_values: list[float] = []
++        if uv_plot.size > 0:
++            range_values.extend(np.ravel(np.abs(uv_plot)).tolist())
++        for seq in (grid_x, grid_y, path_x, path_y):
++            arr = np.asarray([v for v in seq if v is not None], dtype=np.float64)
++            if arr.size:
++                range_values.extend(np.abs(arr[np.isfinite(arr)]).tolist())
++        if range_values:
++            cap = float(np.nanquantile(np.asarray(range_values, dtype=np.float64), 0.985))
++            cap = max(1.0, min(50.0, 1.12 * cap))
++        else:
++            cap = 1.0
++
++        chart_label = "rescaled ΩC" if self._projection_chart_mode == "rescaled" else "unscaled C"
++        self.projection_status_html.value = (
++            f"<span style='font-family:monospace;font-size:12px'>"
++            f"{chart_label}; frame={frame_name}; Ω={omega:.4g}; scale={chart_scale:.4g}; "
++            f"hidden near pole={int((~finite).sum())}"
++            "</span>"
++        )
++        self._sync_projection_chart_button_label()
++
++        with self.projection_fig.batch_update():
++            self.projection_fig.data[0].x = grid_x
++            self.projection_fig.data[0].y = grid_y
++            self.projection_fig.data[1].x = path_x
++            self.projection_fig.data[1].y = path_y
++            self.projection_fig.data[1].visible = bool(state.get("show_paths", True))
++            self.projection_fig.data[2].x = uv_plot[:, 0].tolist() if uv_plot.size else []
++            self.projection_fig.data[2].y = uv_plot[:, 1].tolist() if uv_plot.size else []
++            self.projection_fig.data[3].x = [0.0]
++            self.projection_fig.data[3].y = [0.0]
++            self.projection_fig.update_xaxes(range=[-cap, cap])
++            self.projection_fig.update_yaxes(range=[-cap, cap])
++            self.projection_fig.layout.title = f"Spherical inversion chart ({chart_label})"
++
+     def _export_media_scene_state(
+         self,
+         *,
+@@ -2072,9 +2230,10 @@ class LMSBall3DWidget:
+         if bool(self.layout_top_view.value):
+             # Top row: larger 3D view. Bottom row: controls + stats/plots.
+             self.sphere_fig.update_layout(width=1200, height=600)
++            self.projection_fig.update_layout(width=1200, height=600)
+             layout_w = max(1220, panel_w)
+             self.bottom_panel.layout.width = f"{layout_w}px"
+-            self.layout.children = (self.sphere_fig, self.bottom_panel)
++            self.layout.children = (self.visual_tabs, self.bottom_panel)
+             self.layout.layout = widgets.Layout(
+                 display="flex",
+                 flex_flow="column",
+@@ -2083,8 +2242,9 @@ class LMSBall3DWidget:
+             )
+         else:
+             self.sphere_fig.update_layout(width=760, height=760)
++            self.projection_fig.update_layout(width=760, height=760)
+             self.bottom_panel.layout.width = f"{panel_w}px"
+-            self.layout.children = (self.sphere_fig, self.bottom_panel)
++            self.layout.children = (self.visual_tabs, self.bottom_panel)
+             self.layout.layout = widgets.Layout(
+                 display="flex",
+                 flex_flow="row",
+@@ -2116,6 +2276,16 @@ class LMSBall3DWidget:
+             self.layout_dropdown.value = layout_value
+             self._updating = prev
+ 
++    def _sync_projection_chart_button_label(self) -> None:
++        if not hasattr(self, "btn_projection_chart"):
++            return
++        if self._projection_chart_mode == "unscaled":
++            self.btn_projection_chart.description = "2D Chart: Unscaled"
++            self.btn_projection_chart.button_style = "info"
++        else:
++            self.btn_projection_chart.description = "2D Chart: Rescaled"
++            self.btn_projection_chart.button_style = ""
++
+     def _sync_time_direction_button_label(self) -> None:
+         if bool(self.toggle_time_direction.value):
+             self.toggle_time_direction.description = "Time Direction: Backward"
+@@ -2163,6 +2333,7 @@ class LMSBall3DWidget:
+             return "Perpendicular-variance proxy"
+         return "Entropy kernel proxy"
+ 
++
+     def _primary_metric_series_name(self) -> str:
+         if self.init_metric_mode == "perp_variance":
+             return "perp-variance proxy"
+@@ -2462,6 +2633,181 @@ class LMSBall3DWidget:
+             cap=cap,
+         )
+ 
++    @staticmethod
++    def _projection_basis_from_pole(pole: np.ndarray, *, eps: float = 1e-12) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++        a = np.asarray(pole, dtype=np.float64).reshape(3)
++        n = float(np.linalg.norm(a))
++        if n <= eps or not np.isfinite(n):
++            a = np.array([1.0, 0.0, 0.0], dtype=np.float64)
++        else:
++            a = a / n
++        ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
++        if abs(float(np.dot(ref, a))) > 0.92:
++            ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
++        e1 = np.cross(ref, a)
++        e1 = e1 / max(float(np.linalg.norm(e1)), eps)
++        e2 = np.cross(a, e1)
++        e2 = e2 / max(float(np.linalg.norm(e2)), eps)
++        return a, e1, e2
++
++    @classmethod
++    def _spherical_inversion_project_2d(
++        cls,
++        points: np.ndarray,
++        *,
++        pole: np.ndarray,
++        omega: float = 1.0,
++        eps: float = 1e-10,
++    ) -> np.ndarray:
++        """Project C_a(x)=(x-a)/|x-a|^2 to the plane normal to boundary pole a."""
++        pts = np.asarray(points, dtype=np.float64)
++        single = pts.ndim == 1
++        arr = pts.reshape(-1, 3)
++        a, e1, e2 = cls._projection_basis_from_pole(pole, eps=eps)
++        diff = arr - a[None, :]
++        den = np.sum(diff * diff, axis=1, keepdims=True)
++        finite = den[:, 0] > float(eps)
++        y = np.full_like(diff, np.nan, dtype=np.float64)
++        y[finite] = float(omega) * diff[finite] / den[finite]
++        out = np.column_stack([y @ e1, y @ e2])
++        return out[0] if single else out
++
++    @classmethod
++    def _spherical_inversion_grid_2d(
++        cls,
++        *,
++        pole: np.ndarray,
++        omega: float,
++        theta_count: int = 8,
++        phi_count: int = 12,
++        samples: int = 192,
++    ) -> tuple[list[float | None], list[float | None]]:
++        a, e1, e2 = cls._projection_basis_from_pole(pole)
++        xs: list[float | None] = []
++        ys: list[float | None] = []
++
++        def append_curve(curve: np.ndarray) -> None:
++            uv = cls._spherical_inversion_project_2d(curve, pole=a, omega=float(omega))
++            finite = np.isfinite(uv).all(axis=1)
++            for pt, ok in zip(uv, finite, strict=True):
++                if ok:
++                    xs.append(float(pt[0]))
++                    ys.append(float(pt[1]))
++                else:
++                    xs.append(None)
++                    ys.append(None)
++            xs.append(None)
++            ys.append(None)
++
++        phi = np.linspace(0.0, 2.0 * math.pi, int(samples), endpoint=True)
++        for theta in np.linspace(0.18, math.pi - 0.18, int(theta_count)):
++            ring = (
++                math.cos(float(theta)) * a[None, :]
++                + math.sin(float(theta)) * (np.cos(phi)[:, None] * e1[None, :] + np.sin(phi)[:, None] * e2[None, :])
++            )
++            append_curve(ring)
++
++        theta = np.linspace(0.18, math.pi - 0.18, int(samples), endpoint=True)
++        for phi0 in np.linspace(0.0, 2.0 * math.pi, int(phi_count), endpoint=False):
++            u = math.cos(float(phi0)) * e1 + math.sin(float(phi0)) * e2
++            meridian = np.cos(theta)[:, None] * a[None, :] + np.sin(theta)[:, None] * u[None, :]
++            append_curve(meridian)
++        return xs, ys
++
++    @staticmethod
++    def _line_segments_from_projected_series(series_uv: np.ndarray) -> tuple[list[float | None], list[float | None]]:
++        arr = np.asarray(series_uv, dtype=np.float64)
++        if arr.ndim != 3 or arr.shape[-1] != 2:
++            return [], []
++        xs: list[float | None] = []
++        ys: list[float | None] = []
++        for j in range(arr.shape[1]):
++            curve = arr[:, j, :]
++            finite = np.isfinite(curve).all(axis=1)
++            for pt, ok in zip(curve, finite, strict=True):
++                if ok:
++                    xs.append(float(pt[0]))
++                    ys.append(float(pt[1]))
++                else:
++                    xs.append(None)
++                    ys.append(None)
++            xs.append(None)
++            ys.append(None)
++        return xs, ys
++
++    def _projection_pole_from_state(self, state: dict[str, Any]) -> np.ndarray:
++        frame_name = self._coerce_frame_name(str(state.get("frame_name", "lab")))
++        if frame_name == "body":
++            pole = np.asarray(state.get("w_raw", np.array([1.0, 0.0, 0.0])), dtype=np.float64)
++        else:
++            # z_lab=-zeta w, so -z_lab is the lab-frame image of the reduced w direction.
++            pole = -np.asarray(state.get("z_raw", np.array([-1.0, 0.0, 0.0])), dtype=np.float64)
++        n = float(np.linalg.norm(pole))
++        if n <= 1e-10 or not np.isfinite(n):
++            return np.array([1.0, 0.0, 0.0], dtype=np.float64)
++        return pole / n
++
++    def _projection_chart_omega(self, state: dict[str, Any]) -> float:
++        w = np.asarray(state.get("w_raw", np.zeros(3)), dtype=np.float64).reshape(3)
++        return max(1e-8, 1.0 - float(np.dot(w, w)))
++
++    def _projection_chart_scale(self, state: dict[str, Any]) -> float:
++        if self._projection_chart_mode == "unscaled":
++            return 1.0
++        return self._projection_chart_omega(state)
++
++    def _projected_point_paths_2d(
++        self,
++        *,
++        t: int,
++        frame_name: Literal["lab", "body"],
++        base_points: np.ndarray,
++        display_idx: np.ndarray | None,
++        traj_cache: dict[str, np.ndarray],
++        pole: np.ndarray,
++        omega: float,
++        max_paths: int = 64,
++    ) -> tuple[list[float | None], list[float | None]]:
++        if t <= 0 or max_paths <= 0:
++            return [], []
++        n = int(base_points.shape[0])
++        if n <= 0:
++            return [], []
++        if display_idx is not None and display_idx.size > 0:
++            candidates = np.asarray(display_idx, dtype=np.int64)
++        else:
++            candidates = np.arange(n, dtype=np.int64)
++        if candidates.size > max_paths:
++            pick = np.linspace(0, candidates.size - 1, int(max_paths), dtype=np.int64)
++            sample_idx = candidates[pick]
++        else:
++            sample_idx = candidates
++        frame_stride = max(1, int(math.ceil((t + 1) / 180.0)))
++        frames = np.arange(0, t + 1, frame_stride, dtype=np.int64)
++        if frames[-1] != t:
++            frames = np.append(frames, t)
++
++        x_key = "x_body" if frame_name == "body" else "x_lab"
++        x_cached = traj_cache.get(x_key)
++        if x_cached is not None:
++            pts = np.asarray(x_cached, dtype=np.float64)[frames][:, sample_idx, :]
++        else:
++            w_series = np.asarray(traj_cache["w"], dtype=np.float64)[frames]
++            zeta_series = np.asarray(traj_cache["zeta"], dtype=np.float64)[frames]
++            base = np.asarray(base_points, dtype=np.float64)[sample_idx]
++            diff = base[None, :, :] - w_series[:, None, :]
++            den = np.einsum("tnd,tnd->tn", diff, diff)[:, :, None]
++            w2 = np.einsum("td,td->t", w_series, w_series)[:, None, None]
++            pts = ((1.0 - w2) / np.maximum(den, 1e-12)) * diff - w_series[:, None, :]
++            pts = pts / np.maximum(np.linalg.norm(pts, axis=2, keepdims=True), 1e-12)
++            if frame_name == "lab":
++                pts = np.einsum("tnd,ted->tne", pts, zeta_series, optimize=True)
++
++        uv = self._spherical_inversion_project_2d(pts.reshape(-1, 3), pole=pole, omega=omega).reshape(
++            pts.shape[0], pts.shape[1], 2
++        )
++        return self._line_segments_from_projected_series(uv)
++
+     def _frame_arrays(self) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
+         """Return (x, z, Z) arrays according to current viewing-frame choice."""
+         if self.view_frame_dropdown.value == "body":
+@@ -2877,16 +3223,11 @@ class LMSBall3DWidget:
+                 target_r=float(r0),
+                 init_state=init_mode,
+             )
+-            target_w = self._target_w_from_radius(
+-                target_r=float(r0),
+-                target_dir=center_dir,
+-            )
+             w0, base_points = self._reduced_state_from_boundary_points(
+                 points=x0_points,
+                 weights=weights,
+                 d=d,
+                 fallback_dir=center_dir,
+-                target_w=target_w,
+             )
+ 
+         zeta0 = torch.eye(d, dtype=torch.float64)
+@@ -3347,94 +3688,34 @@ class LMSBall3DWidget:
+     ) -> torch.Tensor:
+         return local_busemann_initializer(points, weights, lam=lam)
+ 
+-    def _estimate_w_from_boundary_points_poisson(
+-        self,
+-        *,
+-        points: torch.Tensor,
+-        weights: torch.Tensor,
+-        d: int,
+-        fallback_dir: torch.Tensor,
+-    ) -> torch.Tensor:
+-        """Moment-matched shrink inversion q(r)=f_d(r)r used in legacy widgets."""
+-        m = (weights[:, None] * points).sum(dim=0)
+-        q = float(torch.linalg.norm(m))
+-        q = float(np.clip(q, 0.0, 0.999999))
+-        if q < 1e-12:
+-            return fallback_dir * 0.0
+-
+-        # In reduced coordinates z = -zeta w, so for zeta=I at initialization
+-        # the physical centroid direction aligns with -w (not +w).
+-        direction = -m / max(q, 1e-12)
+-
+-        def q_of_r(r: float) -> float:
+-            return float(self._shrink_fd(d=d, r=r) * r)
+-
+-        lo = 0.0
+-        hi = 0.999999
+-        q_hi = q_of_r(hi)
+-        if q >= q_hi:
+-            r = hi
+-        else:
+-            for _ in range(60):
+-                mid = 0.5 * (lo + hi)
+-                if q_of_r(mid) < q:
+-                    lo = mid
+-                else:
+-                    hi = mid
+-            r = 0.5 * (lo + hi)
+-        return direction * float(r)
+-
+-    def _estimate_w_from_boundary_points_busemann(
++    def _exact_reduced_state_from_observed_cloud(
+         self,
+         *,
+         points: torch.Tensor,
+         weights: torch.Tensor,
+         fallback_dir: torch.Tensor,
+-        max_iters: int = 120,
++        max_iters: int = 160,
+         tol: float = 1e-10,
+-    ) -> torch.Tensor:
+-        """Exact finite-N inversion from the LMS/Busemann cloud potential."""
+-        try:
+-            z_star = canonical_center(
+-                points,
+-                weights,
+-                fallback_dir=fallback_dir,
+-                max_iters=max_iters,
+-                tol=tol,
+-            )
+-            if torch.isfinite(z_star).all():
+-                return -z_star
+-        except Exception:
+-            pass
+-        return self._estimate_w_from_boundary_points_poisson(
+-            points=points,
+-            weights=weights,
+-            d=int(points.shape[1]),
+-            fallback_dir=fallback_dir,
+-        )
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """Return (w0, base_points, observed_points) from exact finite-N Busemann gauge.
+ 
+-    def _estimate_w_from_boundary_points(
+-        self,
+-        *,
+-        points: torch.Tensor,
+-        weights: torch.Tensor,
+-        d: int,
+-        fallback_dir: torch.Tensor,
+-    ) -> torch.Tensor:
+-        """Estimate reduced w from a boundary cloud using the selected inversion."""
+-        method = self._current_center_estimation_mode()
+-        if method == "busemann_exact":
+-            return self._estimate_w_from_boundary_points_busemann(
+-                points=points,
+-                weights=weights,
+-                fallback_dir=fallback_dir,
+-            )
+-        return self._estimate_w_from_boundary_points_poisson(
+-            points=points,
+-            weights=weights,
+-            d=d,
++        Solves sum_i a_i M_{-w0}(x_i)=0 with canonical base cloud P_i=M_{-w0}(x_i).
++        """
++        observed = normalize(points)
++        state = canonical_cloud(
++            observed,
++            weights,
+             fallback_dir=fallback_dir,
++            max_iters=int(max_iters),
++            tol=float(tol),
+         )
++        w0 = state.w
++        base_points = state.P
++        x_reconstructed = normalize(mobius_sphere(base_points, w0))
++        self._last_gauge_residual_norm = float(state.residual_norm)
++        self._last_gauge_center_error = float(state.center_error)
++        self._last_gauge_converged = bool(state.converged)
++        return w0, base_points, x_reconstructed
+ 
+     @staticmethod
+     def _target_w_from_radius(
+@@ -3455,38 +3736,13 @@ class LMSBall3DWidget:
+         fallback_dir: torch.Tensor,
+         target_w: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        """Build (w0, base_points) from a boundary cloud under the active inversion mode.
+-
+-        In exact Busemann mode, if `target_w` is provided we keep the exact
+-        deboosted base cloud and place it back on the same Möbius orbit at the
+-        requested reduced center. This preserves the exact inversion structure
+-        while making the chosen radius/direction exact by construction.
+-        """
+-        method = self._current_center_estimation_mode()
+-        if method == "busemann_exact":
+-            w_exact = self._estimate_w_from_boundary_points_busemann(
+-                points=points,
+-                weights=weights,
+-                fallback_dir=fallback_dir,
+-            )
+-            base_points = self._recover_base_points_from_state(
+-                x_points=points,
+-                w0=w_exact,
+-            )
+-            if target_w is not None:
+-                return target_w.to(dtype=base_points.dtype, device=base_points.device), base_points
+-            return w_exact, base_points
+-
+-        w0 = self._estimate_w_from_boundary_points_poisson(
++        """Build (w0, base_points) from an observed boundary cloud via exact inversion."""
++        _ = (d, target_w)
++        w0, base_points, _ = self._exact_reduced_state_from_observed_cloud(
+             points=points,
+             weights=weights,
+-            d=d,
+             fallback_dir=fallback_dir,
+         )
+-        base_points = self._recover_base_points_from_state(
+-            x_points=points,
+-            w0=w0,
+-        )
+         return w0, base_points
+ 
+     def _reduced_state_from_poisson_cloud(
+@@ -3498,18 +3754,14 @@ class LMSBall3DWidget:
+         d: int,
+         fallback_dir: torch.Tensor,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-        """Build a Poisson initialization, optionally re-centering finite-N by Busemann inversion."""
++        """Build a Poisson sample, place it on the target orbit, then exact-invert."""
++        _ = d
+         x_points = normalize(mobius_sphere(base_points, target_w))
+-        if self._current_center_estimation_mode() != "busemann_exact":
+-            return target_w, base_points, x_points
+-        w0, recovered_base = self._reduced_state_from_boundary_points(
++        return self._exact_reduced_state_from_observed_cloud(
+             points=x_points,
+             weights=weights,
+-            d=d,
+             fallback_dir=fallback_dir,
+         )
+-        x_reconstructed = normalize(mobius_sphere(recovered_base, w0))
+-        return w0, recovered_base, x_reconstructed
+ 
+     @staticmethod
+     def _recover_base_points_from_state(
+@@ -3605,12 +3857,19 @@ class LMSBall3DWidget:
+             inversion_enabled=bool(self._inversion_enabled),
+         )
+         self._apply_base_scene_state_to_widget(scene_state)
++        self._apply_inversive_projection_to_widget(
++            scene_state,
++            traj_cache=self._traj_cache,
++            base_points=self._base_points_np if self._base_points_np is not None else np.zeros((0, 3), dtype=np.float64),
++            display_idx=self._display_indices,
++        )
+ 
+         self._last_path_frame = t
+         self._last_overlay_frame = t
+ 
+         z_norm = float(np.linalg.norm(np.asarray(scene_state["Z_raw"], dtype=np.float64)) / max(float(params["K"]), 1e-9))
+         w_norm = float(np.linalg.norm(np.asarray(scene_state["w_raw"], dtype=np.float64)))
++        z_mag = float(np.linalg.norm(np.asarray(scene_state["z_raw"], dtype=np.float64)))
+         def _metric_at(key: str) -> float:
+             arr = self._metric_cache.get(key) if self._metric_cache else None
+             if arr is None or len(arr) <= t:
+@@ -3633,7 +3892,7 @@ class LMSBall3DWidget:
+             f"<tr><td style='padding-right:14px'>omega</td><td>{float(params['omega']):.3f}</td></tr>"
+             f"<tr><td style='padding-right:14px'>dt eff</td><td>{dt_eff:+.4f}</td></tr>"
+             f"<tr><td style='padding-right:14px'>Time direction</td><td>{'backward' if time_sign < 0 else 'forward'}</td></tr>"
+-            f"<tr><td style='padding-right:14px'>|w|,|z|</td><td>{w_norm:.5f}</td></tr>"
++            f"<tr><td style='padding-right:14px'>|w|,|z|</td><td>{w_norm:.5f}, {z_mag:.5f}</td></tr>"
+             f"<tr><td style='padding-right:14px'>|Z|/K</td><td>{z_norm:.5f}</td></tr>"
+             f"<tr><td style='padding-right:14px'>Entropy direction</td>"
+             f"<td>{'increase' if bool(self.toggle_entropy.value) else 'dissipate'}</td></tr>"
+@@ -3676,14 +3935,22 @@ class LMSBall3DWidget:
+         self.layout_top_view.value = bool(change.get("new") == "top")
+ 
+     def _on_center_estimation_change(self, change: dict[str, Any]) -> None:
+-        if self._updating or change.get("name") != "value":
+-            return
+-        self.center_estimation_mode = self._canonical_center_estimation_mode(str(change.get("new", "poisson_shrink")))
+-        self._recompute(reset_frame=False)
++        _ = change
++        self.center_estimation_mode = "busemann_exact"
+ 
+     def _on_toggle_frame_clicked(self, _btn: widgets.Button) -> None:
+         self.view_frame_dropdown.value = "body" if self.view_frame_dropdown.value == "lab" else "lab"
+ 
++    def _on_projection_chart_clicked(self, _btn: widgets.Button) -> None:
++        self._projection_chart_mode = "unscaled" if self._projection_chart_mode == "rescaled" else "rescaled"
++        self._sync_projection_chart_button_label()
++        self._render_frame(int(self.frame_slider.value))
++
++    def _on_visual_tab_change(self, change: dict[str, Any]) -> None:
++        if self._updating or change.get("name") != "selected_index":
++            return
++        self._render_frame(int(self.frame_slider.value))
++
+     def _on_toggle_layout_clicked(self, _btn: widgets.Button) -> None:
+         self.layout_top_view.value = not bool(self.layout_top_view.value)
+ 
+@@ -4927,10 +5194,8 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
+         self._queue_async_recompute(reset_frame=False)
+ 
+     def _on_center_estimation_change(self, change: dict[str, Any]) -> None:
+-        if self._updating or change.get("name") != "value":
+-            return
+-        self.center_estimation_mode = self._canonical_center_estimation_mode(str(change.get("new", "poisson_shrink")))
+-        self._queue_async_recompute(reset_frame=False)
++        _ = change
++        self.center_estimation_mode = "busemann_exact"
+ 
+     def _on_recompute_clicked(self, _btn: widgets.Button) -> None:
+         self._queue_async_recompute(reset_frame=False)
+@@ -5030,16 +5295,11 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
+                 target_r=float(r0),
+                 init_state=mode,
+             )
+-            target_w = self._target_w_from_radius(
+-                target_r=float(r0),
+-                target_dir=center_dir,
+-            )
+             w0, base_points = self._reduced_state_from_boundary_points(
+                 points=x0_points,
+                 weights=weights,
+                 d=d,
+                 fallback_dir=center_dir,
+-                target_w=target_w,
+             )
+ 
+         zeta0 = torch.eye(d, dtype=torch.float64)
+@@ -5203,7 +5463,7 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
+     def _compute_hydro_job_result(self, *, job: dict[str, Any], seq: int) -> dict[str, Any]:
+         prev_center_mode = self._job_center_estimation_mode
+         self._job_center_estimation_mode = self._canonical_center_estimation_mode(
+-            str(job.get("center_estimation_mode", "poisson_shrink"))
++            str(job.get("center_estimation_mode", "busemann_exact"))
+         )
+         params = dict(job["params"])
+         entropy_increase = bool(job["entropy_increase"])
+@@ -6440,6 +6700,7 @@ class _LMSEntropyShellMixin:
+         target_info = self._entropy_target_for_params(params)
+         constraint_mode = str(target_info.get("constraint_mode", "constant_entropy"))
+         axis = self._target_axis_from_params(params)
++        weights = torch.ones(n, dtype=torch.float64) / float(n)
+         _, w_poisson, x_poisson = self._poisson_reference_cloud(
+             n=n,
+             axis=axis,
+@@ -6448,7 +6709,12 @@ class _LMSEntropyShellMixin:
+             refine_entropy=constraint_mode == "constant_entropy",
+         )
+         if mode == "poisson":
+-            return x_poisson, w_poisson
++            w0, base_points, _ = self._exact_reduced_state_from_observed_cloud(
++                points=x_poisson,
++                weights=weights,
++                fallback_dir=axis,
++            )
++            return w0, base_points
+ 
+         if constraint_mode == "constant_energy":
+             init_state = "entropy_low" if mode == "min_energy" else "entropy_high"
+@@ -6460,13 +6726,12 @@ class _LMSEntropyShellMixin:
+                 target_r=float(target_info["r_poisson"]),
+                 init_state=init_state,
+             )
+-            w0 = self._estimate_w_from_boundary_points(
++            w0, base_points, _ = self._exact_reduced_state_from_observed_cloud(
+                 points=x_final,
+-                weights=torch.ones(n, dtype=torch.float64) / float(n),
+-                d=3,
++                weights=weights,
+                 fallback_dir=axis,
+             )
+-            return x_final, w0
++            return w0, base_points
+ 
+         if mode == "min_energy":
+             x_final = self._optimize_energy_shell_boundary_points(
+@@ -6476,13 +6741,12 @@ class _LMSEntropyShellMixin:
+                 minimize_energy=True,
+                 cancel_check=cancel_check,
+             )
+-            w0 = self._estimate_w_from_boundary_points(
++            w0, base_points, _ = self._exact_reduced_state_from_observed_cloud(
+                 points=x_final,
+-                weights=torch.ones(n, dtype=torch.float64) / float(n),
+-                d=3,
++                weights=weights,
+                 fallback_dir=axis,
+             )
+-            return x_final, w0
++            return w0, base_points
+ 
+         best_points: torch.Tensor | None = None
+         best_key: tuple[int, float, float] | None = None
+@@ -6507,13 +6771,12 @@ class _LMSEntropyShellMixin:
+                 best_points = x_candidate
+         if best_points is None:
+             best_points = x_poisson
+-        w0 = self._estimate_w_from_boundary_points(
++        w0, base_points, _ = self._exact_reduced_state_from_observed_cloud(
+             points=best_points,
+-            weights=torch.ones(n, dtype=torch.float64) / float(n),
+-            d=3,
++            weights=weights,
+             fallback_dir=axis,
+         )
+-        return best_points, w0
++        return w0, base_points
+ 
+     def _entropy_shell_stats_rows(self, *, t: int, params: dict[str, float | int], z_norm: float, w_norm: float) -> str:
+         target = self._entropy_target_for_params(params)
+@@ -6612,16 +6875,12 @@ class LMSBall3DEntropyShellEnsembleWidget(_LMSEntropyShellMixin, LMSBall3DHydrod
+                 refine_entropy=constraint_mode == "constant_entropy",
+             )
+         else:
+-            x0_points, w0 = self._make_energy_shell_boundary_points(
++            w0, base_points = self._make_energy_shell_boundary_points(
+                 n=n,
+                 params=params,
+                 mode=self._coerce_mode_to_active_family(mode),  # type: ignore[arg-type]
+                 cancel_check=cancel_check,
+             )
+-            base_points = self._recover_base_points_from_state(
+-                x_points=x0_points,
+-                w0=w0,
+-            )
+ 
+         zeta0 = torch.eye(d, dtype=torch.float64)
+         rot_axis = torch.tensor(_angles_to_unit(float(params["ax_az"]), float(params["ax_el"])), dtype=torch.float64)
+@@ -6727,15 +6986,11 @@ class LMSBall3DEntropyShellTwoSheetWidget(_LMSEntropyShellMixin, LMSBall3DBackwa
+                 refine_entropy=constraint_mode == "constant_entropy",
+             )
+         else:
+-            x0_points, w0 = self._make_energy_shell_boundary_points(
++            w0, base_points = self._make_energy_shell_boundary_points(
+                 n=n,
+                 params=params,
+                 mode=mode,  # type: ignore[arg-type]
+             )
+-            base_points = self._recover_base_points_from_state(
+-                x_points=x0_points,
+-                w0=w0,
+-            )
+ 
+         zeta0 = torch.eye(d, dtype=torch.float64)
+         rot_axis = torch.tensor(_angles_to_unit(float(params["ax_az"]), float(params["ax_el"])), dtype=torch.float64)

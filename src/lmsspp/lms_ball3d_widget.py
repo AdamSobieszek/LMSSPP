@@ -25,10 +25,18 @@ try:
     from .core.canonical_gauge import (
         ball_to_rapidity,
         busemann_cloud_potential,
-        canonical_cloud,
         canonical_residual,
         local_busemann_initializer,
         rapidity_to_ball,
+    )
+    from .core.gauge import target_w_from_radius as core_target_w_from_radius
+    from .core.gauge_transformations import (
+        CenterEstimationMode,
+        canonical_center_estimation_mode,
+        radius_to_centroid_norm,
+        shrink_fd,
+        state_from_observed_cloud,
+        state_from_reference_cloud,
     )
     from .LMS import (
         clamp_to_ball,
@@ -43,10 +51,18 @@ except Exception:
     from core.canonical_gauge import (  # type: ignore
         ball_to_rapidity,
         busemann_cloud_potential,
-        canonical_cloud,
         canonical_residual,
         local_busemann_initializer,
         rapidity_to_ball,
+    )
+    from core.gauge import target_w_from_radius as core_target_w_from_radius  # type: ignore
+    from core.gauge_transformations import (  # type: ignore
+        CenterEstimationMode,
+        canonical_center_estimation_mode,
+        radius_to_centroid_norm,
+        shrink_fd,
+        state_from_observed_cloud,
+        state_from_reference_cloud,
     )
     from LMS import (  # type: ignore
         clamp_to_ball,
@@ -148,7 +164,6 @@ InitMetricMode = Literal["entropy", "perp_variance"]
 EnergyStateMode = Literal["min_energy", "poisson", "max_energy"]
 EntropyCoordinateMode = Literal["kernel", "continuum_poisson"]
 ShellConstraintMode = Literal["constant_entropy", "constant_energy"]
-CenterEstimationMode = Literal["busemann_exact"]
 
 
 class _HydroRecomputeCancelled(Exception):
@@ -441,12 +456,14 @@ class LMSBall3DWidget:
             style={"description_width": "initial"},
         )
         self.center_estimation_dropdown = widgets.Dropdown(
-            options=[("Exact Busemann", "busemann_exact")],
-            value="busemann_exact",
+            options=[
+                ("Exact Busemann", "busemann_exact"),
+                ("Poisson shrink", "poisson_shrink"),
+            ],
+            value=self.center_estimation_mode,
             description="Center inversion",
             layout=widgets.Layout(width="260px"),
             style={"description_width": "initial"},
-            disabled=True,
         )
         self.layout_dropdown = widgets.Dropdown(
             options=[
@@ -1292,11 +1309,16 @@ class LMSBall3DWidget:
 
     @staticmethod
     def _canonical_center_estimation_mode(mode: str) -> CenterEstimationMode:
-        _ = mode
-        return "busemann_exact"
+        return canonical_center_estimation_mode(mode)
 
     def _current_center_estimation_mode(self) -> CenterEstimationMode:
-        return "busemann_exact"
+        job_mode = getattr(self, "_job_center_estimation_mode", None)
+        if job_mode is not None:
+            return self._canonical_center_estimation_mode(str(job_mode))
+        dropdown = getattr(self, "center_estimation_dropdown", None)
+        if dropdown is not None:
+            return self._canonical_center_estimation_mode(str(dropdown.value))
+        return self._canonical_center_estimation_mode(str(getattr(self, "center_estimation_mode", "busemann_exact")))
 
     @staticmethod
     def _json_ready(value: Any) -> Any:
@@ -1679,6 +1701,8 @@ class LMSBall3DWidget:
             base_points_display=base_display,
             display_idx=disp,
         )
+        if points.ndim != 2 or int(points.shape[1]) != 3:
+            return
         uv = self._spherical_inversion_project_2d(points, pole=pole, omega=chart_scale)
         finite = np.isfinite(uv).all(axis=1)
         uv_plot = uv[finite]
@@ -2748,7 +2772,7 @@ class LMSBall3DWidget:
         return pole / n
 
     def _projection_chart_omega(self, state: dict[str, Any]) -> float:
-        w = np.asarray(state.get("w_raw", np.zeros(3)), dtype=np.float64).reshape(3)
+        w = np.asarray(state.get("w_raw", np.zeros(3)), dtype=np.float64).reshape(-1)
         return max(1e-8, 1.0 - float(np.dot(w, w)))
 
     def _projection_chart_scale(self, state: dict[str, Any]) -> float:
@@ -3161,17 +3185,7 @@ class LMSBall3DWidget:
 
     def _shrink_fd(self, d: int, r: float) -> float:
         """Continuum LMS shrink factor f_d(r) from the hypergeometric ratio."""
-        r_clamped = max(0.0, min(0.999999999, float(r)))
-        if d == 2:
-            return 1.0
-        b = 1.0 - 0.5 * float(d)
-        c = 1.0 + 0.5 * float(d)
-        u = r_clamped * r_clamped
-        fu = self._hyp2f1_1b_c_u(b, c, u)
-        f1 = self._hyp2f1_1b_c_1(b, c)
-        if abs(f1) < 1e-12:
-            return 1.0
-        return float(fu / f1)
+        return shrink_fd(int(d), float(r))
 
     def _simulate(self, params: dict[str, float | int]):
         d = 3
@@ -3195,18 +3209,17 @@ class LMSBall3DWidget:
         self._init_state_mode = init_mode
         if init_mode == "poisson":
             # Finite-N Poisson-manifold initialization:
-            # choose uniform reference points, then optionally recover the
-            # finite-N Busemann center from the resulting boundary cloud.
+            # choose uniform reference points, then apply the selected gauge
+            # policy to the resulting boundary cloud.
             base_seed_points = random_points_on_sphere(
                 n,
                 d=d,
                 generator=self._torch_gen,
                 dtype=torch.float64,
             )
-            r0_clip = float(np.clip(r0, 0.0, 0.999999))
             # Keep sign convention consistent with optimized initializers:
             # requested axis controls the physical dipole direction z=-w at t=0.
-            target_w = -center_dir * r0_clip
+            target_w = self._target_w_from_radius(target_r=r0, target_dir=center_dir)
             w0, base_points, _ = self._reduced_state_from_poisson_cloud(
                 base_points=base_seed_points,
                 target_w=target_w,
@@ -3223,11 +3236,13 @@ class LMSBall3DWidget:
                 target_r=float(r0),
                 init_state=init_mode,
             )
+            target_w = self._target_w_from_radius(target_r=r0, target_dir=center_dir)
             w0, base_points = self._reduced_state_from_boundary_points(
                 points=x0_points,
                 weights=weights,
                 d=d,
                 fallback_dir=center_dir,
+                target_w=target_w,
             )
 
         zeta0 = torch.eye(d, dtype=torch.float64)
@@ -3604,8 +3619,7 @@ class LMSBall3DWidget:
         return var_parallel, var_perp
 
     def _radius_to_q_target(self, *, d: int, r: float) -> float:
-        r_clip = float(np.clip(r, 0.0, 0.999999))
-        return float(np.clip(self._shrink_fd(d=d, r=r_clip) * r_clip, 0.0, 0.999999))
+        return radius_to_centroid_norm(int(d), float(r))
 
     def _q_tolerance_from_r_tolerance(self, *, d: int, r: float, dr: float) -> float:
         r0 = float(np.clip(r, 0.0, 0.999999))
@@ -3688,6 +3702,11 @@ class LMSBall3DWidget:
     ) -> torch.Tensor:
         return local_busemann_initializer(points, weights, lam=lam)
 
+    def _record_gauge_diagnostics(self, diagnostics: Any) -> None:
+        self._last_gauge_residual_norm = float(getattr(diagnostics, "residual_norm", float("nan")))
+        self._last_gauge_center_error = float(getattr(diagnostics, "center_error", float("nan")))
+        self._last_gauge_converged = bool(getattr(diagnostics, "converged", True))
+
     def _exact_reduced_state_from_observed_cloud(
         self,
         *,
@@ -3701,21 +3720,37 @@ class LMSBall3DWidget:
 
         Solves sum_i a_i M_{-w0}(x_i)=0 with canonical base cloud P_i=M_{-w0}(x_i).
         """
-        observed = normalize(points)
-        state = canonical_cloud(
-            observed,
+        state = state_from_observed_cloud(
+            points,
             weights,
+            mode="busemann_exact",
             fallback_dir=fallback_dir,
             max_iters=int(max_iters),
             tol=float(tol),
         )
-        w0 = state.w
-        base_points = state.P
-        x_reconstructed = normalize(mobius_sphere(base_points, w0))
-        self._last_gauge_residual_norm = float(state.residual_norm)
-        self._last_gauge_center_error = float(state.center_error)
-        self._last_gauge_converged = bool(state.converged)
-        return w0, base_points, x_reconstructed
+        self._record_gauge_diagnostics(state.diagnostics)
+        w0, base_points, _ = state.as_lms_inputs()
+        return w0, base_points, state.observed_points
+
+    def _estimate_w_from_boundary_points(
+        self,
+        *,
+        points: torch.Tensor,
+        weights: torch.Tensor,
+        d: int,
+        fallback_dir: torch.Tensor,
+    ) -> torch.Tensor:
+        """Estimate only w for callers that already keep the observed cloud."""
+        _ = d
+        state = state_from_observed_cloud(
+            points,
+            weights,
+            mode=self._current_center_estimation_mode(),
+            fallback_dir=fallback_dir,
+        )
+        self._record_gauge_diagnostics(state.diagnostics)
+        w0, _, _ = state.as_lms_inputs()
+        return w0
 
     @staticmethod
     def _target_w_from_radius(
@@ -3723,9 +3758,11 @@ class LMSBall3DWidget:
         target_r: float,
         target_dir: torch.Tensor,
     ) -> torch.Tensor:
-        r_clip = float(np.clip(target_r, 0.0, 0.999999))
-        axis = normalize(target_dir.unsqueeze(0))[0]
-        return -axis * r_clip
+        return core_target_w_from_radius(
+            float(target_r),
+            target_dir,
+            convention="physical_dipole",
+        )
 
     def _reduced_state_from_boundary_points(
         self,
@@ -3736,13 +3773,17 @@ class LMSBall3DWidget:
         fallback_dir: torch.Tensor,
         target_w: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build (w0, base_points) from an observed boundary cloud via exact inversion."""
-        _ = (d, target_w)
-        w0, base_points, _ = self._exact_reduced_state_from_observed_cloud(
-            points=points,
-            weights=weights,
+        """Build (w0, base_points) from an observed boundary cloud."""
+        _ = d
+        state = state_from_observed_cloud(
+            points,
+            weights,
+            mode=self._current_center_estimation_mode(),
             fallback_dir=fallback_dir,
+            target_w=target_w,
         )
+        self._record_gauge_diagnostics(state.diagnostics)
+        w0, base_points, _ = state.as_lms_inputs()
         return w0, base_points
 
     def _reduced_state_from_poisson_cloud(
@@ -3754,14 +3795,18 @@ class LMSBall3DWidget:
         d: int,
         fallback_dir: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build a Poisson sample, place it on the target orbit, then exact-invert."""
+        """Build a Poisson reference cloud under the selected gauge policy."""
         _ = d
-        x_points = normalize(mobius_sphere(base_points, target_w))
-        return self._exact_reduced_state_from_observed_cloud(
-            points=x_points,
+        state = state_from_reference_cloud(
+            base_points,
+            target_w,
             weights=weights,
+            mode=self._current_center_estimation_mode(),
             fallback_dir=fallback_dir,
         )
+        self._record_gauge_diagnostics(state.diagnostics)
+        w0, base_points, _ = state.as_lms_inputs()
+        return w0, base_points, state.observed_points
 
     @staticmethod
     def _recover_base_points_from_state(
@@ -3935,8 +3980,10 @@ class LMSBall3DWidget:
         self.layout_top_view.value = bool(change.get("new") == "top")
 
     def _on_center_estimation_change(self, change: dict[str, Any]) -> None:
-        _ = change
-        self.center_estimation_mode = "busemann_exact"
+        if self._updating or change.get("name") != "value":
+            return
+        self.center_estimation_mode = self._canonical_center_estimation_mode(str(change.get("new", "busemann_exact")))
+        self._recompute(reset_frame=False)
 
     def _on_toggle_frame_clicked(self, _btn: widgets.Button) -> None:
         self.view_frame_dropdown.value = "body" if self.view_frame_dropdown.value == "lab" else "lab"
@@ -5194,8 +5241,10 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
         self._queue_async_recompute(reset_frame=False)
 
     def _on_center_estimation_change(self, change: dict[str, Any]) -> None:
-        _ = change
-        self.center_estimation_mode = "busemann_exact"
+        if self._updating or change.get("name") != "value":
+            return
+        self.center_estimation_mode = self._canonical_center_estimation_mode(str(change.get("new", "busemann_exact")))
+        self._queue_async_recompute(reset_frame=False)
 
     def _on_recompute_clicked(self, _btn: widgets.Button) -> None:
         self._queue_async_recompute(reset_frame=False)
@@ -5276,9 +5325,8 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 generator=self._torch_gen,
                 dtype=torch.float64,
             )
-            r0_clip = float(np.clip(r0, 0.0, 0.999999))
             # Keep sign convention consistent with optimized initializers.
-            target_w = -center_dir * r0_clip
+            target_w = self._target_w_from_radius(target_r=r0, target_dir=center_dir)
             w0, base_points, _ = self._reduced_state_from_poisson_cloud(
                 base_points=base_seed_points,
                 target_w=target_w,
@@ -5295,11 +5343,13 @@ class LMSBall3DHydrodynamicEnsembleWidget(LMSBall3DWidget):
                 target_r=float(r0),
                 init_state=mode,
             )
+            target_w = self._target_w_from_radius(target_r=r0, target_dir=center_dir)
             w0, base_points = self._reduced_state_from_boundary_points(
                 points=x0_points,
                 weights=weights,
                 d=d,
                 fallback_dir=center_dir,
+                target_w=target_w,
             )
 
         zeta0 = torch.eye(d, dtype=torch.float64)
@@ -6701,7 +6751,7 @@ class _LMSEntropyShellMixin:
         constraint_mode = str(target_info.get("constraint_mode", "constant_entropy"))
         axis = self._target_axis_from_params(params)
         weights = torch.ones(n, dtype=torch.float64) / float(n)
-        _, w_poisson, x_poisson = self._poisson_reference_cloud(
+        base_poisson, w_poisson, x_poisson = self._poisson_reference_cloud(
             n=n,
             axis=axis,
             r_poisson=float(target_info["r_poisson"]),
@@ -6709,12 +6759,7 @@ class _LMSEntropyShellMixin:
             refine_entropy=constraint_mode == "constant_entropy",
         )
         if mode == "poisson":
-            w0, base_points, _ = self._exact_reduced_state_from_observed_cloud(
-                points=x_poisson,
-                weights=weights,
-                fallback_dir=axis,
-            )
-            return w0, base_points
+            return w_poisson, base_poisson
 
         if constraint_mode == "constant_energy":
             init_state = "entropy_low" if mode == "min_energy" else "entropy_high"
@@ -6726,9 +6771,10 @@ class _LMSEntropyShellMixin:
                 target_r=float(target_info["r_poisson"]),
                 init_state=init_state,
             )
-            w0, base_points, _ = self._exact_reduced_state_from_observed_cloud(
+            w0, base_points = self._reduced_state_from_boundary_points(
                 points=x_final,
                 weights=weights,
+                d=3,
                 fallback_dir=axis,
             )
             return w0, base_points
@@ -6741,9 +6787,10 @@ class _LMSEntropyShellMixin:
                 minimize_energy=True,
                 cancel_check=cancel_check,
             )
-            w0, base_points, _ = self._exact_reduced_state_from_observed_cloud(
+            w0, base_points = self._reduced_state_from_boundary_points(
                 points=x_final,
                 weights=weights,
+                d=3,
                 fallback_dir=axis,
             )
             return w0, base_points
@@ -6771,9 +6818,10 @@ class _LMSEntropyShellMixin:
                 best_points = x_candidate
         if best_points is None:
             best_points = x_poisson
-        w0, base_points, _ = self._exact_reduced_state_from_observed_cloud(
+        w0, base_points = self._reduced_state_from_boundary_points(
             points=best_points,
             weights=weights,
+            d=3,
             fallback_dir=axis,
         )
         return w0, base_points

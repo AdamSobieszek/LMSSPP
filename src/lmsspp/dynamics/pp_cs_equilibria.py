@@ -376,6 +376,7 @@ class FFTPeszekPoyato2D:
         self.fft_Hxy = np.fft.rfft2(kernels[3])
         self.fft_Hyy = np.fft.rfft2(kernels[4])
         self.fft_W = np.fft.rfft2(kernels[5])
+        self._padded_work = np.zeros((self.P, self.P), dtype=np.float64)
 
     def clip_inside(self, x: Array) -> Array:
         margin = 2.1 * self.h
@@ -412,16 +413,20 @@ class FFTPeszekPoyato2D:
         return None
 
     def convolve(self, rho_grid: Array, fft_kernel: Array) -> Array:
-        padded = np.zeros((self.P, self.P), dtype=np.float64)
-        padded[: self.G, : self.G] = rho_grid
+        padded = self._zero_padded_grid(rho_grid)
         conv = np.fft.irfft2(np.fft.rfft2(padded) * fft_kernel, s=(self.P, self.P))
         return conv[: self.G, : self.G]
 
     def convolve_fields(self, rho_grid: Array, fft_kernels: Sequence[Array]) -> tuple[Array, ...]:
-        padded = np.zeros((self.P, self.P), dtype=np.float64)
-        padded[: self.G, : self.G] = rho_grid
+        padded = self._zero_padded_grid(rho_grid)
         rho_hat = np.fft.rfft2(padded)
         return tuple(np.fft.irfft2(rho_hat * fft_kernel, s=(self.P, self.P))[: self.G, : self.G] for fft_kernel in fft_kernels)
+
+    def _zero_padded_grid(self, rho_grid: Array) -> Array:
+        padded = self._padded_work
+        padded.fill(0.0)
+        padded[: self.G, : self.G] = rho_grid
+        return padded
 
     def A_grid_from_particles(self, x: Array) -> tuple[Array, Array, Array]:
         rho_grid = deposit_mass(x, self.G, self.L)
@@ -1282,9 +1287,8 @@ def finite_horizon_gauge_average_field(
     bounded-grid implementation.
     """
 
-    theta = _parse_predictive_theta(predictive_weight)
+    tau, theta = _resolve_predictive_tau_theta(tau, predictive_weight)
     A_now, rho_now = solver.A_at_particles(x)
-    tau = float(tau)
     if tau == 0.0 or theta == 0.0:
         return omega - A_now, A_now, rho_now
     x_tau = solver.clip_inside(x + tau * (omega - A_now))
@@ -1308,8 +1312,7 @@ def finite_horizon_negative_velocity_at(
     )
     xf = solver.clip_inside(np.asarray(x, dtype=np.float64))
     omega_now = np.asarray(omega, dtype=np.float64)
-    tau = float(config.prediction_horizon_tau)
-    predictive_theta = _predictive_theta_from_config(config)
+    tau, predictive_theta = _predictive_tau_theta_from_config(config)
     velocity, _, _ = finite_horizon_gauge_average_field(solver, xf, omega_now, tau, predictive_theta)
     return -np.asarray(velocity, dtype=np.float64)
 
@@ -1330,12 +1333,22 @@ def compute_finite_horizon_negative_velocities(
     if trajectory.ndim != 3 or trajectory.shape[-1] != 2:
         raise ValueError("trajectory_x must have shape (frames, particles, 2)")
     frames = np.empty_like(trajectory)
+    solver = FFTPeszekPoyato2D(
+        config.alpha,
+        config.K,
+        config.grid_size,
+        config.domain_radius,
+    )
+    omega_now = np.asarray(omega, dtype=np.float64)
+    tau, predictive_theta = _predictive_tau_theta_from_config(config)
     for f in range(trajectory.shape[0]):
-        frames[f] = finite_horizon_negative_velocity_at(config, trajectory[f], omega)
+        xf = solver.clip_inside(trajectory[f])
+        velocity, _, _ = finite_horizon_gauge_average_field(solver, xf, omega_now, tau, predictive_theta)
+        frames[f] = -np.asarray(velocity, dtype=np.float64)
     return frames
 
 
-def _parse_predictive_theta(value: PredictiveWeightChoice) -> float:
+def _parse_predictive_signed_theta(value: PredictiveWeightChoice) -> float:
     if isinstance(value, str):
         stripped = value.strip()
         if stripped == "averaged_predictive":
@@ -1353,13 +1366,37 @@ def _parse_predictive_theta(value: PredictiveWeightChoice) -> float:
         theta = float(value)
     if not np.isfinite(theta):
         raise ValueError("predictive_pp_weight must be finite")
-    if not 0.0 <= theta <= 1.0:
-        raise ValueError("predictive_pp_weight must lie in [0, 1]")
+    if not -1.0 <= theta <= 1.0:
+        raise ValueError("predictive_pp_weight must lie in [-1, 1]")
     return float(theta)
 
 
+def _parse_predictive_theta(value: PredictiveWeightChoice) -> float:
+    return abs(_parse_predictive_signed_theta(value))
+
+
+def _resolve_predictive_tau_theta(
+    tau: float,
+    predictive_weight: PredictiveWeightChoice,
+) -> tuple[float, float]:
+    tau_f = float(tau)
+    if not np.isfinite(tau_f):
+        raise ValueError("prediction_horizon_tau must be finite")
+    theta = _parse_predictive_signed_theta(predictive_weight)
+    if theta < 0.0:
+        tau_f = -tau_f
+        theta = -theta
+    return tau_f, float(theta)
+
+
 def _predictive_theta_from_config(config: SimulationConfig) -> float:
-    return _parse_predictive_theta(config.predictive_mode if config.predictive_pp_weight is None else config.predictive_pp_weight)
+    _, theta = _predictive_tau_theta_from_config(config)
+    return theta
+
+
+def _predictive_tau_theta_from_config(config: SimulationConfig) -> tuple[float, float]:
+    predictive_weight = config.predictive_mode if config.predictive_pp_weight is None else config.predictive_pp_weight
+    return _resolve_predictive_tau_theta(config.prediction_horizon_tau, predictive_weight)
 
 
 def _predictive_theta_label(theta: float) -> str:
@@ -1615,8 +1652,6 @@ def run_finite_horizon_gauge_averaged_simulation(
     """
 
     _validate_runtime_config(config)
-    if float(config.prediction_horizon_tau) < 0.0:
-        raise ValueError("prediction_horizon_tau must be non-negative")
 
     def _raise_if_cancelled() -> None:
         if cancel_check is not None and cancel_check():
@@ -1644,11 +1679,19 @@ def run_finite_horizon_gauge_averaged_simulation(
     dt_history: list[float] = []
     t = 0.0
     time_sign = -1.0 if config.time_direction == "backward" else 1.0
-    tau = float(config.prediction_horizon_tau)
-    predictive_theta = _predictive_theta_from_config(config)
+    tau, predictive_theta = _predictive_tau_theta_from_config(config)
+    field_evaluations_per_velocity = 2 if tau != 0.0 and predictive_theta != 0.0 else 1
+    last_velocity_backend: Any | None = None
+    last_A_bar_backend: Any | None = None
+    last_rho_grid_backend: Any | None = None
 
     def velocity_fn(state_x: Any) -> tuple[Any, Any, Any]:
-        return finite_horizon_gauge_average_field(solver, state_x, omega, tau, predictive_theta)
+        nonlocal last_velocity_backend, last_A_bar_backend, last_rho_grid_backend
+        velocity, A_bar, rho_grid_now = finite_horizon_gauge_average_field(solver, state_x, omega, tau, predictive_theta)
+        last_velocity_backend = velocity
+        last_A_bar_backend = A_bar
+        last_rho_grid_backend = rho_grid_now
+        return velocity, A_bar, rho_grid_now
 
     def record_trajectory(step_: int, x_: Any, time_: float, *, force: bool = False) -> None:
         if not config.make_animation:
@@ -1691,7 +1734,7 @@ def run_finite_horizon_gauge_averaged_simulation(
             _raise_if_cancelled()
             record_trajectory(accepted_steps, x, t)
             vf, _, _ = velocity_fn(x)
-            field_evaluations += 2 if tau != 0.0 else 1
+            field_evaluations += field_evaluations_per_velocity
             rms, maxv = solver.speed_stats(vf)
             if accepted_steps % config.record_every == 0:
                 append_diagnostic(accepted_steps, t, rms, maxv, dt_fixed)
@@ -1702,7 +1745,7 @@ def run_finite_horizon_gauge_averaged_simulation(
             x_pred, clipped = solver.clip_inside_with_count(x + time_sign * dt_fixed * vf)
             clip_events += clipped
             k2, _, _ = velocity_fn(x_pred)
-            field_evaluations += 2 if tau != 0.0 else 1
+            field_evaluations += field_evaluations_per_velocity
             x = x + 0.5 * time_sign * dt_fixed * (vf + k2)
             x = solver.center(x)
             x, clipped = solver.clip_inside_with_count(x)
@@ -1715,7 +1758,7 @@ def run_finite_horizon_gauge_averaged_simulation(
             _raise_if_cancelled()
             record_trajectory(accepted_steps, x, t)
             vf, _, _ = velocity_fn(x)
-            field_evaluations += 2 if tau != 0.0 else 1
+            field_evaluations += field_evaluations_per_velocity
             rms, maxv = solver.speed_stats(vf)
             if accepted_steps % config.record_every == 0:
                 append_diagnostic(accepted_steps, t, rms, maxv, dt_current)
@@ -1729,7 +1772,7 @@ def run_finite_horizon_gauge_averaged_simulation(
                 x_pred, clipped = solver.clip_inside_with_count(x + time_sign * trial_dt * vf)
                 clip_events += clipped
                 k2, _, _ = velocity_fn(x_pred)
-                field_evaluations += 2 if tau != 0.0 else 1
+                field_evaluations += field_evaluations_per_velocity
                 x_euler = x + time_sign * trial_dt * vf
                 x_heun = x + 0.5 * time_sign * trial_dt * (vf + k2)
                 local_err = solver.rms_delta(x_heun, x_euler)
@@ -1755,8 +1798,13 @@ def run_finite_horizon_gauge_averaged_simulation(
     runtime = time.time() - start
     if config.make_animation and (not trajectory_steps or trajectory_steps[-1] != accepted_steps):
         record_trajectory(accepted_steps, x, t, force=True)
-    residual_backend, A_bar_backend, rho_grid_backend = velocity_fn(x)
-    field_evaluations += 2 if tau != 0.0 else 1
+    if last_velocity_backend is None or last_A_bar_backend is None or last_rho_grid_backend is None:
+        residual_backend, A_bar_backend, rho_grid_backend = velocity_fn(x)
+        field_evaluations += field_evaluations_per_velocity
+    else:
+        residual_backend = last_velocity_backend
+        A_bar_backend = last_A_bar_backend
+        rho_grid_backend = last_rho_grid_backend
     solver.synchronize()
     x_final = solver.to_numpy(x).copy()
     A_final = solver.to_numpy(A_bar_backend)
@@ -2668,11 +2716,11 @@ def _validate_runtime_config(config: SimulationConfig) -> None:
         raise ValueError("external_field must be 'affine' or 'projective'")
     if not np.isfinite(config.projective_epsilon) or config.projective_epsilon < 0:
         raise ValueError("projective_epsilon must be a finite, non-negative number")
-    if not np.isfinite(config.prediction_horizon_tau) or config.prediction_horizon_tau < 0:
-        raise ValueError("prediction_horizon_tau must be a finite, non-negative number")
+    if not np.isfinite(config.prediction_horizon_tau):
+        raise ValueError("prediction_horizon_tau must be a finite number")
     if config.predictive_mode not in ("averaged_predictive", "pure_predictive"):
         raise ValueError("predictive_mode must be 'averaged_predictive' or 'pure_predictive'")
-    _predictive_theta_from_config(config)
+    _predictive_tau_theta_from_config(config)
     if not np.isfinite(config.hamiltonian_q) or not 0.0 <= config.hamiltonian_q <= 2.0:
         raise ValueError("hamiltonian_q must be a finite number in [0, 2]")
     if not np.isfinite(config.hamiltonian_epsH) or config.hamiltonian_epsH < 0:
@@ -4269,29 +4317,33 @@ class FiniteHorizonGaugeAveragedPeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsB
     ``tau`` is not the numerical timestep.  The precompute path calls
     :func:`run_finite_horizon_gauge_averaged_simulation`, which still defaults to
     adaptive RK2, so users can keep integration ``dt`` much smaller than the
-    prediction horizon.
+    prediction horizon.  Negative ``tau`` evaluates the predictive sample point
+    behind the current state.  A negative config ``predictive_pp_weight`` is only
+    a shorthand for flipping the sign of ``tau`` and is normalized before the
+    simulation starts.
     """
 
     def _layout_header_html(self) -> str:
-        theta = _predictive_theta_from_config(self.config)
+        tau, theta = _predictive_tau_theta_from_config(self.config)
         return (
             "<b>Finite-Horizon Predictive Peszek--Poyato dynamics</b><br>"
-            f"Config-selected law: {_predictive_theta_label(theta)}. "
+            f"Config-selected law: {_predictive_theta_label(theta)} with &tau;={tau:g}. "
             "The horizon &tau; is a model parameter, not the numerical integration step."
         )
 
     def _build_controls(self) -> None:
         super()._build_controls()
-        tau_default = max(0.0, float(self.config.prediction_horizon_tau))
+        tau_default, _ = _predictive_tau_theta_from_config(self.config)
+        tau_span = max(0.30, 4.0 * abs(tau_default))
         self.prediction_horizon_slider = widgets.FloatSlider(
             value=tau_default,
-            min=0.0,
-            max=max(0.30, 4.0 * tau_default),
+            min=-tau_span,
+            max=tau_span,
             step=0.001,
             description="tau",
             readout_format=".3f",
             continuous_update=False,
-            tooltip="Physical prediction horizon tau for the config-selected predictive PP law; keep numerical dt smaller than tau.",
+            tooltip="Signed physical prediction horizon tau for the config-selected predictive PP law; keep numerical dt smaller than |tau|.",
             layout=widgets.Layout(width="560px"),
         )
         self.prediction_status_html = widgets.HTML(value="", layout=widgets.Layout(width="620px"))
@@ -4306,9 +4358,11 @@ class FiniteHorizonGaugeAveragedPeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsB
 
     def _config_from_controls(self, *, make_animation: bool) -> SimulationConfig:
         cfg = super()._config_from_controls(make_animation=make_animation)
+        _, predictive_theta = _predictive_tau_theta_from_config(self.config)
         return replace(
             cfg,
             prediction_horizon_tau=float(self.prediction_horizon_slider.value),
+            predictive_pp_weight=predictive_theta,
             external_field="affine",
             projective_epsilon=0.0,
         )
@@ -4332,12 +4386,12 @@ class FiniteHorizonGaugeAveragedPeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsB
     def _sync_prediction_label(self) -> None:
         tau = float(self.prediction_horizon_slider.value)
         dt = float(self.config.dt)
-        ratio = dt / tau if tau > 0 else float("inf")
+        ratio = dt / abs(tau) if tau != 0.0 else float("inf")
         theta = _predictive_theta_from_config(self.config)
-        if tau > 0:
+        if tau != 0.0:
             self.prediction_status_html.value = (
                 "<b>Finite horizon:</b> "
-                f"&tau;={tau:.4g}; numerical dt/&tau;={ratio:.3g}; "
+                f"&tau;={tau:.4g}; numerical dt/|&tau;|={ratio:.3g}; "
                 f"{_predictive_theta_label(theta)}; "
                 f"V=&omega;-(1-&theta;)A<sub>&rho;</sub>(x)-&theta;A<sub>&rho;<sub>&tau;</sub></sub>(P<sub>&tau;</sub>), "
                 f"&theta;={theta:g}"

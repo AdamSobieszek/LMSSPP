@@ -5,11 +5,13 @@ import torch
 
 from lmsspp.LMS import integrate_lms_reduced_euler, mobius_sphere, normalize, random_points_on_sphere, skew_symmetric_from_axis
 from lmsspp.core.canonical_gauge import canonical_cloud, canonical_residual
+from lmsspp.core.gauge_transformations import state_from_observed_cloud
+from lmsspp.lms_ball4d_widget import LMSBall4DWidget
 from lmsspp.lms_ball3d_widget import LMSBall3DWidget
 
 
 class LMSBall3DExactGaugeTests(unittest.TestCase):
-    def test_exact_reduced_state_satisfies_gauge_equation_3d(self) -> None:
+    def test_core_exact_reduced_state_satisfies_gauge_equation_3d(self) -> None:
         n = 18
         d = 3
         weights = torch.full((n,), 1.0 / float(n), dtype=torch.float64)
@@ -17,6 +19,38 @@ class LMSBall3DExactGaugeTests(unittest.TestCase):
             mobius_sphere(
                 random_points_on_sphere(n, d=d, dtype=torch.float64),
                 torch.tensor([0.22, -0.11, 0.07], dtype=torch.float64),
+            )
+        )
+        state = state_from_observed_cloud(
+            observed,
+            weights,
+            mode="busemann_exact",
+            fallback_dir=torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64),
+        )
+        w0 = state.w
+        base_points = state.reference_points
+        x_reconstructed = state.observed_points
+
+        inverse = (weights[:, None] * mobius_sphere(observed, -w0)).sum(dim=0)
+        reconstructed = normalize(mobius_sphere(base_points, w0))
+        base_bary = (weights[:, None] * base_points).sum(dim=0)
+
+        self.assertLess(float(torch.linalg.norm(inverse)), 1e-7)
+        self.assertLess(float(torch.linalg.norm(base_bary)), 1e-7)
+        self.assertLess(
+            float(torch.amax(torch.linalg.norm(reconstructed - observed, dim=1))),
+            1e-6,
+        )
+        self.assertTrue(bool(state.diagnostics.converged))
+
+    def test_widget_exact_wrapper_records_diagnostics(self) -> None:
+        n = 12
+        d = 3
+        weights = torch.full((n,), 1.0 / float(n), dtype=torch.float64)
+        observed = normalize(
+            mobius_sphere(
+                random_points_on_sphere(n, d=d, dtype=torch.float64),
+                torch.tensor([0.15, -0.08, 0.04], dtype=torch.float64),
             )
         )
         probe = object.__new__(LMSBall3DWidget)
@@ -31,17 +65,26 @@ class LMSBall3DExactGaugeTests(unittest.TestCase):
             fallback_dir=torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64),
         )
 
-        inverse = (weights[:, None] * mobius_sphere(observed, -w0)).sum(dim=0)
-        reconstructed = normalize(mobius_sphere(base_points, w0))
-        base_bary = (weights[:, None] * base_points).sum(dim=0)
-
-        self.assertLess(float(torch.linalg.norm(inverse)), 1e-7)
-        self.assertLess(float(torch.linalg.norm(base_bary)), 1e-7)
-        self.assertLess(
-            float(torch.amax(torch.linalg.norm(reconstructed - observed, dim=1))),
-            1e-6,
-        )
+        self.assertLess(float(torch.linalg.norm((weights[:, None] * mobius_sphere(observed, -w0)).sum(dim=0))), 1e-7)
+        self.assertLess(float(torch.linalg.norm((weights[:, None] * base_points).sum(dim=0))), 1e-7)
+        self.assertLess(float(torch.amax(torch.linalg.norm(x_reconstructed - observed, dim=1))), 1e-6)
         self.assertTrue(bool(probe._last_gauge_converged))
+
+    def test_center_estimation_dropdown_mode_defaults_and_selects_poisson(self) -> None:
+        class Dropdown:
+            value = "busemann_exact"
+
+        probe = object.__new__(LMSBall3DWidget)
+        probe._job_center_estimation_mode = None
+        probe.center_estimation_mode = "busemann_exact"
+        probe.center_estimation_dropdown = Dropdown()
+
+        self.assertEqual(probe._current_center_estimation_mode(), "busemann_exact")
+        probe.center_estimation_dropdown.value = "poisson_shrink"
+        self.assertEqual(probe._current_center_estimation_mode(), "poisson_shrink")
+
+    def test_lms_ball4d_inherits_gauge_estimator(self) -> None:
+        self.assertTrue(callable(getattr(LMSBall4DWidget, "_estimate_w_from_boundary_points", None)))
 
     def test_short_trajectory_preserves_z_magnitude_invariant(self) -> None:
         n = 12
