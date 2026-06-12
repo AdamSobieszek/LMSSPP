@@ -18,3 +18,8 @@ deploy/iframe_app/static/export_meta.json
 
 # Research outputs
 /temp_research
+
+# Codex-website
+/lms-framework-site/dist/
+/lms-framework-site/node_modules/
+/lms-framework-site/.wrangler/
