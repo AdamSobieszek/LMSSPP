@@ -29,26 +29,26 @@ params:
 cases:
   - label: seed2026_alpha0p995
     seed: 2026
-    K: 5.0
+    K: None
     tau: 0.025
     alpha: 0.995
   - label: seed2026_alpha0p996
     seed: 2026
-    K: 5.0
+    K: None
     tau: 0.025
     alpha: 0.996
   - label: seed2026_alpha0p997
     seed: 2026
-    K: 5.0
+    K: None
     tau: 0.025
     alpha: 0.997
   - label: seed2026_alpha0p998
     seed: 2026
-    K: 5.0
+    K: None
     tau: 0.025
     alpha: 0.998
   - label: seed2026_alpha0p999
     seed: 2026
-    K: 5.0
+    K: None
     tau: 0.025
     alpha: 0.999

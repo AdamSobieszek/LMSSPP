@@ -27,6 +27,11 @@ params:
   right_zoom_delay_frames: 0
 
 cases:
+  - label: seed2026_theta0p0
+    seed: 2026
+    K: None
+    tau: 0.055
+    predictive_pp_weight: 0.0
   - label: seed2026_theta0p2
     seed: 2026
     K: None
@@ -52,8 +57,8 @@ cases:
     K: None
     tau: 0.055
     predictive_pp_weight: 0.8
-  - label: seed2026_theta0p1
+  - label: seed2026_theta1p0
     seed: 2026
     K: None
     tau: 0.055
-    predictive_pp_weight: 0.1
+    predictive_pp_weight: 1.0
