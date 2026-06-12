@@ -28,6 +28,7 @@ from .pp_cs_equilibria import (
     InitialCondition,
     InitializerConfig,
     IntegratorChoice,
+    PredictiveModeChoice,
     SimulationConfig,
     SimulationResult,
     TorchPeszekPoyato2D,
@@ -39,7 +40,10 @@ from .pp_cs_equilibria import (
     _dt_history_summary,
     _jsonable,
     _make_pp_backend,
+    _predictive_theta_from_config,
+    _predictive_theta_label,
     _projective_external_numpy,
+    finite_horizon_negative_velocity_at,
     _seed_from_args,
     _trajectory_frame_limit,
     _trajectory_stride,
@@ -51,6 +55,7 @@ from .pp_cs_equilibria import (
     fiber_colors,
     interp_grid_with_weights,
     make_initial_condition,
+    resolve_pp_K,
     run_finite_horizon_gauge_averaged_simulation,
     validate_initial_condition,
     write_time_diagnostics,
@@ -62,6 +67,9 @@ AnimationBatchRightModel = Literal["finite_horizon", "ordinary_pp_adaptive"]
 
 RESEARCH_DASHBOARD_FILENAME = "pp_transient_research_diagnostics.html"
 FINAL_MORPHOLOGY_FILENAME = "final_morphology.html"
+EXPERIMENT_PNG_COMPRESS_LEVEL = 9
+EXPERIMENT_MP4_CRF = 28
+EXPERIMENT_MP4_PRESET = "slow"
 
 RESEARCH_DIAGNOSTIC_FIELDS = (
     "step",
@@ -132,15 +140,24 @@ def _validate_research_config(config: TransientResearchConfig) -> None:
         raise ValueError("research_nn_chunk must be positive")
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"none", "null", "~", ""}:
+        return None
+    return float(value)
+
+
 def direct_A_at(
     points: Array,
     sources: Array,
     alpha: float,
-    K: float,
+    K: float | None,
     chunk: int = 128,
 ) -> Array:
     """Direct finite-particle PP interaction field at query points."""
 
+    K_eff = resolve_pp_K(alpha, K)
     points = np.asarray(points, dtype=np.float64)
     sources = np.asarray(sources, dtype=np.float64)
     out = np.zeros((points.shape[0], 2), dtype=np.float64)
@@ -153,7 +170,7 @@ def direct_A_at(
         r = np.linalg.norm(diff, axis=-1)
         mask = r > 1e-14
         scale = np.zeros_like(r)
-        scale[mask] = float(K) * (r[mask] ** (-float(alpha))) / (1.0 - float(alpha)) / N
+        scale[mask] = K_eff * (r[mask] ** (-float(alpha))) / (1.0 - float(alpha)) / N
         out[a : a + max(1, int(chunk))] = np.sum(diff * scale[..., None], axis=1)
     return out
 
@@ -161,7 +178,7 @@ def direct_A_at(
 class DirectPeszekPoyato2D:
     """Direct O(N^2) PP evaluator for small-N integrator/backend validation."""
 
-    def __init__(self, alpha: float, K: float, grid_size: int, domain_radius: float, *, chunk: int = 128):
+    def __init__(self, alpha: float, K: float | None, grid_size: int, domain_radius: float, *, chunk: int = 128):
         if not 0.0 <= alpha <= 2.0:
             raise ValueError("alpha must lie in [0, 2] for the PP kernel normalization")
         if abs(alpha - 1.0) < 1e-9:
@@ -174,7 +191,7 @@ class DirectPeszekPoyato2D:
             raise ValueError("chunk must be positive")
 
         self.alpha = float(alpha)
-        self.K = float(K)
+        self.K = resolve_pp_K(self.alpha, K)
         self.G = int(grid_size)
         self.L = float(domain_radius)
         self.h = 2 * self.L / self.G
@@ -677,7 +694,7 @@ def pp_particle_energy(
     x: Array,
     omega: Array,
     alpha: float,
-    K: float,
+    K: float | None,
     *,
     sample_size: int = 1200,
     seed: int = 0,
@@ -685,6 +702,7 @@ def pp_particle_energy(
 ) -> float:
     """Direct particle PP energy, sampled deterministically for large clouds."""
 
+    K_eff = resolve_pp_K(alpha, K)
     x_full = np.asarray(x, dtype=np.float64)
     omega_full = np.asarray(omega, dtype=np.float64)
     idx = _diagnostic_sample_indices(len(x_full), int(sample_size), seed)
@@ -701,7 +719,7 @@ def pp_particle_energy(
         r = np.linalg.norm(p[:, None, :] - xs[None, :, :], axis=2)
         mask = r > 1e-14
         w = np.zeros_like(r)
-        w[mask] = float(K) * (r[mask] ** (2.0 - float(alpha))) / denom
+        w[mask] = K_eff * (r[mask] ** (2.0 - float(alpha))) / denom
         pair_sum += float(np.sum(w))
     return linear + 0.5 * pair_sum / float(m * m)
 
@@ -791,8 +809,9 @@ def compute_morphology_metrics(x: Array, *, grid_dx: float | None = None) -> dic
     }
 
 
-def rk2_shell_radius(alpha: float, K: float, dt: float) -> float:
-    return float(abs(dt) * abs(K) / max(2.0 * abs(1.0 - float(alpha)), 1e-30))
+def rk2_shell_radius(alpha: float, K: float | None, dt: float) -> float:
+    K_eff = resolve_pp_K(alpha, K)
+    return float(abs(dt) * abs(K_eff) / max(2.0 * abs(1.0 - float(alpha)), 1e-30))
 
 
 def _research_diagnostic_row(
@@ -922,7 +941,7 @@ def make_final_morphology_figure(result: ResearchSimulationResult, config: Trans
             text=title
             or (
                 f"Final morphology: {config.integrator}, force={config.force_backend}, "
-                f"alpha={config.alpha:g}, K={config.K:g}, h={config.dt:g}, grid={config.grid_size}, "
+                f"alpha={config.alpha:g}, K={resolve_pp_K(config.alpha, config.K):g}, h={config.dt:g}, grid={config.grid_size}, "
                 f"steps={result.steps}, t={result.final_time:.4g}, seed={config.seed}"
             ),
             x=0.5,
@@ -1031,7 +1050,7 @@ def make_research_diagnostics_dashboard(result: ResearchSimulationResult, config
             text=(
                 "PP transient artifact diagnostics<br>"
                 f"<sup>integrator={config.integrator}, force={config.force_backend}, alpha={config.alpha:g}, "
-                f"K={config.K:g}, h={config.dt:g}, grid={config.grid_size}, seed={config.seed}, "
+                f"K={resolve_pp_K(config.alpha, config.K):g}, h={config.dt:g}, grid={config.grid_size}, seed={config.seed}, "
                 f"center={config.center_each_step}, clip={config.clip_each_step}</sup>"
             ),
             x=0.5,
@@ -1055,10 +1074,12 @@ def summarize_research_run(result: ResearchSimulationResult, config: TransientRe
     """Compact JSON-friendly summary for sweep tables."""
 
     dx = float(2.0 * config.domain_radius / config.grid_size)
+    K_eff = resolve_pp_K(config.alpha, config.K)
     summary: dict[str, object] = {
         "seed": int(config.seed),
         "alpha": float(config.alpha),
-        "K": float(config.K),
+        "K": float(K_eff),
+        "K_config": None if config.K is None else float(config.K),
         "delta": float(1.0 - config.alpha),
         "inv_delta": float(1.0 / max(abs(1.0 - config.alpha), 1e-30)),
         "dt": float(config.dt),
@@ -1416,6 +1437,42 @@ def _cloud_halfwidth(x: Array, q: float = 0.995, pad: float = 1.25, floor: float
     return max(float(floor), float(pad * np.quantile(r, q)))
 
 
+def _smooth_delayed_zoom_scales(
+    raw_scales: Sequence[float],
+    *,
+    smoothing_radius: int = 2,
+    delay_frames: int = 4,
+) -> Array:
+    """Smooth dynamic zoom half-widths and delay zoom-in to avoid visual jitter."""
+
+    raw = np.asarray(raw_scales, dtype=np.float64)
+    if raw.ndim != 1:
+        raise ValueError("raw_scales must be one-dimensional")
+    if len(raw) == 0:
+        return raw
+    if not np.all(np.isfinite(raw)):
+        raise ValueError("raw_scales must be finite")
+    raw = np.maximum(raw, 1e-12)
+
+    radius = max(0, int(smoothing_radius))
+    if radius > 0 and len(raw) > 1:
+        offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+        weights = radius + 1.0 - np.abs(offsets)
+        weights = weights / np.sum(weights)
+        padded = np.pad(raw, (radius, radius), mode="edge")
+        smoothed = np.convolve(padded, weights, mode="valid")
+    else:
+        smoothed = raw.copy()
+
+    delay = max(0, int(delay_frames))
+    delayed = np.empty_like(smoothed)
+    for i in range(len(smoothed)):
+        delayed[i] = smoothed[max(0, i - delay)]
+
+    # Never let the delayed axis clip the current frame if the cloud expands.
+    return np.maximum(delayed, raw)
+
+
 def _long_cross_prefix(max_steps: int) -> str:
     return f"fig_long_{int(max_steps)}"
 
@@ -1456,7 +1513,7 @@ def _plot_long_cross_final(
     fig.suptitle(f"Long run, max_steps={int(max_steps)}: disk scale vs cross scale")
     fig.tight_layout()
     filename = f"{_long_cross_prefix(max_steps)}_final_full_and_zoom.png"
-    fig.savefig(out_dir / filename, dpi=200)
+    _save_experiment_png(fig, out_dir / filename, dpi=200)
     plt.close(fig)
     return filename
 
@@ -1503,7 +1560,7 @@ def _plot_long_cross_montage(
     fig.suptitle(f"Long run montage: {name} ({suffix})")
     fig.tight_layout()
     filename = f"{_long_cross_prefix(max_steps)}_montage_{name}.png"
-    fig.savefig(out_dir / filename, dpi=200)
+    _save_experiment_png(fig, out_dir / filename, dpi=200)
     plt.close(fig)
     return filename
 
@@ -1550,7 +1607,7 @@ def _plot_long_cross_adaptive_details(
     fig.suptitle(f"Adaptive cross-scale diagnostics, zoom half-width={zoom:.3g}")
     fig.tight_layout()
     filename = f"{_long_cross_prefix(max_steps)}_adaptive_cross_details.png"
-    fig.savefig(out_dir / filename, dpi=200)
+    _save_experiment_png(fig, out_dir / filename, dpi=200)
     plt.close(fig)
     return filename
 
@@ -1583,7 +1640,7 @@ def _write_long_cross_report(
         "",
         (
             f"Configuration: `n_fibers={fixed_config.n_fibers}`, `n_per_fiber={fixed_config.n_per_fiber}`, "
-            f"`alpha={fixed_config.alpha:g}`, `K={fixed_config.K:g}`, `grid_size={fixed_config.grid_size}`, "
+            f"`alpha={fixed_config.alpha:g}`, `K={resolve_pp_K(fixed_config.alpha, fixed_config.K):g}`, `grid_size={fixed_config.grid_size}`, "
             f"`dt={fixed_config.dt:g}`, same seed/initial condition."
         ),
         "",
@@ -1628,7 +1685,7 @@ def run_long_cross_reference(
     n_fibers: int = 10,
     n_per_fiber: int = 100,
     alpha: float = 0.99,
-    K: float = 1.0,
+    K: float | None = 1.0,
     grid_size: int = 256,
     domain_radius: float = 4.0,
     dt: float = 0.055,
@@ -1655,6 +1712,7 @@ def run_long_cross_reference(
 ) -> dict[str, object]:
     """Run the long fixed-RK2 disk versus adaptive-RK2 cross reference experiment."""
 
+    K = _optional_float(K)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     effective_min_steps = int(max_steps) + 10 if min_steps is None else int(min_steps)
@@ -1782,8 +1840,82 @@ def finite_horizon_model_residual(
         solver.clip_inside(np.asarray(x, dtype=np.float64)),
         np.asarray(omega, dtype=np.float64),
         float(config.prediction_horizon_tau),
+        _predictive_theta_from_config(config),
     )
     return np.asarray(residual, dtype=np.float64)
+
+
+def evaluate_predictive_residuals(
+    config: SimulationConfig,
+    x: Array,
+    omega: Array,
+) -> dict[str, Array]:
+    """Evaluate present, averaged-predictive, and pure-predictive residuals."""
+
+    solver = FFTPeszekPoyato2D(config.alpha, config.K, config.grid_size, config.domain_radius)
+    x_now = solver.clip_inside(np.asarray(x, dtype=np.float64))
+    omega_now = np.asarray(omega, dtype=np.float64)
+    A_now, _ = solver.A_at_particles(x_now)
+    tau = float(config.prediction_horizon_tau)
+    if tau == 0.0:
+        x_tau = x_now
+        A_tau = A_now
+    else:
+        x_tau = solver.clip_inside(x_now + tau * (omega_now - A_now))
+        A_tau, _ = solver.A_at_particles(x_tau)
+    avg_A = 0.5 * (A_now + A_tau)
+    return {
+        "A_now": A_now,
+        "A_tau": A_tau,
+        "x_tau": np.asarray(x_tau, dtype=np.float64),
+        "present_residual": omega_now - A_now,
+        "avg_predictive_residual": omega_now - avg_A,
+        "pure_predictive_residual": omega_now - A_tau,
+    }
+
+
+def predictive_mode_diagnostics(config: SimulationConfig, result: SimulationResult) -> dict[str, object]:
+    """Final-state diagnostics for averaged/pure predictive PP comparisons."""
+
+    dx = float(2.0 * config.domain_radius / config.grid_size)
+    morph = compute_morphology_metrics(result.x_final, grid_dx=dx)
+    residuals = evaluate_predictive_residuals(config, result.x_final, result.initial.omega)
+    norms = {key: np.linalg.norm(value, axis=1) for key, value in residuals.items() if key.endswith("_residual")}
+    eval_config = _ordinary_pp_fft_eval_config(config)
+    hessian = evaluate_A_and_H_at_particles(eval_config, result.x_final)
+    center = result.x_final.mean(axis=0, keepdims=True)
+    radius = np.linalg.norm(result.x_final - center, axis=1)
+    R_peak = float(morph["disk_radius"])
+    bandwidth = max(2.0 * dx, 0.05 * max(R_peak, dx))
+    boundary = np.abs(radius - R_peak) <= bandwidth
+    if not np.any(boundary):
+        boundary = np.ones(len(radius), dtype=bool)
+    lambda_boundary = np.asarray(hessian["lambda_max"], dtype=np.float64)[boundary]
+    tau_lambda_peak = float(config.prediction_horizon_tau) * float(np.median(lambda_boundary))
+    theta = _predictive_theta_from_config(config)
+    mode = f"theta={theta:g}"
+    expected_threshold = float("inf") if theta <= 0.0 else float(1.0 / theta)
+    return {
+        "predictive_mode": mode,
+        "R_peak": R_peak,
+        "disk_radius": R_peak,
+        "boundary_bandwidth": float(bandwidth),
+        "boundary_count": int(np.count_nonzero(boundary)),
+        "lambda_max_boundary_median": float(np.median(lambda_boundary)),
+        "lambda_max_boundary_p90": float(np.quantile(lambda_boundary, 0.90)),
+        "tau_lambda_peak": tau_lambda_peak,
+        "expected_tau_lambda_threshold": expected_threshold,
+        "threshold_error": float(tau_lambda_peak - expected_threshold),
+        "present_residual_rms": float(np.sqrt(np.mean(norms["present_residual"] ** 2))),
+        "present_residual_median": float(np.median(norms["present_residual"])),
+        "avg_predictive_residual_rms": float(np.sqrt(np.mean(norms["avg_predictive_residual"] ** 2))),
+        "avg_predictive_residual_median": float(np.median(norms["avg_predictive_residual"])),
+        "pure_predictive_residual_rms": float(np.sqrt(np.mean(norms["pure_predictive_residual"] ** 2))),
+        "pure_predictive_residual_median": float(np.median(norms["pure_predictive_residual"])),
+        "boundary_mass_fraction": float(morph["boundary_mass_fraction"]),
+        "axis_mass_fraction": float(morph["axis_mass_fraction"]),
+        "fourfold_mode": float(morph["fourfold_mode"]),
+    }
 
 
 def _ordinary_pp_fft_eval_config(config: SimulationConfig) -> TransientResearchConfig:
@@ -1857,7 +1989,8 @@ def summarize_finite_horizon_comparison(
         "new_dt_initial": float(new_config.dt),
         "new_dt_max": float(new_config.dt_max),
         "alpha": float(new_config.alpha),
-        "K": float(new_config.K),
+        "K": float(resolve_pp_K(new_config.alpha, new_config.K)),
+        "K_config": None if new_config.K is None else float(new_config.K),
         "grid_size": int(new_config.grid_size),
         "n_particles": int(len(new_result.x_final)),
         "old_steps": int(old_result.steps),
@@ -1939,10 +2072,11 @@ def make_finite_horizon_comparison_figure(
         fig.update_yaxes(range=[-zoom, zoom], row=1, col=col)
         fig.update_xaxes(title_text="radius", row=2, col=col)
     if title_text is None:
+        K_eff = resolve_pp_K(new_config.alpha, new_config.K)
         title_text = (
             "Finite-horizon predictive model test<br>"
             f"<sup>tau={new_config.prediction_horizon_tau:g}, adaptive dt_max={new_config.dt_max:g}; "
-            f"old fixed h={old_config.dt:g}, alpha={new_config.alpha:g}, K={new_config.K:g}, seed={new_config.seed}</sup>"
+            f"old fixed h={old_config.dt:g}, alpha={new_config.alpha:g}, K={K_eff:g}, seed={new_config.seed}</sup>"
         )
     fig.update_layout(
         title=dict(
@@ -2139,7 +2273,7 @@ def _write_finite_horizon_comparison_png(
         y=0.98,
     )
     fig.tight_layout()
-    fig.savefig(path, dpi=180)
+    _save_experiment_png(fig, path, dpi=180)
     plt.close(fig)
 
 
@@ -2191,7 +2325,7 @@ def _write_finite_horizon_residual_png(
         fig.colorbar(sc, ax=ax, label="log10 residual")
     fig.suptitle("Finite-horizon adaptive state: original PP residual vs new model residual", y=0.98)
     fig.tight_layout()
-    fig.savefig(path, dpi=180)
+    _save_experiment_png(fig, path, dpi=180)
     plt.close(fig)
 
 
@@ -2237,8 +2371,1012 @@ def _write_pp_adaptive_residual_png(
         fig.colorbar(sc, ax=ax, label="log10 residual")
     fig.suptitle("Adaptive ordinary PP state: continuous residual vs RK2 map residual", y=0.98)
     fig.tight_layout()
-    fig.savefig(path, dpi=180)
+    _save_experiment_png(fig, path, dpi=180)
     plt.close(fig)
+
+
+def make_predictive_mode_comparison_figure(
+    avg_result: SimulationResult,
+    avg_config: SimulationConfig,
+    pure_result: SimulationResult,
+    pure_config: SimulationConfig,
+    *,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+) -> go.Figure:
+    group_names = avg_result.initial.group_names
+    colors = fiber_colors(avg_config, avg_result.initial.omega_atoms, len(group_names))
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        specs=[
+            [{"type": "scattergl"}, {"type": "scattergl"}],
+            [{"type": "histogram"}, {"type": "histogram"}],
+        ],
+        subplot_titles=[
+            "Averaged predictive PP, adaptive RK2",
+            "Pure predictive PP, adaptive RK2",
+            "Averaged radius histogram",
+            "Pure radius histogram",
+        ],
+        horizontal_spacing=0.08,
+        vertical_spacing=0.12,
+    )
+    for col, (result, cfg) in enumerate(((avg_result, avg_config), (pure_result, pure_config)), start=1):
+        rng = np.random.default_rng(int(cfg.seed) + 173 + col)
+        for k, name in enumerate(group_names):
+            idx_all = np.where(result.initial.group_id == k)[0]
+            if len(idx_all) == 0:
+                continue
+            idx = rng.choice(idx_all, size=min(cfg.max_plot_points_per_group, len(idx_all)), replace=False)
+            fig.add_trace(
+                go.Scattergl(
+                    x=result.x_final[idx, 0],
+                    y=result.x_final[idx, 1],
+                    mode="markers",
+                    marker=dict(size=4, color=colors[k], opacity=0.72),
+                    name=f"{name}",
+                    showlegend=(col == 1),
+                    legendgroup=f"fiber{k}",
+                ),
+                row=1,
+                col=col,
+            )
+        radius = np.linalg.norm(result.x_final - result.x_final.mean(axis=0, keepdims=True), axis=1)
+        fig.add_trace(go.Histogram(x=radius, nbinsx=64, showlegend=False), row=2, col=col)
+        if col == 1 and left_dynamic_zoom:
+            zoom = _cloud_halfwidth(result.x_final, q=left_zoom_quantile, pad=left_zoom_pad, floor=1e-6)
+        elif col == 2 and right_dynamic_zoom:
+            zoom = _cloud_halfwidth(result.x_final, q=right_zoom_quantile, pad=right_zoom_pad, floor=1e-6)
+        else:
+            zoom = float(cfg.domain_radius)
+        fig.update_xaxes(range=[-zoom, zoom], scaleanchor=f"y{col}", scaleratio=1, row=1, col=col)
+        fig.update_yaxes(range=[-zoom, zoom], row=1, col=col)
+        fig.update_xaxes(title_text="radius", row=2, col=col)
+    predicted_ratio = 2.0 ** (1.0 / float(avg_config.alpha))
+    fig.update_layout(
+        title=dict(
+            text=(
+                "Averaged versus pure predictive PP<br>"
+                f"<sup>alpha={avg_config.alpha:g}, tau={avg_config.prediction_horizon_tau:g}, "
+                f"predicted R_pure/R_avg~{predicted_ratio:.3g}, seed={avg_config.seed}</sup>"
+            ),
+            x=0.5,
+        ),
+        width=1350,
+        height=980,
+        template="plotly_white",
+        legend=dict(groupclick="togglegroup", itemsizing="constant"),
+    )
+    return fig
+
+
+def _write_predictive_mode_comparison_png(
+    avg_result: SimulationResult,
+    avg_config: SimulationConfig,
+    pure_result: SimulationResult,
+    pure_config: SimulationConfig,
+    path: Path,
+    *,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+) -> None:
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    group_names = avg_result.initial.group_names
+    colors = fiber_colors(avg_config, avg_result.initial.omega_atoms, len(group_names))
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.0))
+    panels = (
+        (avg_result, avg_config, "Averaged predictive PP"),
+        (pure_result, pure_config, "Pure predictive PP"),
+    )
+    for col, (result, cfg, title) in enumerate(panels):
+        ax = axes[0, col]
+        for k, color in enumerate(colors):
+            idx = np.where(result.initial.group_id == k)[0]
+            ax.scatter(result.x_final[idx, 0], result.x_final[idx, 1], s=7, c=color, alpha=0.72, linewidths=0)
+        if col == 0 and left_dynamic_zoom:
+            zoom = _cloud_halfwidth(result.x_final, q=left_zoom_quantile, pad=left_zoom_pad, floor=1e-6)
+        elif col == 1 and right_dynamic_zoom:
+            zoom = _cloud_halfwidth(result.x_final, q=right_zoom_quantile, pad=right_zoom_pad, floor=1e-6)
+        else:
+            zoom = float(cfg.domain_radius)
+        ax.set_title(title)
+        ax.set_xlim(-zoom, zoom)
+        ax.set_ylim(-zoom, zoom)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.15)
+        radius = np.linalg.norm(result.x_final - result.x_final.mean(axis=0, keepdims=True), axis=1)
+        axes[1, col].hist(radius, bins=64, color="0.25", alpha=0.85)
+        axes[1, col].set_xlabel("radius")
+        axes[1, col].set_ylabel("count")
+    predicted_ratio = 2.0 ** (1.0 / float(avg_config.alpha))
+    fig.suptitle(
+        f"Averaged vs pure predictive PP: alpha={avg_config.alpha:g}, tau={avg_config.prediction_horizon_tau:g}, "
+        f"predicted R_pure/R_avg~{predicted_ratio:.3g}",
+        y=0.98,
+    )
+    fig.tight_layout()
+    _save_experiment_png(fig, path, dpi=180)
+    plt.close(fig)
+
+
+def _write_predictive_mode_statistics_png(
+    avg_diag: dict[str, object],
+    pure_diag: dict[str, object],
+    avg_config: SimulationConfig,
+    path: Path,
+) -> None:
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    labels = ("averaged", "pure")
+    R = np.array([float(avg_diag["R_peak"]), float(pure_diag["R_peak"])])
+    ratio = float(R[1] / max(R[0], 1e-30))
+    predicted_ratio = 2.0 ** (1.0 / float(avg_config.alpha))
+    residual_keys = ("present_residual_rms", "avg_predictive_residual_rms", "pure_predictive_residual_rms")
+    avg_res = [float(avg_diag[key]) for key in residual_keys]
+    pure_res = [float(pure_diag[key]) for key in residual_keys]
+    tau_lambda = [float(avg_diag["tau_lambda_peak"]), float(pure_diag["tau_lambda_peak"])]
+    thresholds = [float(avg_diag["expected_tau_lambda_threshold"]), float(pure_diag["expected_tau_lambda_threshold"])]
+    lambda_boundary = [float(avg_diag["lambda_max_boundary_median"]), float(pure_diag["lambda_max_boundary_median"])]
+    boundary_mass = [float(avg_diag["boundary_mass_fraction"]), float(pure_diag["boundary_mass_fraction"])]
+
+    fig, axes = plt.subplots(2, 3, figsize=(14.5, 8.2))
+    x = np.arange(2)
+    axes[0, 0].bar(x, R, color=["#4C78A8", "#F58518"])
+    axes[0, 0].set_xticks(x, labels)
+    axes[0, 0].set_ylabel("R_peak")
+    axes[0, 0].set_title(f"Disk radius peak\nR_pure/R_avg={ratio:.3g}, predicted={predicted_ratio:.3g}")
+
+    axes[0, 1].bar(np.arange(3) - 0.18, avg_res, width=0.36, label="averaged", color="#4C78A8")
+    axes[0, 1].bar(np.arange(3) + 0.18, pure_res, width=0.36, label="pure", color="#F58518")
+    axes[0, 1].set_xticks(np.arange(3), ["present", "avg", "pure"])
+    axes[0, 1].set_yscale("log")
+    axes[0, 1].set_ylabel("residual RMS")
+    axes[0, 1].set_title("Residual channels at final state")
+    axes[0, 1].legend()
+
+    axes[0, 2].bar(x, tau_lambda, color=["#4C78A8", "#F58518"])
+    axes[0, 2].scatter(x, thresholds, color="black", marker="_", s=240, label="expected")
+    axes[0, 2].set_xticks(x, labels)
+    axes[0, 2].set_ylabel("tau * median(lambda_max boundary)")
+    axes[0, 2].set_title("Finite-horizon threshold")
+    axes[0, 2].legend()
+
+    axes[1, 0].bar(x, lambda_boundary, color=["#4C78A8", "#F58518"])
+    axes[1, 0].set_xticks(x, labels)
+    axes[1, 0].set_ylabel("median lambda_max")
+    axes[1, 0].set_title("Boundary precision scale")
+
+    axes[1, 1].bar(x, boundary_mass, color=["#4C78A8", "#F58518"])
+    axes[1, 1].set_xticks(x, labels)
+    axes[1, 1].set_ylim(0.0, 1.0)
+    axes[1, 1].set_ylabel("boundary mass fraction")
+    axes[1, 1].set_title("Boundary concentration")
+
+    axes[1, 2].axis("off")
+    text = "\n".join(
+        [
+            f"alpha = {avg_config.alpha:g}",
+            f"tau = {avg_config.prediction_horizon_tau:g}",
+            f"K = {resolve_pp_K(avg_config.alpha, avg_config.K):g}",
+            f"seed = {avg_config.seed}",
+            "",
+            "Expected thresholds:",
+            "averaged: tau lambda ~= 2",
+            "pure: tau lambda ~= 1",
+        ]
+    )
+    axes[1, 2].text(0.02, 0.95, text, va="top", family="monospace")
+    fig.suptitle("Predictive PP averaged-vs-pure diagnostics", y=0.99)
+    fig.tight_layout()
+    _save_experiment_png(fig, path, dpi=180)
+    plt.close(fig)
+
+
+def _velocity_panel_halfwidth(
+    velocity: Array,
+    *,
+    dynamic_zoom: bool,
+    zoom_quantile: float,
+    zoom_pad: float,
+    static_vmax: float,
+) -> float:
+    if dynamic_zoom:
+        return _cloud_halfwidth(velocity, q=zoom_quantile, pad=zoom_pad, floor=1e-6)
+    return max(float(static_vmax), 1e-6)
+
+
+def _xv_position_panel_title() -> str:
+    return "Particle positions"
+
+
+def _xv_negative_velocity_panel_title(config: SimulationConfig) -> str:
+    theta = _predictive_theta_from_config(config)
+    return f"Negative velocity scatter (-x_dot, {_predictive_theta_label(theta)})"
+
+
+def _xv_comparison_figure_title(config: SimulationConfig) -> str:
+    theta = _predictive_theta_from_config(config)
+    return (
+        "Particle positions vs negative velocity<br>"
+        f"<sup>{_predictive_theta_label(theta)}; alpha={config.alpha:g}, "
+        f"tau={config.prediction_horizon_tau:g}, seed={config.seed}</sup>"
+    )
+
+
+def _xv_comparison_suptitle(config: SimulationConfig) -> str:
+    theta = _predictive_theta_from_config(config)
+    return (
+        f"Particle positions vs negative velocity: {_predictive_theta_label(theta)}; "
+        f"alpha={config.alpha:g}, tau={config.prediction_horizon_tau:g}, seed={config.seed}"
+    )
+
+
+def make_morphology_vs_negative_velocity_figure(
+    result: SimulationResult,
+    config: SimulationConfig,
+    *,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+) -> go.Figure:
+    group_names = result.initial.group_names
+    colors = fiber_colors(config, result.initial.omega_atoms, len(group_names))
+    negative_velocity = finite_horizon_negative_velocity_at(config, result.x_final, result.initial.omega)
+    velocity_norm = np.linalg.norm(negative_velocity, axis=1)
+    static_vmax = float(np.quantile(velocity_norm, 0.995) * 1.08) if velocity_norm.size else float(config.domain_radius)
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        specs=[
+            [{"type": "scattergl"}, {"type": "scattergl"}],
+            [{"type": "histogram"}, {"type": "histogram"}],
+        ],
+        subplot_titles=[
+            _xv_position_panel_title(),
+            _xv_negative_velocity_panel_title(config),
+            "Radial distance histogram",
+            "|-x_dot| histogram",
+        ],
+        horizontal_spacing=0.08,
+        vertical_spacing=0.12,
+    )
+    rng = np.random.default_rng(int(config.seed) + 173)
+    for k, name in enumerate(group_names):
+        idx_all = np.where(result.initial.group_id == k)[0]
+        if len(idx_all) == 0:
+            continue
+        idx = rng.choice(idx_all, size=min(config.max_plot_points_per_group, len(idx_all)), replace=False)
+        fig.add_trace(
+            go.Scattergl(
+                x=result.x_final[idx, 0],
+                y=result.x_final[idx, 1],
+                mode="markers",
+                marker=dict(size=4, color=colors[k], opacity=0.72),
+                name=f"{name}",
+                showlegend=True,
+                legendgroup=f"fiber{k}",
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scattergl(
+                x=negative_velocity[idx, 0],
+                y=negative_velocity[idx, 1],
+                mode="markers",
+                marker=dict(size=4, color=colors[k], opacity=0.72),
+                name=f"{name}",
+                showlegend=False,
+                legendgroup=f"fiber{k}",
+            ),
+            row=1,
+            col=2,
+        )
+    radius = np.linalg.norm(result.x_final - result.x_final.mean(axis=0, keepdims=True), axis=1)
+    fig.add_trace(go.Histogram(x=radius, nbinsx=64, showlegend=False), row=2, col=1)
+    fig.add_trace(go.Histogram(x=velocity_norm, nbinsx=64, showlegend=False), row=2, col=2)
+    left_zoom = (
+        _cloud_halfwidth(result.x_final, q=left_zoom_quantile, pad=left_zoom_pad, floor=1e-6)
+        if left_dynamic_zoom
+        else float(config.domain_radius)
+    )
+    right_zoom = _velocity_panel_halfwidth(
+        negative_velocity,
+        dynamic_zoom=right_dynamic_zoom,
+        zoom_quantile=right_zoom_quantile,
+        zoom_pad=right_zoom_pad,
+        static_vmax=static_vmax,
+    )
+    fig.update_xaxes(title_text="x1", range=[-left_zoom, left_zoom], scaleanchor="y", scaleratio=1, row=1, col=1)
+    fig.update_yaxes(title_text="x2", range=[-left_zoom, left_zoom], row=1, col=1)
+    fig.update_xaxes(title_text="v1", range=[-right_zoom, right_zoom], scaleanchor="y2", scaleratio=1, row=1, col=2)
+    fig.update_yaxes(title_text="v2", range=[-right_zoom, right_zoom], row=1, col=2)
+    fig.update_xaxes(title_text="radius", row=2, col=1)
+    fig.update_xaxes(title_text="|-x_dot|", row=2, col=2)
+    fig.update_layout(
+        title=dict(
+            text=_xv_comparison_figure_title(config),
+            x=0.5,
+        ),
+        width=1350,
+        height=980,
+        template="plotly_white",
+        legend=dict(groupclick="togglegroup", itemsizing="constant"),
+    )
+    return fig
+
+
+def _write_morphology_vs_negative_velocity_png(
+    result: SimulationResult,
+    config: SimulationConfig,
+    path: Path,
+    *,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+) -> None:
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    colors = fiber_colors(config, result.initial.omega_atoms, len(result.initial.group_names))
+    negative_velocity = finite_horizon_negative_velocity_at(config, result.x_final, result.initial.omega)
+    velocity_norm = np.linalg.norm(negative_velocity, axis=1)
+    static_vmax = float(np.quantile(velocity_norm, 0.995) * 1.08) if velocity_norm.size else float(config.domain_radius)
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.0))
+    for k, color in enumerate(colors):
+        idx = np.where(result.initial.group_id == k)[0]
+        axes[0, 0].scatter(result.x_final[idx, 0], result.x_final[idx, 1], s=7, c=color, alpha=0.72, linewidths=0)
+        axes[0, 1].scatter(negative_velocity[idx, 0], negative_velocity[idx, 1], s=7, c=color, alpha=0.72, linewidths=0)
+    left_zoom = (
+        _cloud_halfwidth(result.x_final, q=left_zoom_quantile, pad=left_zoom_pad, floor=1e-6)
+        if left_dynamic_zoom
+        else float(config.domain_radius)
+    )
+    right_zoom = _velocity_panel_halfwidth(
+        negative_velocity,
+        dynamic_zoom=right_dynamic_zoom,
+        zoom_quantile=right_zoom_quantile,
+        zoom_pad=right_zoom_pad,
+        static_vmax=static_vmax,
+    )
+    axes[0, 0].set_title(_xv_position_panel_title())
+    axes[0, 0].set_xlim(-left_zoom, left_zoom)
+    axes[0, 0].set_ylim(-left_zoom, left_zoom)
+    axes[0, 0].set_aspect("equal", adjustable="box")
+    axes[0, 0].set_xlabel("x1")
+    axes[0, 0].set_ylabel("x2")
+    axes[0, 0].grid(True, alpha=0.15)
+    axes[0, 1].set_title(_xv_negative_velocity_panel_title(config))
+    axes[0, 1].set_xlim(-right_zoom, right_zoom)
+    axes[0, 1].set_ylim(-right_zoom, right_zoom)
+    axes[0, 1].set_aspect("equal", adjustable="box")
+    axes[0, 1].set_xlabel("v1")
+    axes[0, 1].set_ylabel("v2")
+    axes[0, 1].grid(True, alpha=0.15)
+    radius = np.linalg.norm(result.x_final - result.x_final.mean(axis=0, keepdims=True), axis=1)
+    axes[1, 0].hist(radius, bins=64, color="0.25", alpha=0.85)
+    axes[1, 0].set_title("Radial distance histogram")
+    axes[1, 0].set_xlabel("radius")
+    axes[1, 0].set_ylabel("count")
+    axes[1, 1].hist(velocity_norm, bins=64, color="0.25", alpha=0.85)
+    axes[1, 1].set_title("|-x_dot| histogram")
+    axes[1, 1].set_xlabel("|-x_dot|")
+    axes[1, 1].set_ylabel("count")
+    fig.suptitle(_xv_comparison_suptitle(config), y=0.98)
+    fig.tight_layout()
+    _save_experiment_png(fig, path, dpi=180)
+    plt.close(fig)
+
+
+def _write_predictive_single_system_statistics_png(
+    diag: dict[str, object],
+    config: SimulationConfig,
+    path: Path,
+) -> None:
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    theta = _predictive_theta_from_config(config)
+    residual_keys = ("present_residual_rms", "avg_predictive_residual_rms", "pure_predictive_residual_rms")
+    residuals = [float(diag[key]) for key in residual_keys]
+    fig, axes = plt.subplots(1, 3, figsize=(13.0, 4.2))
+    axes[0].bar(["R_peak"], [float(diag["R_peak"])], color="#4C78A8")
+    axes[0].set_ylabel("R_peak")
+    axes[0].set_title("Disk radius peak")
+    axes[1].bar(["present", "avg", "pure"], residuals, color="#4C78A8")
+    axes[1].set_yscale("log")
+    axes[1].set_ylabel("residual RMS")
+    axes[1].set_title("Residual channels at final state")
+    axes[2].bar(
+        ["tau*lambda"],
+        [float(diag["tau_lambda_peak"])],
+        color="#4C78A8",
+    )
+    axes[2].axhline(float(diag["expected_tau_lambda_threshold"]), color="black", linestyle="--", label="expected")
+    axes[2].set_ylabel("tau * median(lambda_max boundary)")
+    axes[2].set_title("Finite-horizon threshold")
+    axes[2].legend()
+    fig.suptitle(
+        f"Predictive PP diagnostics: {_predictive_theta_label(theta)}; "
+        f"alpha={config.alpha:g}, tau={config.prediction_horizon_tau:g}, seed={config.seed}",
+        y=1.02,
+    )
+    fig.tight_layout()
+    _save_experiment_png(fig, path, dpi=180)
+    plt.close(fig)
+
+
+def write_morphology_vs_negative_velocity_animation(
+    result: SimulationResult,
+    config: SimulationConfig,
+    path: Path | str,
+    *,
+    frame_count: int = 72,
+    fps: int = 12,
+    max_points_per_group: int = 700,
+    left_title: str | None = None,
+    right_title: str | None = None,
+    suptitle_prefix: str = "Particle positions vs negative velocity",
+    suptitle_params: str | None = None,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    left_zoom_smoothing_radius: int = 2,
+    left_zoom_delay_frames: int = 4,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+    right_zoom_smoothing_radius: int = 2,
+    right_zoom_delay_frames: int = 4,
+) -> None:
+    """Write a two-panel MP4 for one predictive PP run.
+
+    The left panel shows particle morphology.  The right panel shows the same
+    sampled particles colored by fiber in the negative-velocity scatter used by
+    the finite-horizon dynamics widget with ``second_panel="velocity"``.
+    """
+
+    if frame_count < 2:
+        raise ValueError("frame_count must be at least 2")
+    if fps <= 0:
+        raise ValueError("fps must be positive")
+    if result.trajectory_times is None:
+        raise ValueError("result must include trajectory_times; run with make_animation=True")
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    omega = result.initial.omega
+    group_names = result.initial.group_names
+    colors = fiber_colors(config, result.initial.omega_atoms, len(group_names))
+    rng = np.random.default_rng(int(config.seed) + 5901)
+    sample_indices: list[Array] = []
+    for k in range(len(group_names)):
+        idx_all = np.where(result.initial.group_id == k)[0]
+        if len(idx_all) == 0:
+            sample_indices.append(np.array([], dtype=np.int64))
+            continue
+        sample_indices.append(np.sort(rng.choice(idx_all, size=min(int(max_points_per_group), len(idx_all)), replace=False)))
+
+    t_end = float(result.trajectory_times[-1])
+    target_times = np.linspace(0.0, t_end, int(frame_count))
+    position_frames = [_trajectory_at_time(result, float(t)) for t in target_times]
+    velocity_frames = [finite_horizon_negative_velocity_at(config, x_state, omega) for x_state in position_frames]
+    static_vmax = 1e-6
+    for velocity in velocity_frames:
+        norms = np.linalg.norm(velocity, axis=1)
+        if norms.size:
+            static_vmax = max(static_vmax, float(np.max(norms)))
+    static_vmax *= 1.08
+
+    left_zoom_scales: Array | None = None
+    if left_dynamic_zoom:
+        raw_zoom_scales = [
+            _cloud_halfwidth(x_state, q=left_zoom_quantile, pad=left_zoom_pad, floor=1e-6)
+            for x_state in position_frames
+        ]
+        left_zoom_scales = _smooth_delayed_zoom_scales(
+            raw_zoom_scales,
+            smoothing_radius=left_zoom_smoothing_radius,
+            delay_frames=left_zoom_delay_frames,
+        )
+    right_zoom_scales: Array | None = None
+    if right_dynamic_zoom:
+        raw_zoom_scales = [
+            _velocity_panel_halfwidth(
+                velocity_frames[i],
+                dynamic_zoom=True,
+                zoom_quantile=right_zoom_quantile,
+                zoom_pad=right_zoom_pad,
+                static_vmax=static_vmax,
+            )
+            for i in range(len(velocity_frames))
+        ]
+        right_zoom_scales = _smooth_delayed_zoom_scales(
+            raw_zoom_scales,
+            smoothing_radius=right_zoom_smoothing_radius,
+            delay_frames=right_zoom_delay_frames,
+        )
+
+    resolved_left_title = _xv_position_panel_title() if left_title is None else left_title
+    resolved_right_title = _xv_negative_velocity_panel_title(config) if right_title is None else right_title
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 6.4), dpi=150)
+    panels = (
+        (axes[0], resolved_left_title, ("x1", "x2")),
+        (axes[1], resolved_right_title, ("v1", "v2")),
+    )
+    traces: list[list[Any]] = []
+    for ax, title, axis_labels in panels:
+        ax.set_title(title)
+        ax.set_xlim(-config.domain_radius, config.domain_radius)
+        ax.set_ylim(-config.domain_radius, config.domain_radius)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.15)
+        ax.set_xlabel(axis_labels[0])
+        ax.set_ylabel(axis_labels[1])
+        panel_traces: list[Any] = []
+        for k, idx in enumerate(sample_indices):
+            scatter = ax.scatter([], [], s=8, c=colors[k], alpha=0.72, linewidths=0, label=group_names[k])
+            panel_traces.append(scatter)
+        traces.append(panel_traces)
+    axes[0].legend(loc="upper right", fontsize=6, markerscale=1.2, frameon=True)
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.94])
+
+    step_scale = result.steps / max(float(result.final_time), 1e-30)
+    if suptitle_params is None:
+        suptitle_params = _xv_comparison_suptitle(config)
+    writer = _experiment_mp4_writer(output, fps=int(fps))
+    try:
+        for frame_idx, t in enumerate(target_times):
+            x_state = position_frames[frame_idx]
+            v_state = velocity_frames[frame_idx]
+            for k, idx in enumerate(sample_indices):
+                traces[0][k].set_offsets(x_state[idx])
+                traces[1][k].set_offsets(v_state[idx])
+            if left_zoom_scales is not None:
+                zoom = float(left_zoom_scales[frame_idx])
+                axes[0].set_xlim(-zoom, zoom)
+                axes[0].set_ylim(-zoom, zoom)
+            if right_zoom_scales is not None:
+                zoom = float(right_zoom_scales[frame_idx])
+                axes[1].set_xlim(-zoom, zoom)
+                axes[1].set_ylim(-zoom, zoom)
+            elif not right_dynamic_zoom:
+                axes[1].set_xlim(-static_vmax, static_vmax)
+                axes[1].set_ylim(-static_vmax, static_vmax)
+            fig.suptitle(
+                f"{suptitle_prefix} "
+                f"| t={t:.3f}/{t_end:.3f} "
+                f"| step~{step_scale * t:.1f} "
+                f"| {suptitle_params}",
+                fontsize=11,
+            )
+            fig.canvas.draw()
+            rgba = np.asarray(fig.canvas.buffer_rgba())
+            writer.append_data(rgba[:, :, :3])
+    finally:
+        writer.close()
+        plt.close(fig)
+
+
+def run_predictive_velocity_animation_batch(
+    out_dir: Path | str,
+    *,
+    cases: Sequence[dict[str, object]] | None = None,
+    alpha: float = 0.99,
+    n_fibers: int = 20,
+    n_per_fiber: int = 200,
+    grid_size: int = 128,
+    domain_radius: float = 4.0,
+    adaptive_steps: int = 800,
+    adaptive_steps_per_horizon: int = 4,
+    adaptive_dt_min: float | None = None,
+    adaptive_dt_max: float | None = None,
+    record_every: int | None = None,
+    animation_frames: int = 200,
+    fps: int = 15,
+    left_dynamic_zoom: bool = True,
+    right_dynamic_zoom: bool = True,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    left_zoom_smoothing_radius: int = 3,
+    left_zoom_delay_frames: int = 0,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+    right_zoom_smoothing_radius: int = 3,
+    right_zoom_delay_frames: int = 0,
+) -> list[dict[str, object]]:
+    """Run one predictive PP case per weight and render morphology vs negative velocity."""
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    selected_cases = tuple(default_finite_horizon_animation_cases() if cases is None else cases)
+    summaries: list[dict[str, object]] = []
+    for case_idx, case in enumerate(selected_cases):
+        label = str(case.get("label", f"case_{case_idx:02d}"))
+        seed = int(case.get("seed", 2026 + case_idx))
+        case_alpha = float(case.get("alpha", alpha))
+        K = _optional_float(case.get("K", 1.0))
+        tau = float(case.get("tau", 0.055))
+        steps = int(case.get("adaptive_steps", adaptive_steps))
+        dt_adaptive = tau / max(1, int(adaptive_steps_per_horizon))
+        dt_min = float(adaptive_dt_min if adaptive_dt_min is not None else min(dt_adaptive / 10.0, 1.0e-4))
+        dt_max = float(adaptive_dt_max if adaptive_dt_max is not None else dt_adaptive)
+        case_record_every = int(case.get("record_every", record_every if record_every is not None else max(1, steps // 40)))
+        case_dir = out / label
+        case_dir.mkdir(parents=True, exist_ok=True)
+        predictive_pp_weight = case.get("predictive_pp_weight")
+        run_kwargs: dict[str, object] = {
+            "predictive_mode": "averaged_predictive",
+            "out_dir": case_dir / "predictive_adaptive",
+        }
+        if predictive_pp_weight is not None:
+            run_kwargs["predictive_pp_weight"] = predictive_pp_weight
+        run_config = SimulationConfig(
+            n_fibers=n_fibers,
+            n_per_fiber=n_per_fiber,
+            alpha=case_alpha,
+            K=K,
+            grid_size=grid_size,
+            domain_radius=domain_radius,
+            dt=dt_adaptive,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            max_steps=steps,
+            min_steps=steps + 10,
+            tol_rms=0.0,
+            max_displacement_per_step=0.75,
+            backend="numpy",
+            integrator="adaptive_rk2",
+            color_scheme="phase_color",
+            prediction_horizon_tau=tau,
+            seed=seed,
+            make_dashboard=False,
+            make_animation=True,
+            trajectory_frame_count=max(animation_frames, 2),
+            max_plot_points_per_group=1200,
+            record_every=case_record_every,
+            **run_kwargs,
+        )
+        initial = make_initial_condition(run_config)
+        run_result = run_finite_horizon_gauge_averaged_simulation(run_config, initial)
+        _save_finite_horizon_run_outputs(run_result, run_config, Path(run_config.out_dir))
+        diag = predictive_mode_diagnostics(run_config, run_result)
+        theta = float(_predictive_theta_from_config(run_config))
+        summary = {
+            "label": label,
+            "case_index": int(case_idx),
+            "alpha": case_alpha,
+            "predictive_pp_weight": None if predictive_pp_weight is None else theta,
+            "K": K,
+            "tau": tau,
+            "seed": seed,
+            "n_particles": int(len(run_result.x_final)),
+            "steps": int(run_result.steps),
+            "final_time": float(run_result.final_time),
+            "diagnostics": diag,
+            "time_aligned_mp4": "time_aligned_morphology_vs_negative_velocity.mp4",
+            "morphology_png": "morphology_vs_negative_velocity.png",
+            "statistics_png": "predictive_system_statistics.png",
+        }
+        (case_dir / "case_metrics.json").write_text(json.dumps(_jsonable(summary), indent=2))
+        make_morphology_vs_negative_velocity_figure(
+            run_result,
+            run_config,
+            left_dynamic_zoom=left_dynamic_zoom,
+            left_zoom_quantile=left_zoom_quantile,
+            left_zoom_pad=left_zoom_pad,
+            right_dynamic_zoom=right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+        ).write_html(str(case_dir / "morphology_vs_negative_velocity.html"), include_plotlyjs="cdn")
+        _write_morphology_vs_negative_velocity_png(
+            run_result,
+            run_config,
+            case_dir / "morphology_vs_negative_velocity.png",
+            left_dynamic_zoom=left_dynamic_zoom,
+            left_zoom_quantile=left_zoom_quantile,
+            left_zoom_pad=left_zoom_pad,
+            right_dynamic_zoom=right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+        )
+        _write_predictive_single_system_statistics_png(
+            diag,
+            run_config,
+            case_dir / "predictive_system_statistics.png",
+        )
+        write_morphology_vs_negative_velocity_animation(
+            run_result,
+            run_config,
+            case_dir / "time_aligned_morphology_vs_negative_velocity.mp4",
+            frame_count=int(animation_frames),
+            fps=int(fps),
+            suptitle_params=_xv_comparison_suptitle(run_config),
+            left_dynamic_zoom=left_dynamic_zoom,
+            left_zoom_quantile=left_zoom_quantile,
+            left_zoom_pad=left_zoom_pad,
+            left_zoom_smoothing_radius=left_zoom_smoothing_radius,
+            left_zoom_delay_frames=left_zoom_delay_frames,
+            right_dynamic_zoom=right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+            right_zoom_smoothing_radius=right_zoom_smoothing_radius,
+            right_zoom_delay_frames=right_zoom_delay_frames,
+        )
+        summaries.append(summary)
+
+    (out / "batch_metrics.json").write_text(json.dumps(_jsonable(summaries), indent=2))
+    report = [
+        "# Particle Positions Versus Negative Velocity Batch",
+        "",
+        "Each case runs one adaptive-RK2 predictive PP simulation. "
+        "The left animation panel shows particle positions; the right panel shows "
+        "the widget-style negative-velocity scatter ``-x_dot`` for the same sampled particles.",
+        "",
+        "## Cases",
+        "",
+    ]
+    for summary in summaries:
+        label = str(summary["label"])
+        report.extend(
+            [
+                f"### {label}",
+                "",
+                f"- [time-aligned MP4]({label}/{summary['time_aligned_mp4']})",
+                f"- [morphology PNG]({label}/{summary['morphology_png']})",
+                f"- [statistics PNG]({label}/{summary['statistics_png']})",
+                f"- theta={summary['predictive_pp_weight']}",
+                f"- R_peak={float(summary['diagnostics']['R_peak']):.6g}",
+                f"- tau*lambda peak={float(summary['diagnostics']['tau_lambda_peak']):.6g}",
+                "",
+            ]
+        )
+    (out / "REPORT_PREDICTIVE_VELOCITY_BATCH.md").write_text("\n".join(report))
+    return summaries
+
+
+def run_predictive_mode_comparison_batch(
+    out_dir: Path | str,
+    *,
+    cases: Sequence[dict[str, object]] | None = None,
+    n_fibers: int = 20,
+    n_per_fiber: int = 200,
+    grid_size: int = 128,
+    domain_radius: float = 4.0,
+    adaptive_steps: int = 800,
+    adaptive_steps_per_horizon: int = 4,
+    adaptive_dt_min: float | None = None,
+    adaptive_dt_max: float | None = None,
+    record_every: int | None = None,
+    animation_frames: int = 200,
+    fps: int = 15,
+    left_dynamic_zoom: bool = True,
+    right_dynamic_zoom: bool = True,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    left_zoom_smoothing_radius: int = 3,
+    left_zoom_delay_frames: int = 0,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+    right_zoom_smoothing_radius: int = 3,
+    right_zoom_delay_frames: int = 0,
+) -> list[dict[str, object]]:
+    """Compare averaged-predictive and pure-predictive PP, both with adaptive RK2."""
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    selected_cases = tuple(default_finite_horizon_animation_cases() if cases is None else cases)
+    summaries: list[dict[str, object]] = []
+    for case_idx, case in enumerate(selected_cases):
+        label = str(case.get("label", f"case_{case_idx:02d}"))
+        seed = int(case.get("seed", 2026 + case_idx))
+        alpha = float(case.get("alpha", 0.99))
+        K = _optional_float(case.get("K", 1.0))
+        tau = float(case.get("tau", 0.055))
+        steps = int(case.get("adaptive_steps", adaptive_steps))
+        dt_adaptive = tau / max(1, int(adaptive_steps_per_horizon))
+        dt_min = float(adaptive_dt_min if adaptive_dt_min is not None else min(dt_adaptive / 10.0, 1.0e-4))
+        dt_max = float(adaptive_dt_max if adaptive_dt_max is not None else dt_adaptive)
+        case_record_every = int(case.get("record_every", record_every if record_every is not None else max(1, steps // 40)))
+        case_dir = out / label
+        case_dir.mkdir(parents=True, exist_ok=True)
+        base_kwargs = dict(
+            n_fibers=n_fibers,
+            n_per_fiber=n_per_fiber,
+            alpha=alpha,
+            K=K,
+            grid_size=grid_size,
+            domain_radius=domain_radius,
+            dt=dt_adaptive,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            max_steps=steps,
+            min_steps=steps + 10,
+            tol_rms=0.0,
+            max_displacement_per_step=0.75,
+            backend="numpy",
+            integrator="adaptive_rk2",
+            color_scheme="phase_color",
+            prediction_horizon_tau=tau,
+            seed=seed,
+            make_dashboard=False,
+            make_animation=True,
+            trajectory_frame_count=max(animation_frames, 2),
+            max_plot_points_per_group=1200,
+            record_every=case_record_every,
+        )
+        predictive_pp_weight = case.get("predictive_pp_weight")
+        avg_kwargs: dict[str, object] = {
+            "predictive_mode": "averaged_predictive",
+            "out_dir": case_dir / "averaged_predictive_adaptive",
+        }
+        if predictive_pp_weight is not None:
+            avg_kwargs["predictive_pp_weight"] = predictive_pp_weight
+        avg_config = SimulationConfig(**base_kwargs, **avg_kwargs)
+        initial = make_initial_condition(avg_config)
+        avg_result = run_finite_horizon_gauge_averaged_simulation(avg_config, initial)
+        _save_finite_horizon_run_outputs(avg_result, avg_config, Path(avg_config.out_dir))
+        pure_kwargs: dict[str, object] = {
+            "predictive_mode": "pure_predictive",
+            "out_dir": case_dir / "pure_predictive_adaptive",
+        }
+        if predictive_pp_weight is not None:
+            pure_kwargs["predictive_pp_weight"] = 1.0
+        pure_config = replace(avg_config, **pure_kwargs)
+        pure_result = run_finite_horizon_gauge_averaged_simulation(pure_config, initial)
+        _save_finite_horizon_run_outputs(pure_result, pure_config, Path(pure_config.out_dir))
+
+        avg_diag = predictive_mode_diagnostics(avg_config, avg_result)
+        pure_diag = predictive_mode_diagnostics(pure_config, pure_result)
+        predicted_ratio = 2.0 ** (1.0 / alpha)
+        observed_ratio = float(pure_diag["R_peak"]) / max(float(avg_diag["R_peak"]), 1e-30)
+        comparison = {
+            "label": label,
+            "case_index": int(case_idx),
+            "alpha": alpha,
+            "predictive_pp_weight": None if predictive_pp_weight is None else float(_predictive_theta_from_config(avg_config)),
+            "K": K,
+            "tau": tau,
+            "seed": seed,
+            "n_particles": int(len(avg_result.x_final)),
+            "avg_steps": int(avg_result.steps),
+            "pure_steps": int(pure_result.steps),
+            "avg_final_time": float(avg_result.final_time),
+            "pure_final_time": float(pure_result.final_time),
+            "R_avg": float(avg_diag["R_peak"]),
+            "R_pure": float(pure_diag["R_peak"]),
+            "R_pure_over_R_avg": observed_ratio,
+            "predicted_R_pure_over_R_avg": float(predicted_ratio),
+            "ratio_error": float(observed_ratio - predicted_ratio),
+            "avg_diagnostics": avg_diag,
+            "pure_diagnostics": pure_diag,
+            "time_aligned_mp4": "time_aligned_averaged_vs_pure_predictive.mp4",
+            "morphology_png": "averaged_vs_pure_predictive.png",
+            "statistics_png": "predictive_mode_statistics.png",
+        }
+        (case_dir / "comparison_metrics.json").write_text(json.dumps(_jsonable(comparison), indent=2))
+        make_predictive_mode_comparison_figure(
+            avg_result,
+            avg_config,
+            pure_result,
+            pure_config,
+            left_dynamic_zoom=left_dynamic_zoom,
+            left_zoom_quantile=left_zoom_quantile,
+            left_zoom_pad=left_zoom_pad,
+            right_dynamic_zoom=right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+        ).write_html(str(case_dir / "averaged_vs_pure_predictive.html"), include_plotlyjs="cdn")
+        _write_predictive_mode_comparison_png(
+            avg_result,
+            avg_config,
+            pure_result,
+            pure_config,
+            case_dir / "averaged_vs_pure_predictive.png",
+            left_dynamic_zoom=left_dynamic_zoom,
+            left_zoom_quantile=left_zoom_quantile,
+            left_zoom_pad=left_zoom_pad,
+            right_dynamic_zoom=right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+        )
+        _write_predictive_mode_statistics_png(
+            avg_diag,
+            pure_diag,
+            avg_config,
+            case_dir / "predictive_mode_statistics.png",
+        )
+        write_time_aligned_finite_horizon_animation(
+            avg_result,
+            avg_config,
+            pure_result,
+            pure_config,
+            case_dir / "time_aligned_averaged_vs_pure_predictive.mp4",
+            frame_count=int(animation_frames),
+            fps=int(fps),
+            left_title="Averaged predictive PP, adaptive RK2",
+            right_title="Pure predictive PP, adaptive RK2",
+            suptitle_prefix="Time-aligned averaged-vs-pure predictive comparison",
+            suptitle_params=f"alpha={alpha:g}, tau={tau:g}, seed={seed}, predicted ratio={predicted_ratio:.3g}",
+            left_dynamic_zoom=left_dynamic_zoom,
+            left_zoom_quantile=left_zoom_quantile,
+            left_zoom_pad=left_zoom_pad,
+            left_zoom_smoothing_radius=left_zoom_smoothing_radius,
+            left_zoom_delay_frames=left_zoom_delay_frames,
+            right_dynamic_zoom=right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+            right_zoom_smoothing_radius=right_zoom_smoothing_radius,
+            right_zoom_delay_frames=right_zoom_delay_frames,
+        )
+        summaries.append(comparison)
+
+    (out / "batch_metrics.json").write_text(json.dumps(_jsonable(summaries), indent=2))
+    report = [
+        "# Averaged Versus Pure Predictive PP Batch",
+        "",
+        "Both panels use adaptive RK2. The left panel is averaged predictive PP; the right panel is pure predictive PP.",
+        "MP4 frames are sampled on a shared objective-time grid by linearly interpolating recorded trajectory frames.",
+        "",
+        "## Cases",
+        "",
+    ]
+    for summary in summaries:
+        label = str(summary["label"])
+        report.extend(
+            [
+                f"### {label}",
+                "",
+                f"- [time-aligned MP4]({label}/{summary['time_aligned_mp4']})",
+                f"- [morphology PNG]({label}/{summary['morphology_png']})",
+                f"- [statistics PNG]({label}/{summary['statistics_png']})",
+                f"- R_avg/R_pure: {float(summary['R_avg']):.6g} / {float(summary['R_pure']):.6g}",
+                f"- R_pure/R_avg observed/predicted: {float(summary['R_pure_over_R_avg']):.6g} / {float(summary['predicted_R_pure_over_R_avg']):.6g}",
+                f"- tau*lambda peak averaged/pure: {float(summary['avg_diagnostics']['tau_lambda_peak']):.6g} / {float(summary['pure_diagnostics']['tau_lambda_peak']):.6g}",
+                f"- residual RMS present/avg/pure at pure final state: "
+                f"{float(summary['pure_diagnostics']['present_residual_rms']):.6g} / "
+                f"{float(summary['pure_diagnostics']['avg_predictive_residual_rms']):.6g} / "
+                f"{float(summary['pure_diagnostics']['pure_predictive_residual_rms']):.6g}",
+                "",
+            ]
+        )
+    (out / "REPORT_PREDICTIVE_MODE_BATCH.md").write_text("\n".join(report))
+    return summaries
 
 
 def run_finite_horizon_comparison(
@@ -2247,7 +3385,7 @@ def run_finite_horizon_comparison(
     n_fibers: int = 10,
     n_per_fiber: int = 50,
     alpha: float = 0.99,
-    K: float = 1.0,
+    K: float | None = 1.0,
     grid_size: int = 256,
     domain_radius: float = 4.0,
     tau: float = 0.055,
@@ -2257,6 +3395,7 @@ def run_finite_horizon_comparison(
 ) -> dict[str, object]:
     """Compare old fixed-RK2 PP discovery dynamics to the new finite-horizon model."""
 
+    K = _optional_float(K)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     old_config = TransientResearchConfig(
@@ -2419,6 +3558,37 @@ def _setup_matplotlib_caches() -> None:
     os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache))
 
 
+def _save_experiment_png(fig: Any, path: Path | str, *, dpi: int) -> None:
+    """Save experiment PNGs with maximum lossless PNG compression."""
+
+    fig.savefig(path, dpi=dpi, pil_kwargs={"compress_level": EXPERIMENT_PNG_COMPRESS_LEVEL})
+
+
+def _experiment_mp4_writer(path: Path | str, *, fps: int) -> Any:
+    """Create a small, broadly compatible H.264 writer for experiment MP4s."""
+
+    import imageio.v2 as imageio
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return imageio.get_writer(
+        str(output),
+        format="FFMPEG",
+        fps=int(fps),
+        codec="libx264",
+        pixelformat="yuv420p",
+        macro_block_size=16,
+        output_params=[
+            "-crf",
+            str(EXPERIMENT_MP4_CRF),
+            "-preset",
+            EXPERIMENT_MP4_PRESET,
+            "-movflags",
+            "+faststart",
+        ],
+    )
+
+
 def write_time_aligned_finite_horizon_animation(
     old_result: ResearchSimulationResult,
     old_config: TransientResearchConfig,
@@ -2429,12 +3599,20 @@ def write_time_aligned_finite_horizon_animation(
     frame_count: int = 72,
     fps: int = 12,
     max_points_per_group: int = 700,
+    left_title: str = "Original PP, fixed RK2",
     right_title: str = "Finite-horizon PP, adaptive RK2",
     suptitle_prefix: str = "Time-aligned finite-horizon comparison",
     suptitle_params: str | None = None,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    left_zoom_smoothing_radius: int = 2,
+    left_zoom_delay_frames: int = 4,
     right_dynamic_zoom: bool = False,
     right_zoom_quantile: float = 0.9975,
     right_zoom_pad: float = 1.35,
+    right_zoom_smoothing_radius: int = 2,
+    right_zoom_delay_frames: int = 4,
 ) -> None:
     """Write a two-panel MP4 comparing fixed-RK2 PP and adaptive finite-horizon PP.
 
@@ -2450,7 +3628,6 @@ def write_time_aligned_finite_horizon_animation(
     if old_result.trajectory_times is None or new_result.trajectory_times is None:
         raise ValueError("both results must include trajectory_times")
     _setup_matplotlib_caches()
-    import imageio.v2 as imageio
     import matplotlib
 
     matplotlib.use("Agg", force=True)
@@ -2471,9 +3648,33 @@ def write_time_aligned_finite_horizon_animation(
 
     t_end = min(float(old_result.trajectory_times[-1]), float(new_result.trajectory_times[-1]))
     target_times = np.linspace(0.0, t_end, int(frame_count))
+    old_frames = [_trajectory_at_time(old_result, float(t)) for t in target_times]
+    new_frames = [_trajectory_at_time(new_result, float(t)) for t in target_times]
+    left_zoom_scales: Array | None = None
+    if left_dynamic_zoom:
+        raw_zoom_scales = [
+            _cloud_halfwidth(x_state, q=left_zoom_quantile, pad=left_zoom_pad, floor=1e-6)
+            for x_state in old_frames
+        ]
+        left_zoom_scales = _smooth_delayed_zoom_scales(
+            raw_zoom_scales,
+            smoothing_radius=left_zoom_smoothing_radius,
+            delay_frames=left_zoom_delay_frames,
+        )
+    right_zoom_scales: Array | None = None
+    if right_dynamic_zoom:
+        raw_zoom_scales = [
+            _cloud_halfwidth(x_state, q=right_zoom_quantile, pad=right_zoom_pad, floor=1e-6)
+            for x_state in new_frames
+        ]
+        right_zoom_scales = _smooth_delayed_zoom_scales(
+            raw_zoom_scales,
+            smoothing_radius=right_zoom_smoothing_radius,
+            delay_frames=right_zoom_delay_frames,
+        )
     fig, axes = plt.subplots(1, 2, figsize=(12.8, 6.4), dpi=150)
     panels = (
-        (axes[0], old_config, "Original PP, fixed RK2"),
+        (axes[0], old_config, left_title),
         (axes[1], new_config, right_title),
     )
     traces: list[list[Any]] = []
@@ -2497,16 +3698,20 @@ def write_time_aligned_finite_horizon_animation(
     new_step_scale = new_result.steps / max(float(new_result.final_time), 1e-30)
     if suptitle_params is None:
         suptitle_params = f"alpha={new_config.alpha:g}, tau={new_config.prediction_horizon_tau:g}, seed={new_config.seed}"
-    writer = imageio.get_writer(output, fps=int(fps), codec="libx264", quality=8, macro_block_size=16)
+    writer = _experiment_mp4_writer(output, fps=int(fps))
     try:
         for frame_idx, t in enumerate(target_times):
-            old_x = _trajectory_at_time(old_result, float(t))
-            new_x = _trajectory_at_time(new_result, float(t))
+            old_x = old_frames[frame_idx]
+            new_x = new_frames[frame_idx]
             for panel_idx, x_state in enumerate((old_x, new_x)):
                 for k, idx in enumerate(sample_indices):
                     traces[panel_idx][k].set_offsets(x_state[idx])
-            if right_dynamic_zoom:
-                zoom = _cloud_halfwidth(new_x, q=right_zoom_quantile, pad=right_zoom_pad, floor=1e-6)
+            if left_zoom_scales is not None:
+                zoom = float(left_zoom_scales[frame_idx])
+                axes[0].set_xlim(-zoom, zoom)
+                axes[0].set_ylim(-zoom, zoom)
+            if right_zoom_scales is not None:
+                zoom = float(right_zoom_scales[frame_idx])
                 axes[1].set_xlim(-zoom, zoom)
                 axes[1].set_ylim(-zoom, zoom)
             fig.suptitle(
@@ -2595,7 +3800,8 @@ def _summarize_adaptive_pp_comparison(
         "new_dt_initial": float(new_config.dt),
         "new_dt_max": float(new_config.dt_max),
         "alpha": float(new_config.alpha),
-        "K": float(new_config.K),
+        "K": float(resolve_pp_K(new_config.alpha, new_config.K)),
+        "K_config": None if new_config.K is None else float(new_config.K),
         "grid_size": int(new_config.grid_size),
         "n_particles": int(len(new_result.x_final)),
         "right_model": "ordinary_pp_adaptive",
@@ -2638,9 +3844,16 @@ def run_finite_horizon_animation_batch(
     research_diagnostic_sample_size: int = 2500,
     research_energy_sample_size: int = 1200,
     research_nn_chunk: int = 512,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float | None = None,
+    left_zoom_pad: float | None = None,
+    left_zoom_smoothing_radius: int | None = None,
+    left_zoom_delay_frames: int | None = None,
     right_dynamic_zoom: bool = False,
     right_zoom_quantile: float = 0.9975,
     right_zoom_pad: float = 1.35,
+    right_zoom_smoothing_radius: int = 2,
+    right_zoom_delay_frames: int = 4,
     animation_frames: int = 72,
     fps: int = 12,
 ) -> list[dict[str, object]]:
@@ -2661,7 +3874,7 @@ def run_finite_horizon_animation_batch(
         label = str(case.get("label", f"case_{case_idx:02d}"))
         seed = int(case.get("seed", 2026 + case_idx))
         alpha = float(case.get("alpha", 0.99))
-        K = float(case.get("K", 1.0))
+        K = _optional_float(case.get("K", 1.0))
         tau = float(case.get("tau", 0.055))
         fixed_steps = int(case.get("old_fixed_steps", old_fixed_steps))
         case_adaptive_steps = int(case.get("adaptive_steps", adaptive_steps if adaptive_steps is not None else fixed_steps))
@@ -2673,6 +3886,23 @@ def run_finite_horizon_animation_batch(
             )
         )
         case_right_dynamic_zoom = bool(case.get("right_dynamic_zoom", right_dynamic_zoom))
+        case_right_zoom_smoothing_radius = int(case.get("right_zoom_smoothing_radius", right_zoom_smoothing_radius))
+        case_right_zoom_delay_frames = int(case.get("right_zoom_delay_frames", right_zoom_delay_frames))
+        case_left_dynamic_zoom = bool(case.get("left_dynamic_zoom", left_dynamic_zoom))
+        case_left_zoom_quantile = float(case.get("left_zoom_quantile", left_zoom_quantile if left_zoom_quantile is not None else right_zoom_quantile))
+        case_left_zoom_pad = float(case.get("left_zoom_pad", left_zoom_pad if left_zoom_pad is not None else right_zoom_pad))
+        case_left_zoom_smoothing_radius = int(
+            case.get(
+                "left_zoom_smoothing_radius",
+                left_zoom_smoothing_radius if left_zoom_smoothing_radius is not None else case_right_zoom_smoothing_radius,
+            )
+        )
+        case_left_zoom_delay_frames = int(
+            case.get(
+                "left_zoom_delay_frames",
+                left_zoom_delay_frames if left_zoom_delay_frames is not None else case_right_zoom_delay_frames,
+            )
+        )
         case_dir = out / label
         case_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2745,12 +3975,13 @@ def run_finite_horizon_animation_batch(
             new_out = Path(new_config.out_dir)
             _save_finite_horizon_run_outputs(new_result, new_config, new_out)
             comparison = summarize_finite_horizon_comparison(old_result, old_config, new_result, new_config)
+            K_eff = resolve_pp_K(new_config.alpha, new_config.K)
             right_title = "Finite-horizon PP, adaptive RK2"
             right_hist_title = "Finite-horizon radius histogram"
             title_text = (
                 "Finite-horizon predictive model test<br>"
                 f"<sup>tau={new_config.prediction_horizon_tau:g}, adaptive dt_max={new_config.dt_max:g}; "
-                f"old fixed h={old_config.dt:g}, alpha={new_config.alpha:g}, K={new_config.K:g}, seed={new_config.seed}</sup>"
+                f"old fixed h={old_config.dt:g}, alpha={new_config.alpha:g}, K={K_eff:g}, seed={new_config.seed}</sup>"
             )
             suptitle = (
                 f"Finite-horizon predictive model test: tau={new_config.prediction_horizon_tau:g}, "
@@ -2799,14 +4030,15 @@ def run_finite_horizon_animation_batch(
             _write_trajectory_npz(Path(new_config.out_dir) / "trajectory.npz", new_result)
             comparison = _summarize_adaptive_pp_comparison(old_result, old_config, new_result, new_config)
             comparison["new_summary"] = new_summary
+            K_eff = resolve_pp_K(new_config.alpha, new_config.K)
             right_title = "Original PP, adaptive RK2"
             right_hist_title = "Adaptive PP radius histogram"
             title_text = (
                 "Original PP integrator comparison<br>"
                 f"<sup>adaptive right panel uses dynamic zoom={case_right_dynamic_zoom}; "
-                f"h={old_config.dt:g}, alpha={new_config.alpha:g}, K={new_config.K:g}, seed={new_config.seed}</sup>"
+                f"h={old_config.dt:g}, alpha={new_config.alpha:g}, K={K_eff:g}, seed={new_config.seed}</sup>"
             )
-            suptitle = f"Original PP fixed-vs-adaptive RK2: h={old_config.dt:g}, alpha={new_config.alpha:g}, K={new_config.K:g}"
+            suptitle = f"Original PP fixed-vs-adaptive RK2: h={old_config.dt:g}, alpha={new_config.alpha:g}, K={K_eff:g}"
             mp4_name = "time_aligned_fixed_vs_adaptive_pp.mp4"
             morphology_stem = "fixed_vs_adaptive_pp"
             residual_stem = "adaptive_pp_residual_split"
@@ -2889,9 +4121,16 @@ def run_finite_horizon_animation_batch(
             right_title=right_title,
             suptitle_prefix=suptitle_prefix,
             suptitle_params=suptitle_params,
+            left_dynamic_zoom=case_left_dynamic_zoom,
+            left_zoom_quantile=case_left_zoom_quantile,
+            left_zoom_pad=case_left_zoom_pad,
+            left_zoom_smoothing_radius=case_left_zoom_smoothing_radius,
+            left_zoom_delay_frames=case_left_zoom_delay_frames,
             right_dynamic_zoom=case_right_dynamic_zoom,
             right_zoom_quantile=right_zoom_quantile,
             right_zoom_pad=right_zoom_pad,
+            right_zoom_smoothing_radius=case_right_zoom_smoothing_radius,
+            right_zoom_delay_frames=case_right_zoom_delay_frames,
         )
         summaries.append(comparison)
 
@@ -3134,7 +4373,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--initialization-fast-min-steps", type=int, default=6)
     parser.add_argument("--initialization-fast-window", type=int, default=3)
     parser.add_argument("--initialization-fast-displacement-tol", type=float, default=1.5e-2)
-    parser.add_argument("--color-scheme", choices=("palette", "phase_color"), default="palette")
+    parser.add_argument("--color-scheme", choices=("phase_color", "palette"), default="phase_color")
     parser.add_argument("--initializer-alpha", type=float, default=0.99)
     parser.add_argument("--initializer-K", type=float, default=1.0)
     parser.add_argument("--initializer-grid-size", type=int, default=None)

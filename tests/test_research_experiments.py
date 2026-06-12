@@ -60,6 +60,81 @@ class ResearchExperimentOrchestrationTests(unittest.TestCase):
             self.assertTrue((out_dir / "orchestration_result.json").exists())
             self.assertTrue((out_dir / "finite_horizon_vs_fixed_rk2.png").exists())
 
+    def test_yaml_predictive_mode_comparison_batch_runs_and_writes_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "predictive_modes"
+            config_path = Path(tmp) / "pp_predictive_modes.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "experiment: predictive_mode_comparison_batch",
+                        f"output_dir: {out_dir}",
+                        "params:",
+                        "  n_fibers: 2",
+                        "  n_per_fiber: 3",
+                        "  grid_size: 16",
+                        "  domain_radius: 3.0",
+                        "  adaptive_steps: 1",
+                        "  adaptive_steps_per_horizon: 1",
+                        "  animation_frames: 2",
+                        "  fps: 1",
+                        "  left_dynamic_zoom: false",
+                        "  right_dynamic_zoom: false",
+                        "cases:",
+                        "  - label: tiny",
+                        "    seed: 25",
+                        "    alpha: 0.45",
+                        "    K: 0.2",
+                        "    tau: 0.01",
+                    ]
+                )
+            )
+            result = run_experiment_file(config_path)
+            self.assertEqual(len(result), 1)
+            self.assertIn("R_pure_over_R_avg", result[0])
+            case_dir = out_dir / "tiny"
+            self.assertTrue((case_dir / "time_aligned_averaged_vs_pure_predictive.mp4").exists())
+            self.assertTrue((case_dir / "predictive_mode_statistics.png").exists())
+            self.assertTrue((out_dir / "REPORT_PREDICTIVE_MODE_BATCH.md").exists())
+
+    def test_yaml_predictive_velocity_animation_batch_runs_and_writes_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "predictive_velocity"
+            config_path = Path(tmp) / "pp_predictive_velocity.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "experiment: predictive_velocity_animation_batch",
+                        f"output_dir: {out_dir}",
+                        "params:",
+                        "  n_fibers: 2",
+                        "  n_per_fiber: 3",
+                        "  grid_size: 16",
+                        "  domain_radius: 3.0",
+                        "  adaptive_steps: 1",
+                        "  adaptive_steps_per_horizon: 1",
+                        "  animation_frames: 2",
+                        "  fps: 1",
+                        "  left_dynamic_zoom: false",
+                        "  right_dynamic_zoom: false",
+                        "cases:",
+                        "  - label: tiny",
+                        "    seed: 25",
+                        "    alpha: 0.45",
+                        "    K: 0.2",
+                        "    tau: 0.01",
+                        "    predictive_pp_weight: 0.6",
+                    ]
+                )
+            )
+            result = run_experiment_file(config_path)
+            self.assertEqual(len(result), 1)
+            self.assertAlmostEqual(float(result[0]["predictive_pp_weight"]), 0.6)
+            case_dir = out_dir / "tiny"
+            self.assertTrue((case_dir / "time_aligned_morphology_vs_negative_velocity.mp4").exists())
+            self.assertTrue((case_dir / "predictive_system_statistics.png").exists())
+            self.assertTrue((out_dir / "REPORT_PREDICTIVE_VELOCITY_BATCH.md").exists())
+
     def test_yaml_long_cross_reference_runs_and_writes_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "long_cross"

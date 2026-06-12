@@ -38,6 +38,7 @@ import time
 import warnings
 import webbrowser
 from dataclasses import asdict, dataclass, replace
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
 
@@ -62,12 +63,14 @@ DTypeChoice = Literal["auto", "float32", "float64"]
 IntegratorChoice = Literal["fixed_rk2", "adaptive_rk2"]
 TimeDirectionChoice = Literal["forward", "backward"]
 ExternalFieldChoice = Literal["affine", "projective"]
+PredictiveModeChoice = Literal["averaged_predictive", "pure_predictive"]
+PredictiveWeightChoice = float | int | str
 SecondPanelChoice = Literal["heatmap", "velocity"]
 DensitySolverChoice = Literal["explicit_fv", "split_implicit_diffusion", "chang_cooper"]
 DensityBoundaryChoice = Literal["noflux", "periodic"]
 ContinuousDensityPanelChoice = Literal["rho", "r_fiber", "velocity_mag", "div_A"]
 InitializationAlgorithmChoice = Literal["raw", "alpha_ball"]
-ColorSchemeChoice = Literal["palette", "phase_color"]
+ColorSchemeChoice = Literal["phase_color","palette"]
 
 DEFAULT_SHAPES = (
     "gaussian",
@@ -78,7 +81,7 @@ DEFAULT_SHAPES = (
     "square",
     "crescent",
     "ellipse",
-    "two_mini_blobs",
+    "two_blobs",
     "triangle",
 )
 
@@ -111,10 +114,34 @@ PP_INITIALIZER_OPTIONS: tuple[tuple[str, InitializationAlgorithmChoice], ...] = 
 
 DASHBOARD_FILENAME = "largeN_fft_hessian_dashboard.html"
 ANIMATION_FILENAME = "largeN_fft_dynamics_animation.html"
+AUTO_K_REFERENCE_ALPHA = 0.99
+AUTO_K_REFERENCE_DELTA = 1.0 - AUTO_K_REFERENCE_ALPHA
+
+
+def resolve_pp_K(alpha: float, K: float | None) -> float:
+    """Resolve the PP coupling strength.
+
+    Passing ``K=None`` uses the alpha-scaled convention normalized so that
+    ``alpha=0.99`` gives ``K=1``:
+
+        K_auto = (1 - 0.99) / (1 - alpha + epsilon), epsilon = 1e-9.
+    """
+
+    alpha_f = float(alpha)
+    if K is None:
+        denom = 1.0 - alpha_f + 1e-9
+        if abs(denom) < 1e-15:
+            raise ValueError("K=None is undefined at alpha=1 because 1-alpha=0")
+        K_f = AUTO_K_REFERENCE_DELTA / denom
+    else:
+        K_f = float(K)
+    if not np.isfinite(K_f):
+        raise ValueError("K must be finite or None")
+    return float(K_f)
 
 
 @dataclass(frozen=True)
-class FiberSpec:
+class FiberSpec: 
     """One conserved-omega fiber in the initial condition."""
 
     shape: str | ShapeSampler = "gaussian"
@@ -129,7 +156,7 @@ class InitializerConfig:
     """Parameters for discarded-history PP warmup initializers."""
 
     alpha: float = 0.99
-    K: float = 1.0
+    K: float | None = 1.0
     grid_size: int | None = None
     domain_radius: float | None = None
     dt: float = 0.055
@@ -144,7 +171,7 @@ class SimulationConfig:
     """Parameters for a 2D Peszek--Poyato FFT particle simulation."""
 
     alpha: float = 0.50
-    K: float = 1.0
+    K: float | None = 1.0
     n_fibers: int = 10
     n_per_fiber: int | Sequence[int] = 200
     fibers: Sequence[FiberSpec] | None = None
@@ -174,6 +201,8 @@ class SimulationConfig:
     external_field: ExternalFieldChoice = "affine"
     projective_epsilon: float = 0.0
     prediction_horizon_tau: float = 0.055
+    predictive_mode: PredictiveModeChoice = "averaged_predictive"
+    predictive_pp_weight: PredictiveWeightChoice | None = None
     hamiltonian_q: float = 2.0
     hamiltonian_epsH: float = 0.0
     adaptive_tol: float = 5.0e-3
@@ -320,7 +349,7 @@ class GeometryAnalysis:
 class FFTPeszekPoyato2D:
     """Grid/FFT evaluator for the PP interaction field and Hessian metric."""
 
-    def __init__(self, alpha: float, K: float, grid_size: int, domain_radius: float):
+    def __init__(self, alpha: float, K: float | None, grid_size: int, domain_radius: float):
         if not 0.0 <= alpha <= 2.0:
             raise ValueError("alpha must lie in [0, 2] for the PP kernel normalization")
         if abs(alpha - 1.0) < 1e-9:
@@ -331,7 +360,7 @@ class FFTPeszekPoyato2D:
             raise ValueError("domain_radius must be positive")
 
         self.alpha = float(alpha)
-        self.K = float(K)
+        self.K = resolve_pp_K(self.alpha, K)
         self.G = int(grid_size)
         self.L = float(domain_radius)
         self.h = 2 * self.L / self.G
@@ -466,7 +495,7 @@ class FFTPeszekPoyatoDensity2D:
 
     _BOUNDED_PAD_FACTOR = 4
 
-    def __init__(self, alpha: float, K: float, grid_size: int, domain_radius: float):
+    def __init__(self, alpha: float, K: float | None, grid_size: int, domain_radius: float):
         if not 0.0 <= alpha < 1.0:
             raise ValueError("continuous density requires 0 <= alpha < 1")
         if grid_size < 4:
@@ -475,7 +504,7 @@ class FFTPeszekPoyatoDensity2D:
             raise ValueError("domain_radius must be positive")
 
         self.alpha = float(alpha)
-        self.K = float(K)
+        self.K = resolve_pp_K(self.alpha, K)
         self.G = int(grid_size)
         self.L = float(domain_radius)
         self.h = 2 * self.L / self.G
@@ -540,7 +569,7 @@ class TorchPeszekPoyato2D:
     def __init__(
         self,
         alpha: float,
-        K: float,
+        K: float | None,
         grid_size: int,
         domain_radius: float,
         *,
@@ -559,7 +588,7 @@ class TorchPeszekPoyato2D:
             raise ValueError("domain_radius must be positive")
 
         self.alpha = float(alpha)
-        self.K = float(K)
+        self.K = resolve_pp_K(self.alpha, K)
         self.G = int(grid_size)
         self.L = float(domain_radius)
         self.h = 2 * self.L / self.G
@@ -771,7 +800,7 @@ def sample_shape(kind: str, n: int, rng: np.random.Generator) -> Array:
         pts[:, 0] += 0.22 * np.sin(th)
     elif kind == "ellipse":
         pts = rng.normal(size=(n, 2)) * np.array([0.72, 0.12])
-    elif kind == "two_mini_blobs":
+    elif kind == "two_blobs":
         n1 = n // 2
         pts = np.vstack(
             [
@@ -956,11 +985,12 @@ def direct_hessian_at(
     points: Array,
     sources: Array,
     alpha: float,
-    K: float,
+    K: float | None,
     chunk: int = 128,
 ) -> Array:
     """Direct finite-particle Hessian metric at query points."""
 
+    K_eff = resolve_pp_K(alpha, K)
     out = np.zeros((points.shape[0], 2, 2), dtype=np.float64)
     N = sources.shape[0]
     for a in range(0, points.shape[0], chunk):
@@ -975,7 +1005,7 @@ def direct_hessian_at(
         ey[mask] = diff[..., 1][mask] / r[mask]
 
         scale = np.zeros_like(r)
-        scale[mask] = K * (r[mask] ** (-alpha)) / (1 - alpha) / N
+        scale[mask] = K_eff * (r[mask] ** (-alpha)) / (1 - alpha) / N
 
         Hxx = scale * (1 - alpha * ex * ex)
         Hxy = scale * (-alpha * ex * ey)
@@ -1237,27 +1267,109 @@ def finite_horizon_gauge_average_field(
     x: Any,
     omega: Any,
     tau: float,
+    predictive_weight: PredictiveWeightChoice = 0.5,
 ) -> tuple[Any, Any, Any]:
-    """Finite-horizon gauge-averaged PP field.
+    """Finite-horizon predictive PP field.
 
     Computes
 
-        V_tau = omega - 1/2 A_rho(x)
-                      - 1/2 A_{rho_tau}(x + tau (omega - A_rho(x))),
+        V_tau = omega
+                - (1-theta) A_rho(x)
+                - theta A_{rho_tau}(x + tau (omega - A_rho(x))),
 
     where ``rho_tau`` is represented by depositing the predicted particle
     positions.  The predicted sample points are clipped to the FFT box for the
     bounded-grid implementation.
     """
 
+    theta = _parse_predictive_theta(predictive_weight)
     A_now, rho_now = solver.A_at_particles(x)
     tau = float(tau)
-    if tau == 0.0:
+    if tau == 0.0 or theta == 0.0:
         return omega - A_now, A_now, rho_now
     x_tau = solver.clip_inside(x + tau * (omega - A_now))
     A_tau, _ = solver.A_at_particles(x_tau)
-    A_bar = 0.5 * (A_now + A_tau)
-    return omega - A_bar, A_bar, rho_now
+    A_model = (1.0 - theta) * A_now + theta * A_tau
+    return omega - A_model, A_model, rho_now
+
+
+def finite_horizon_negative_velocity_at(
+    config: SimulationConfig,
+    x: Array,
+    omega: Array,
+) -> Array:
+    """Negative finite-horizon predictive velocity ``-x_dot`` at one particle state."""
+
+    solver = FFTPeszekPoyato2D(
+        config.alpha,
+        config.K,
+        config.grid_size,
+        config.domain_radius,
+    )
+    xf = solver.clip_inside(np.asarray(x, dtype=np.float64))
+    omega_now = np.asarray(omega, dtype=np.float64)
+    tau = float(config.prediction_horizon_tau)
+    predictive_theta = _predictive_theta_from_config(config)
+    velocity, _, _ = finite_horizon_gauge_average_field(solver, xf, omega_now, tau, predictive_theta)
+    return -np.asarray(velocity, dtype=np.float64)
+
+
+def compute_finite_horizon_negative_velocities(
+    config: SimulationConfig,
+    trajectory_x: Array,
+    omega: Array,
+) -> Array:
+    """Per-frame negative velocity ``-x_dot`` along a recorded trajectory.
+
+    This is the same content model used by
+    :class:`FiniteHorizonGaugeAveragedPeszekPoyatoDynamicsWidget` when
+    ``second_panel="velocity"``.
+    """
+
+    trajectory = np.asarray(trajectory_x, dtype=np.float64)
+    if trajectory.ndim != 3 or trajectory.shape[-1] != 2:
+        raise ValueError("trajectory_x must have shape (frames, particles, 2)")
+    frames = np.empty_like(trajectory)
+    for f in range(trajectory.shape[0]):
+        frames[f] = finite_horizon_negative_velocity_at(config, trajectory[f], omega)
+    return frames
+
+
+def _parse_predictive_theta(value: PredictiveWeightChoice) -> float:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "averaged_predictive":
+            theta = 0.5
+        elif stripped == "pure_predictive":
+            theta = 1.0
+        else:
+            try:
+                theta = float(Fraction(stripped.replace(" ", "")))
+            except (ValueError, ZeroDivisionError) as exc:
+                raise TypeError("predictive_pp_weight must be numeric or a fraction string such as '1/2'") from exc
+    elif isinstance(value, bool):
+        raise TypeError("predictive_pp_weight must be numeric, not bool")
+    else:
+        theta = float(value)
+    if not np.isfinite(theta):
+        raise ValueError("predictive_pp_weight must be finite")
+    if not 0.0 <= theta <= 1.0:
+        raise ValueError("predictive_pp_weight must lie in [0, 1]")
+    return float(theta)
+
+
+def _predictive_theta_from_config(config: SimulationConfig) -> float:
+    return _parse_predictive_theta(config.predictive_mode if config.predictive_pp_weight is None else config.predictive_pp_weight)
+
+
+def _predictive_theta_label(theta: float) -> str:
+    if abs(theta) < 1e-14:
+        return "ordinary PP (theta=0)"
+    if abs(theta - 0.5) < 1e-14:
+        return "averaged predictive PP (theta=1/2)"
+    if abs(theta - 1.0) < 1e-14:
+        return "pure predictive PP (theta=1)"
+    return f"interpolated predictive PP (theta={theta:g})"
 
 
 def hamiltonian_exponent_pp_field(
@@ -1533,9 +1645,10 @@ def run_finite_horizon_gauge_averaged_simulation(
     t = 0.0
     time_sign = -1.0 if config.time_direction == "backward" else 1.0
     tau = float(config.prediction_horizon_tau)
+    predictive_theta = _predictive_theta_from_config(config)
 
     def velocity_fn(state_x: Any) -> tuple[Any, Any, Any]:
-        return finite_horizon_gauge_average_field(solver, state_x, omega, tau)
+        return finite_horizon_gauge_average_field(solver, state_x, omega, tau, predictive_theta)
 
     def record_trajectory(step_: int, x_: Any, time_: float, *, force: bool = False) -> None:
         if not config.make_animation:
@@ -1718,6 +1831,7 @@ def _validate_density_config(config: SimulationConfig) -> None:
         )
     if not 0.0 <= config.alpha < 1.0:
         raise ValueError("continuous density requires 0 <= alpha < 1")
+    resolve_pp_K(config.alpha, config.K)
     if config.density_boundary == "periodic":
         raise ValueError("density_boundary='periodic' is not implemented; use 'noflux'")
     if config.density_boundary != "noflux":
@@ -2523,11 +2637,13 @@ def _validate_runtime_config(config: SimulationConfig) -> None:
         raise ValueError("initialization_fast_window must be positive")
     if config.initialization_fast_displacement_tol <= 0:
         raise ValueError("initialization_fast_displacement_tol must be positive")
-    if config.color_scheme not in ("palette", "phase_color"):
-        raise ValueError("color_scheme must be 'palette' or 'phase_color'")
+    if config.color_scheme not in ("phase_color","palette"):
+        raise ValueError("color_scheme must be 'phase_color' or 'palette'")
     init_config = _resolve_initializer_config(config)
     if init_config.alpha >= 1:
         raise ValueError("initializer_config.alpha must be < 1")
+    resolve_pp_K(config.alpha, config.K)
+    resolve_pp_K(init_config.alpha, init_config.K)
     if init_config.grid_size is not None and init_config.grid_size < 4:
         raise ValueError("initializer_config.grid_size must be at least 4")
     if init_config.domain_radius is not None and init_config.domain_radius <= 0:
@@ -2554,6 +2670,9 @@ def _validate_runtime_config(config: SimulationConfig) -> None:
         raise ValueError("projective_epsilon must be a finite, non-negative number")
     if not np.isfinite(config.prediction_horizon_tau) or config.prediction_horizon_tau < 0:
         raise ValueError("prediction_horizon_tau must be a finite, non-negative number")
+    if config.predictive_mode not in ("averaged_predictive", "pure_predictive"):
+        raise ValueError("predictive_mode must be 'averaged_predictive' or 'pure_predictive'")
+    _predictive_theta_from_config(config)
     if not np.isfinite(config.hamiltonian_q) or not 0.0 <= config.hamiltonian_q <= 2.0:
         raise ValueError("hamiltonian_q must be a finite number in [0, 2]")
     if not np.isfinite(config.hamiltonian_epsH) or config.hamiltonian_epsH < 0:
@@ -2672,7 +2791,8 @@ def analyze_hessian_geometry(result: SimulationResult, config: SimulationConfig)
     if config.angles_per_shell < 3:
         raise ValueError("angles_per_shell must be at least 3")
 
-    solver = FFTPeszekPoyato2D(config.alpha, config.K, config.grid_size, config.domain_radius)
+    K_eff = resolve_pp_K(config.alpha, config.K)
+    solver = FFTPeszekPoyato2D(config.alpha, K_eff, config.grid_size, config.domain_radius)
     x_final = result.x_final
     Gxxg, Gxyg, Gyyg = solver.hessian_grid_from_rho(result.rho_grid)
     Gxxp = interp_grid(Gxxg, x_final, solver.G, solver.L)
@@ -2709,13 +2829,14 @@ def analyze_hessian_geometry(result: SimulationResult, config: SimulationConfig)
     alpha_hat_ratio = 1 - 1 / ratio_hat
     gamma_theory = (2 - config.alpha) / (2 * np.sqrt(1 - config.alpha))
     gamma_hat = (2 - alpha_hat_rad) / 2 * np.sqrt(max(ratio_hat, 0))
-    theory_lr = config.K * Rvals ** (-config.alpha)
-    theory_lt = config.K * (1 / (1 - config.alpha)) * Rvals ** (-config.alpha)
+    theory_lr = K_eff * Rvals ** (-config.alpha)
+    theory_lt = K_eff * (1 / (1 - config.alpha)) * Rvals ** (-config.alpha)
 
     metrics: dict[str, object] = {
         "seed": int(config.seed),
         "alpha": float(config.alpha),
-        "K": float(config.K),
+        "K": float(K_eff),
+        "K_config": None if config.K is None else float(config.K),
         "N": int(len(x_final)),
         "n_fibers": int(len(result.initial.group_names)),
         "particles_per_fiber": _group_counts(result.initial.group_id),
@@ -3461,10 +3582,11 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
             tooltip="PP kernel order: alpha in [0,1) is the classic regime, (1,2] the renormalized W^alpha family (alpha->2 is the -log|x| kernel); alpha=1 is singular.",
             layout=widgets.Layout(width="780px"),
         )
+        K_eff = resolve_pp_K(self.config.alpha, self.config.K)
         self.K_slider = widgets.FloatSlider(
-            value=float(self.config.K),
+            value=K_eff,
             min=0.0,
-            max=max(5.0, 4.0 * float(self.config.K)),
+            max=max(5.0, 4.0 * K_eff),
             step=0.01,
             description="K",
             readout_format=".2f",
@@ -3747,10 +3869,11 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
         if result is not None:
             residual_text = f"; residual RMS={result.rms_residual:.3g}; runtime={result.runtime_seconds:.2f}s"
         frame_text = "all steps" if int(cfg.trajectory_frame_count) <= 0 else f"cap {int(cfg.trajectory_frame_count):,}"
+        K_eff = resolve_pp_K(cfg.alpha, cfg.K)
         self.config_status_html.value = (
             "<b>PP config:</b> "
             f"alpha={float(cfg.alpha):.2f}; "
-            f"K={float(cfg.K):.2f}; "
+            f"K={K_eff:.2f}; "
             f"omega atoms={int(cfg.n_fibers)}; "
             f"N/omega={int(cfg.n_per_fiber)}; "
             f"N={total:,}; "
@@ -4134,13 +4257,14 @@ class ProjectivePeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsBaseWidget):
 
 
 class FiniteHorizonGaugeAveragedPeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsBaseWidget):
-    """Widget for finite-horizon gauge-averaged Peszek--Poyato dynamics.
+    """Widget for finite-horizon predictive Peszek--Poyato dynamics.
 
-    The physical prediction horizon ``tau`` deforms the continuum vector field:
+    The physical prediction horizon ``tau`` and interpolation weight ``theta``
+    deform the continuum vector field:
 
         x_dot_i = omega_i
-                  - 1/2 A_rho(x_i)
-                  - 1/2 A_{rho_tau}(x_i + tau (omega_i - A_rho(x_i))).
+                  - (1-theta) A_rho(x_i)
+                  - theta A_{rho_tau}(x_i + tau (omega_i - A_rho(x_i))).
 
     ``tau`` is not the numerical timestep.  The precompute path calls
     :func:`run_finite_horizon_gauge_averaged_simulation`, which still defaults to
@@ -4149,9 +4273,10 @@ class FiniteHorizonGaugeAveragedPeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsB
     """
 
     def _layout_header_html(self) -> str:
+        theta = _predictive_theta_from_config(self.config)
         return (
-            "<b>Finite-Horizon Gauge-Averaged Peszek--Poyato dynamics</b><br>"
-            "Agents align to the average of the present gauge field and the field sampled at a finite predicted point. "
+            "<b>Finite-Horizon Predictive Peszek--Poyato dynamics</b><br>"
+            f"Config-selected law: {_predictive_theta_label(theta)}. "
             "The horizon &tau; is a model parameter, not the numerical integration step."
         )
 
@@ -4166,7 +4291,7 @@ class FiniteHorizonGaugeAveragedPeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsB
             description="tau",
             readout_format=".3f",
             continuous_update=False,
-            tooltip="Physical prediction horizon tau in the two-point gauge average; keep numerical dt smaller than tau.",
+            tooltip="Physical prediction horizon tau for the config-selected predictive PP law; keep numerical dt smaller than tau.",
             layout=widgets.Layout(width="560px"),
         )
         self.prediction_status_html = widgets.HTML(value="", layout=widgets.Layout(width="620px"))
@@ -4198,30 +4323,24 @@ class FiniteHorizonGaugeAveragedPeszekPoyatoDynamicsWidget(PeszekPoyatoDynamicsB
     def _compute_trajectory_velocities(self, trajectory_x: Array) -> Array:
         result = self._result
         assert result is not None
-        solver = FFTPeszekPoyato2D(
-            self.config.alpha,
-            self.config.K,
-            self.config.grid_size,
-            self.config.domain_radius,
+        return compute_finite_horizon_negative_velocities(
+            self.config,
+            trajectory_x,
+            result.initial.omega,
         )
-        omega = np.asarray(result.initial.omega, dtype=np.float64)
-        tau = float(self.config.prediction_horizon_tau)
-        frames = np.empty_like(trajectory_x)
-        for f in range(trajectory_x.shape[0]):
-            xf = solver.clip_inside(trajectory_x[f])
-            v, _, _ = finite_horizon_gauge_average_field(solver, xf, omega, tau)
-            frames[f] = -v
-        return frames
 
     def _sync_prediction_label(self) -> None:
         tau = float(self.prediction_horizon_slider.value)
         dt = float(self.config.dt)
         ratio = dt / tau if tau > 0 else float("inf")
+        theta = _predictive_theta_from_config(self.config)
         if tau > 0:
             self.prediction_status_html.value = (
                 "<b>Finite horizon:</b> "
                 f"&tau;={tau:.4g}; numerical dt/&tau;={ratio:.3g}; "
-                "V=&omega;-&frac12;A<sub>&rho;</sub>(x)-&frac12;A<sub>&rho;<sub>&tau;</sub></sub>(P<sub>&tau;</sub>)"
+                f"{_predictive_theta_label(theta)}; "
+                f"V=&omega;-(1-&theta;)A<sub>&rho;</sub>(x)-&theta;A<sub>&rho;<sub>&tau;</sub></sub>(P<sub>&tau;</sub>), "
+                f"&theta;={theta:g}"
             )
         else:
             self.prediction_status_html.value = "<b>Finite horizon:</b> &tau;=0, recovering ordinary PP."
@@ -4767,10 +4886,11 @@ class PeszekPoyatoContinuousDensityWidget(_AsyncPrecomputeControlsMixin):
             continuous_update=False,
             layout=widgets.Layout(width="780px"),
         )
+        K_eff = resolve_pp_K(self.config.alpha, self.config.K)
         self.K_slider = widgets.FloatSlider(
-            value=float(self.config.K),
+            value=K_eff,
             min=0.0,
-            max=max(5.0, 4.0 * float(self.config.K)),
+            max=max(5.0, 4.0 * K_eff),
             step=0.01,
             description="K",
             readout_format=".2f",
@@ -4991,8 +5111,9 @@ class PeszekPoyatoContinuousDensityWidget(_AsyncPrecomputeControlsMixin):
         cfg = self._config_from_controls(make_animation=False)
         self._sync_zoom_toggle_labels()
         zoom_text = f"zoom={cfg.density_display_grid_size}px" if cfg.density_dynamic_zoom else "zoom=off"
+        K_eff = resolve_pp_K(cfg.alpha, cfg.K)
         msg = (
-            f"<b>Config:</b> alpha={cfg.alpha:.3f}, K={cfg.K:.2f}, eps={cfg.eps_entropy:.3f}, "
+            f"<b>Config:</b> alpha={cfg.alpha:.3f}, K={K_eff:.2f}, eps={cfg.eps_entropy:.3f}, "
             f"fibers={cfg.n_fibers}, grid={cfg.grid_size}^2, {zoom_text}"
         )
         if result is not None:
@@ -5525,7 +5646,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--initialization-fast-min-steps", type=int, default=6)
     parser.add_argument("--initialization-fast-window", type=int, default=3)
     parser.add_argument("--initialization-fast-displacement-tol", type=float, default=1.5e-2)
-    parser.add_argument("--color-scheme", choices=("palette", "phase_color"), default="palette")
+    parser.add_argument("--color-scheme", choices=("phase_color", "palette"), default="phase_color")
     parser.add_argument("--initializer-alpha", type=float, default=0.99)
     parser.add_argument("--initializer-K", type=float, default=1.0)
     parser.add_argument("--initializer-grid-size", type=int, default=None)

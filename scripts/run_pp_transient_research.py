@@ -33,6 +33,7 @@ from lmsspp.dynamics.pp_cs_equilibria import (
 from lmsspp.dynamics.pp_transient_research import (
     RESEARCH_DIAGNOSTIC_FIELDS,
     TransientResearchConfig,
+    _save_experiment_png,
     evaluate_A_at_particles,
     rk2_map_residual,
     run_research_simulation,
@@ -142,7 +143,7 @@ def _plot_morphology_grid(cases: list[dict[str, Any]], path: Path, *, cols: int 
     if title:
         fig.suptitle(title)
     fig.tight_layout()
-    fig.savefig(path, dpi=180)
+    _save_experiment_png(fig, path, dpi=180)
     plt.close(fig)
 
 
@@ -185,7 +186,7 @@ def _plot_scaling(
         ax.grid(True, alpha=0.25)
     fig.suptitle(title)
     fig.tight_layout()
-    fig.savefig(path, dpi=180)
+    _save_experiment_png(fig, path, dpi=180)
     plt.close(fig)
 
 
@@ -216,7 +217,7 @@ def _plot_time_series_pair(cases: list[dict[str, Any]], path: Path, *, title: st
         ax.legend(fontsize=7)
     fig.suptitle(title)
     fig.tight_layout()
-    fig.savefig(path, dpi=180)
+    _save_experiment_png(fig, path, dpi=180)
     plt.close(fig)
 
 
@@ -267,7 +268,7 @@ def _plot_verdict_conical_collapse(cases_by_group: dict[str, list[dict[str, Any]
     ax.grid(True, alpha=0.25)
     ax.legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(path, dpi=220)
+    _save_experiment_png(fig, path, dpi=220)
     plt.close(fig)
     return {
         "conical_scale_fit_C": C,
@@ -307,7 +308,7 @@ def _plot_spatial_residual_pair(case: dict[str, Any], path: Path) -> dict[str, f
         cb.set_label("log10 residual")
     fig.suptitle(f"Fixed-RK2 disk: ODE residual vs one-step map residual ({case['label']})")
     fig.tight_layout()
-    fig.savefig(path, dpi=220)
+    _save_experiment_png(fig, path, dpi=220)
     plt.close(fig)
     return {
         "spatial_R_cont_rms": float(np.sqrt(np.mean(continuous * continuous))),

@@ -59,7 +59,7 @@ DEFAULT_SHAPES = (
     "square",
     "crescent",
     "ellipse",
-    "two_mini_blobs",
+    "two_blobs",
     "triangle",
 )
 
@@ -307,7 +307,7 @@ def sample_shape(kind: str, n: int, rng: np.random.Generator) -> Array:
         pts[:, 0] += 0.22 * np.sin(th)
     elif kind == "ellipse":
         pts = rng.normal(size=(n, 2)) * np.array([0.72, 0.12])
-    elif kind == "two_mini_blobs":
+    elif kind == "two_blobs":
         n1 = n // 2
         pts = np.vstack(
             [

@@ -28,6 +28,7 @@ from lmsspp.dynamics.pp_cs_equilibria import (
     make_initial_condition,
     run_density_simulation,
     run_simulation,
+    resolve_pp_K,
     torch,
     widgets,
 )
@@ -59,6 +60,18 @@ def _hex_rgb(color: str) -> tuple[int, int, int]:
 
 
 class PPBackendTests(unittest.TestCase):
+    def test_auto_K_resolution_scales_from_alpha_099(self) -> None:
+        self.assertAlmostEqual(resolve_pp_K(0.99, None), 1.0)
+        self.assertAlmostEqual(resolve_pp_K(0.999, None), 10.0)
+        self.assertAlmostEqual(resolve_pp_K(0.95, None), 0.2)
+        self.assertAlmostEqual(resolve_pp_K(0.7, 1.3), 1.3)
+        with self.assertRaisesRegex(ValueError, "alpha=1"):
+            resolve_pp_K(1.0, None)
+
+    def test_numpy_backend_accepts_auto_K(self) -> None:
+        solver = FFTPeszekPoyato2D(alpha=0.999, K=None, grid_size=16, domain_radius=3.0)
+        self.assertAlmostEqual(solver.K, 10.0)
+
     def test_numpy_fft_convolution_matches_brute_grid_convolution(self) -> None:
         rng = np.random.default_rng(11)
         solver = FFTPeszekPoyato2D(alpha=0.5, K=1.0, grid_size=8, domain_radius=3.0)

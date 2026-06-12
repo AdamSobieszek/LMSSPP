@@ -6,8 +6,13 @@ from pathlib import Path
 import numpy as np
 
 from lmsspp.dynamics.pp_cs_equilibria import (
+    FFTPeszekPoyato2D,
     InitialCondition,
     SimulationConfig,
+    _predictive_theta_from_config,
+    compute_finite_horizon_negative_velocities,
+    finite_horizon_gauge_average_field,
+    finite_horizon_negative_velocity_at,
     make_initial_condition,
     run_finite_horizon_gauge_averaged_simulation,
     run_simulation,
@@ -23,7 +28,9 @@ from lmsspp.dynamics.pp_transient_research import (
     run_finite_horizon_comparison,
     run_long_cross_reference,
     run_pp_research_sweep,
+    run_predictive_velocity_animation_batch,
     run_research_simulation,
+    _smooth_delayed_zoom_scales,
 )
 
 
@@ -37,6 +44,70 @@ def _direct_A(query: np.ndarray, sources: np.ndarray, alpha: float, K: float) ->
 
 
 class PPTransientResearchTests(unittest.TestCase):
+    def test_dynamic_zoom_scales_are_smoothed_delayed_and_non_clipping(self) -> None:
+        raw = np.array([8.0, 8.0, 8.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float64)
+        delayed = _smooth_delayed_zoom_scales(raw, smoothing_radius=1, delay_frames=2)
+        self.assertEqual(delayed.shape, raw.shape)
+        self.assertTrue(np.all(delayed >= raw))
+        self.assertGreater(delayed[3], raw[3])
+        self.assertGreater(delayed[4], raw[4])
+        self.assertLess(delayed[-1], delayed[4])
+
+    def test_predictive_modes_use_expected_A_tau_combination(self) -> None:
+        rng = np.random.default_rng(16)
+        x = rng.normal(scale=0.35, size=(8, 2))
+        omega = rng.normal(scale=0.2, size=(8, 2))
+        solver = FFTPeszekPoyato2D(alpha=0.45, K=0.7, grid_size=24, domain_radius=3.0)
+        tau = 0.03
+        A_now, _ = solver.A_at_particles(x)
+        x_tau = solver.clip_inside(x + tau * (omega - A_now))
+        A_tau, _ = solver.A_at_particles(x_tau)
+        v_avg, A_avg, _ = finite_horizon_gauge_average_field(
+            solver,
+            x,
+            omega,
+            tau,
+            "averaged_predictive",
+        )
+        v_pure, A_pure, _ = finite_horizon_gauge_average_field(
+            solver,
+            x,
+            omega,
+            tau,
+            "pure_predictive",
+        )
+        v_quarter, A_quarter, _ = finite_horizon_gauge_average_field(
+            solver,
+            x,
+            omega,
+            tau,
+            0.25,
+        )
+        v_fraction, A_fraction, _ = finite_horizon_gauge_average_field(
+            solver,
+            x,
+            omega,
+            tau,
+            "1/2",
+        )
+        np.testing.assert_allclose(A_avg, 0.5 * (A_now + A_tau), rtol=0.0, atol=1e-13)
+        np.testing.assert_allclose(v_avg, omega - 0.5 * (A_now + A_tau), rtol=0.0, atol=1e-13)
+        np.testing.assert_allclose(A_pure, A_tau, rtol=0.0, atol=1e-13)
+        np.testing.assert_allclose(v_pure, omega - A_tau, rtol=0.0, atol=1e-13)
+        np.testing.assert_allclose(A_quarter, 0.75 * A_now + 0.25 * A_tau, rtol=0.0, atol=1e-13)
+        np.testing.assert_allclose(v_quarter, omega - (0.75 * A_now + 0.25 * A_tau), rtol=0.0, atol=1e-13)
+        np.testing.assert_allclose(A_fraction, A_avg, rtol=0.0, atol=1e-13)
+
+    def test_predictive_pp_weight_config_parses_numeric_fractions(self) -> None:
+        base = SimulationConfig()
+        self.assertAlmostEqual(_predictive_theta_from_config(replace(base, predictive_pp_weight="1/2")), 0.5)
+        self.assertAlmostEqual(_predictive_theta_from_config(replace(base, predictive_pp_weight=0.25)), 0.25)
+        self.assertAlmostEqual(_predictive_theta_from_config(replace(base, predictive_pp_weight="0.75")), 0.75)
+        with self.assertRaisesRegex(ValueError, "\\[0, 1\\]"):
+            _predictive_theta_from_config(replace(base, predictive_pp_weight=1.5))
+        with self.assertRaisesRegex(TypeError, "numeric"):
+            _predictive_theta_from_config(replace(base, predictive_pp_weight="not-a-number"))
+
     def test_finite_horizon_tau_zero_recovers_ordinary_pp(self) -> None:
         config = SimulationConfig(
             n_fibers=2,
@@ -210,7 +281,10 @@ class PPTransientResearchTests(unittest.TestCase):
             summaries = run_finite_horizon_animation_batch(
                 tmp,
                 right_model="ordinary_pp_adaptive",
+                left_dynamic_zoom=True,
                 right_dynamic_zoom=True,
+                left_zoom_smoothing_radius=3,
+                left_zoom_delay_frames=0,
                 n_fibers=2,
                 n_per_fiber=3,
                 grid_size=16,
@@ -232,6 +306,68 @@ class PPTransientResearchTests(unittest.TestCase):
             self.assertTrue((case_dir / "fixed_vs_adaptive_pp.png").exists())
             self.assertTrue((case_dir / "adaptive_pp_residual_split.html").exists())
             self.assertTrue((case_dir / "adaptive_rk2_pp" / "metrics.json").exists())
+
+    def test_finite_horizon_negative_velocity_matches_widget_field(self) -> None:
+        rng = np.random.default_rng(18)
+        x = rng.normal(scale=0.35, size=(8, 2))
+        omega = rng.normal(scale=0.2, size=(8, 2))
+        config = SimulationConfig(
+            alpha=0.45,
+            K=0.7,
+            grid_size=24,
+            domain_radius=3.0,
+            prediction_horizon_tau=0.03,
+            predictive_pp_weight=0.65,
+        )
+        solver = FFTPeszekPoyato2D(config.alpha, config.K, config.grid_size, config.domain_radius)
+        velocity, _, _ = finite_horizon_gauge_average_field(
+            solver,
+            x,
+            omega,
+            config.prediction_horizon_tau,
+            _predictive_theta_from_config(config),
+        )
+        np.testing.assert_allclose(
+            finite_horizon_negative_velocity_at(config, x, omega),
+            -velocity,
+            rtol=0.0,
+            atol=1e-13,
+        )
+        trajectory = np.stack([x, x + 0.01], axis=0)
+        batch = compute_finite_horizon_negative_velocities(config, trajectory, omega)
+        np.testing.assert_allclose(batch[0], -velocity, rtol=0.0, atol=1e-13)
+
+    def test_tiny_predictive_velocity_animation_batch_writes_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summaries = run_predictive_velocity_animation_batch(
+                tmp,
+                left_dynamic_zoom=True,
+                right_dynamic_zoom=True,
+                n_fibers=2,
+                n_per_fiber=3,
+                grid_size=16,
+                domain_radius=3.0,
+                adaptive_steps=1,
+                adaptive_steps_per_horizon=1,
+                animation_frames=2,
+                fps=1,
+                cases=[
+                    {
+                        "label": "tiny_theta",
+                        "seed": 25,
+                        "alpha": 0.45,
+                        "K": 0.2,
+                        "tau": 0.01,
+                        "predictive_pp_weight": 0.4,
+                    }
+                ],
+            )
+            case_dir = Path(tmp) / "tiny_theta"
+            self.assertAlmostEqual(float(summaries[0]["predictive_pp_weight"]), 0.4)
+            self.assertTrue((case_dir / "time_aligned_morphology_vs_negative_velocity.mp4").exists())
+            self.assertTrue((case_dir / "morphology_vs_negative_velocity.png").exists())
+            self.assertTrue((case_dir / "predictive_system_statistics.png").exists())
+            self.assertTrue((Path(tmp) / "REPORT_PREDICTIVE_VELOCITY_BATCH.md").exists())
 
     def test_tiny_long_cross_reference_writes_zoom_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

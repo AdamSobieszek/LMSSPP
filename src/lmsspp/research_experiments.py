@@ -32,6 +32,8 @@ from .dynamics.pp_transient_research import (
     run_finite_horizon_comparison,
     run_long_cross_reference,
     run_pp_research_sweep,
+    run_predictive_mode_comparison_batch,
+    run_predictive_velocity_animation_batch,
     run_research_simulation,
     run_toy_transient_suite,
     save_research_run_outputs,
@@ -48,8 +50,11 @@ else:
 
 SUPPORTED_EXPERIMENTS = (
     "finite_horizon_animation_batch",
+    "finite_horizon_animation_alpha_range",
     "finite_horizon_comparison",
     "long_cross_reference",
+    "predictive_mode_comparison_batch",
+    "predictive_velocity_animation_batch",
     "research_sweep",
     "research_run",
     "toy_suite",
@@ -120,6 +125,24 @@ def apply_overrides(config: dict[str, Any], overrides: Sequence[str] | None = No
     return resolved
 
 
+def _normalize_optional_none(value: Any) -> Any:
+    if isinstance(value, str) and value.strip().lower() in {"none", "null", "~", ""}:
+        return None
+    return value
+
+
+def _normalize_optional_K(data: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(data)
+    if "K" in out:
+        out["K"] = _normalize_optional_none(out["K"])
+    if "initializer_config" in out and isinstance(out["initializer_config"], Mapping):
+        init = dict(out["initializer_config"])
+        if "K" in init:
+            init["K"] = _normalize_optional_none(init["K"])
+        out["initializer_config"] = init
+    return out
+
+
 def _dataclass_kwargs(cls: type[Any], data: Mapping[str, Any]) -> dict[str, Any]:
     if not is_dataclass(cls):
         raise TypeError(f"{cls!r} is not a dataclass")
@@ -127,7 +150,7 @@ def _dataclass_kwargs(cls: type[Any], data: Mapping[str, Any]) -> dict[str, Any]
     unknown = sorted(set(data) - names)
     if unknown:
         raise ValueError(f"unknown {cls.__name__} fields: {', '.join(unknown)}")
-    kwargs = dict(data)
+    kwargs = _normalize_optional_K(data)
     if "out_dir" in kwargs and kwargs["out_dir"] is not None:
         kwargs["out_dir"] = Path(kwargs["out_dir"])
     if "shape_names" in kwargs and kwargs["shape_names"] is not None:
@@ -182,8 +205,9 @@ def run_experiment_config(
     out_dir = _output_dir(config, config_path=config_path)
     _write_resolved_config(out_dir, config)
     params = dict(config.get("params", {}))
+    params = _normalize_optional_K(params)
 
-    if kind == "finite_horizon_animation_batch":
+    if kind in ("finite_horizon_animation_batch", "finite_horizon_animation_alpha_range"):
         cases = config.get("cases")
         summaries = run_finite_horizon_animation_batch(
             out_dir,
@@ -195,6 +219,24 @@ def run_experiment_config(
     if kind == "finite_horizon_comparison":
         metrics = run_finite_horizon_comparison(out_dir, **params)
         return metrics
+
+    if kind == "predictive_mode_comparison_batch":
+        cases = config.get("cases")
+        summaries = run_predictive_mode_comparison_batch(
+            out_dir,
+            cases=cases if cases is not None else None,
+            **params,
+        )
+        return summaries
+
+    if kind == "predictive_velocity_animation_batch":
+        cases = config.get("cases")
+        summaries = run_predictive_velocity_animation_batch(
+            out_dir,
+            cases=cases if cases is not None else None,
+            **params,
+        )
+        return summaries
 
     if kind == "long_cross_reference":
         metrics = run_long_cross_reference(out_dir, **params)
