@@ -16,7 +16,5 @@ build/
 deploy/iframe_app/static/trajectory.json
 deploy/iframe_app/static/export_meta.json
 
-/pp_transient_research_results_verdict_quick
-/pp_transient_research_results_20260609
-/pp_transient_research_results_2000
+# Research outputs
 /temp_research
