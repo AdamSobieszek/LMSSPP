@@ -25,10 +25,12 @@ from lmsspp.dynamics.pp_cs_equilibria import (
     make_continuous_density_widget,
     make_density_initial_condition,
     make_dynamics_widget,
+    make_finite_horizon_gauge_averaged_widget,
     make_initial_condition,
     run_density_simulation,
     run_simulation,
     resolve_pp_K,
+    resolve_pp_traction_scale,
     torch,
     widgets,
 )
@@ -65,12 +67,50 @@ class PPBackendTests(unittest.TestCase):
         self.assertAlmostEqual(resolve_pp_K(0.999, None), 10.0)
         self.assertAlmostEqual(resolve_pp_K(0.95, None), 0.2)
         self.assertAlmostEqual(resolve_pp_K(0.7, 1.3), 1.3)
-        with self.assertRaisesRegex(ValueError, "alpha=1"):
-            resolve_pp_K(1.0, None)
+        self.assertTrue(np.isposinf(resolve_pp_K(1.0, None)))
+
+    def test_pp_traction_scale_resolves_singular_metadata_point(self) -> None:
+        self.assertAlmostEqual(resolve_pp_traction_scale(0.99, None), 100.0)
+        self.assertAlmostEqual(resolve_pp_traction_scale(0.5, 1.3), 2.6)
+        self.assertAlmostEqual(resolve_pp_traction_scale(1.0, None), 100.0)
+        self.assertAlmostEqual(resolve_pp_traction_scale(1.0, 1.3), 1.3)
 
     def test_numpy_backend_accepts_auto_K(self) -> None:
         solver = FFTPeszekPoyato2D(alpha=0.999, K=None, grid_size=16, domain_radius=3.0)
         self.assertAlmostEqual(solver.K, 10.0)
+        self.assertAlmostEqual(solver.traction_scale, 10_000.0)
+
+    def test_numpy_backend_accepts_alpha_one_auto_K(self) -> None:
+        solver = FFTPeszekPoyato2D(alpha=1.0, K=None, grid_size=16, domain_radius=3.0)
+        self.assertTrue(np.isposinf(solver.K))
+        self.assertAlmostEqual(solver.traction_scale, 100.0)
+        self.assertTrue(np.isfinite(solver.fft_Kx).all())
+        self.assertTrue(np.isfinite(solver.fft_Hxx).all())
+
+    def test_run_simulation_accepts_alpha_one_auto_K(self) -> None:
+        config = SimulationConfig(
+            alpha=1.0,
+            K=None,
+            n_fibers=2,
+            n_per_fiber=4,
+            grid_size=16,
+            domain_radius=4.0,
+            dt=0.01,
+            dt_min=0.01,
+            dt_max=0.01,
+            max_steps=2,
+            min_steps=0,
+            max_displacement_per_step=0.0,
+            backend="numpy",
+            integrator="fixed_rk2",
+            make_dashboard=False,
+            make_animation=False,
+            seed=123,
+        )
+        result = run_simulation(config)
+        self.assertEqual(result.steps, 2)
+        self.assertEqual(result.final_time, 0.02)
+        self.assertTrue(np.isfinite(result.x_final).all())
 
     def test_numpy_fft_convolution_matches_brute_grid_convolution(self) -> None:
         rng = np.random.default_rng(11)
@@ -231,7 +271,7 @@ class PPBackendTests(unittest.TestCase):
             min_steps=100_000,
             tol_rms=0.0,
             make_animation=True,
-            trajectory_frame_count=0,
+            trajectory_frame_count=100,
             seed=22,
         )
         try:
@@ -484,22 +524,117 @@ class PPBackendTests(unittest.TestCase):
             self.skipTest(str(exc))
 
         widget.initialization_dropdown.value = "ring"
-        widget.initializer_dropdown.value = "legacy_fast_phase"
+        widget.initializer_dropdown.value = "alpha_ball"
         widget.alpha_slider.value = 0.72
         widget.n_fibers_slider.value = 5
         widget.n_per_fiber_slider.value = 7
-        self.assertEqual(widget.frame_cap_slider.value, 0)
-        widget.frame_cap_slider.value = 900
+        self.assertEqual(widget.frame_cap_text.value, 0)
+        widget.max_steps_text.value = 123
+        widget.frame_cap_text.value = 900
         widget.time_direction_toggle.value = True
         runtime = widget._config_from_controls(make_animation=True)
 
         self.assertEqual(runtime.shape_names, ("ring",))
-        self.assertEqual(runtime.initialization_algorithm, "legacy_fast_phase")
+        self.assertEqual(runtime.initialization_algorithm, "alpha_ball")
         self.assertEqual(runtime.n_fibers, 5)
         self.assertEqual(runtime.n_per_fiber, 7)
+        self.assertEqual(runtime.max_steps, 123)
         self.assertEqual(runtime.trajectory_frame_count, 900)
         self.assertEqual(runtime.time_direction, "backward")
         self.assertAlmostEqual(runtime.alpha, 0.72)
+        self.assertAlmostEqual(runtime.K, 1.0)
+        self.assertFalse(widget.K_slider.disabled)
+
+        widget.use_optimal_K_toggle.value = True
+        runtime = widget._config_from_controls(make_animation=True)
+        self.assertIsNone(runtime.K)
+        self.assertTrue(widget.K_slider.disabled)
+
+        widget.use_optimal_K_toggle.value = False
+        widget.K_slider.value = 1.3
+        runtime = widget._config_from_controls(make_animation=True)
+        self.assertAlmostEqual(runtime.K, 1.3)
+        self.assertFalse(widget.K_slider.disabled)
+
+    @unittest.skipIf(widgets is None, "ipywidgets optional dependency is unavailable")
+    def test_widget_auto_K_toggle_supports_alpha_above_one(self) -> None:
+        config = SimulationConfig(
+            alpha=1.2,
+            K=None,
+            n_fibers=2,
+            n_per_fiber=4,
+            grid_size=16,
+            max_steps=2,
+            backend="numpy",
+            make_dashboard=False,
+            make_animation=False,
+        )
+        try:
+            widget = make_dynamics_widget(config, width=500, height=320)
+        except ImportError as exc:
+            self.skipTest(str(exc))
+
+        runtime = widget._config_from_controls(make_animation=True)
+        self.assertIsNone(runtime.K)
+        self.assertTrue(widget.use_optimal_K_toggle.value)
+        self.assertTrue(widget.K_slider.disabled)
+        self.assertIn("K=-0.05", widget.config_status_html.value)
+
+    @unittest.skipIf(widgets is None, "ipywidgets optional dependency is unavailable")
+    def test_widget_rejects_exploding_precompute_settings(self) -> None:
+        config = SimulationConfig(
+            n_fibers=2,
+            n_per_fiber=4,
+            grid_size=16,
+            max_steps=2,
+            backend="numpy",
+            make_dashboard=False,
+            make_animation=False,
+        )
+        try:
+            widget = make_dynamics_widget(config, width=500, height=320)
+        except ImportError as exc:
+            self.skipTest(str(exc))
+
+        widget.max_steps_text.value = 1_000_000
+        widget.frame_cap_text.value = 0
+        widget.precompute()
+
+        self.assertEqual(widget.btn_precompute.button_style, "danger")
+        self.assertIn("These settings will explode your computer, please reconsider.", widget.cache_status_html.value)
+
+    @unittest.skipIf(widgets is None, "ipywidgets optional dependency is unavailable")
+    def test_widget_slider_handles_mark_special_parameter_ranges(self) -> None:
+        config = SimulationConfig(
+            n_fibers=2,
+            n_per_fiber=4,
+            grid_size=16,
+            max_steps=2,
+            backend="numpy",
+            make_dashboard=False,
+            make_animation=False,
+        )
+        try:
+            widget = make_dynamics_widget(config, width=500, height=320)
+            finite_widget = make_finite_horizon_gauge_averaged_widget(
+                replace(config, prediction_horizon_tau=0.02),
+                width=500,
+                height=320,
+            )
+        except ImportError as exc:
+            self.skipTest(str(exc))
+
+        self.assertIsNone(widget.alpha_slider.style.handle_color)
+        widget.alpha_slider.value = 1.2
+        self.assertEqual(widget.alpha_slider.style.handle_color, "#d62728")
+        widget.alpha_slider.value = 0.8
+        self.assertIsNone(widget.alpha_slider.style.handle_color)
+
+        self.assertIsNone(finite_widget.prediction_horizon_slider.style.handle_color)
+        finite_widget.prediction_horizon_slider.value = -0.02
+        self.assertEqual(finite_widget.prediction_horizon_slider.style.handle_color, "#d62728")
+        finite_widget.prediction_horizon_slider.value = 0.02
+        self.assertIsNone(finite_widget.prediction_horizon_slider.style.handle_color)
 
     @unittest.skipIf(
         torch is None or not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
@@ -650,15 +785,23 @@ class ContinuousDensityTests(unittest.TestCase):
         widget.n_fibers_slider.value = 4
         widget.fiber_dropdown.value = 1
         widget.panel_dropdown.value = "velocity_mag"
-        widget.frame_cap_slider.value = 120
+        widget.max_steps_text.value = 21
+        widget.frame_cap_text.value = 120
         runtime = widget._config_from_controls(make_animation=True)
 
         self.assertAlmostEqual(runtime.alpha, 0.25)
         self.assertAlmostEqual(runtime.K, 1.3)
         self.assertAlmostEqual(runtime.eps_entropy, 0.04)
         self.assertEqual(runtime.n_fibers, 4)
+        self.assertEqual(runtime.max_steps, 21)
         self.assertEqual(runtime.trajectory_frame_count, 120)
         self.assertEqual(runtime.density_solver, "split_implicit_diffusion")
+        self.assertFalse(widget.K_slider.disabled)
+
+        widget.use_optimal_K_toggle.value = True
+        runtime = widget._config_from_controls(make_animation=True)
+        self.assertIsNone(runtime.K)
+        self.assertTrue(widget.K_slider.disabled)
 
 
 class DensityDynamicZoomTests(unittest.TestCase):
