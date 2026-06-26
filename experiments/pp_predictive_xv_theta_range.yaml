@@ -1,0 +1,64 @@
+experiment: predictive_velocity_animation_batch
+output_dir: temp_research/pp_predictive_xv_theta_range
+
+params:
+  left_dynamic_zoom: true
+  right_dynamic_zoom: true
+  alpha: 0.99 
+
+  n_fibers: 10
+  n_per_fiber: 100
+  grid_size: 128
+  domain_radius: 5.0
+  adaptive_steps: 1500
+  adaptive_steps_per_horizon: 5
+  adaptive_dt_min: 1.0e-4
+  adaptive_dt_max: 0.02
+  record_every: 10
+  animation_frames: 200
+  fps: 15
+  left_zoom_quantile: 0.9975
+  left_zoom_pad: 1.35
+  left_zoom_smoothing_radius: 3
+  left_zoom_delay_frames: 0
+  right_zoom_quantile: 0.9975
+  right_zoom_pad: 1.35
+  right_zoom_smoothing_radius: 3
+  right_zoom_delay_frames: 0
+
+cases:
+  - label: seed2026_theta0p0
+    seed: 2026
+    K: None
+    tau: 0.055
+    predictive_pp_weight: 0.0
+  - label: seed2026_theta0p2
+    seed: 2026
+    K: None
+    tau: 0.055
+    predictive_pp_weight: 0.2
+  - label: seed2026_theta0p4
+    seed: 2026
+    K: None
+    tau: 0.055
+    predictive_pp_weight: 0.4
+  - label: seed2026_theta0p5
+    seed: 2026
+    K: None
+    tau: 0.055
+    predictive_pp_weight: 0.5
+  - label: seed2026_theta0p6
+    seed: 2026
+    K: None
+    tau: 0.055
+    predictive_pp_weight: 0.6
+  - label: seed2026_theta0p8
+    seed: 2026
+    K: None
+    tau: 0.055
+    predictive_pp_weight: 0.8
+  - label: seed2026_theta1p0
+    seed: 2026
+    K: None
+    tau: 0.055
+    predictive_pp_weight: 1.0

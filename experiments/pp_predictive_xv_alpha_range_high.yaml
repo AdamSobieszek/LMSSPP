@@ -1,0 +1,54 @@
+experiment: predictive_velocity_animation_batch
+output_dir: temp_research/pp_predictive_xv_alpha_range_high
+
+params:
+  left_dynamic_zoom: true
+  right_dynamic_zoom: true
+  alpha: 0.99 
+
+  n_fibers: 10
+  n_per_fiber: 100
+  grid_size: 128
+  domain_radius: 5.0
+  adaptive_steps: 1500
+  adaptive_steps_per_horizon: 5
+  adaptive_dt_min: 1.0e-4
+  adaptive_dt_max: 0.02
+  record_every: 10
+  animation_frames: 200
+  fps: 15
+  left_zoom_quantile: 0.9975
+  left_zoom_pad: 1.35
+  left_zoom_smoothing_radius: 3
+  left_zoom_delay_frames: 0
+  right_zoom_quantile: 0.9975
+  right_zoom_pad: 1.35
+  right_zoom_smoothing_radius: 3
+  right_zoom_delay_frames: 0
+
+cases:
+  - label: seed2026_alpha0p995
+    seed: 2026
+    K: None
+    tau: 0.025
+    alpha: 0.995
+  - label: seed2026_alpha0p996
+    seed: 2026
+    K: None
+    tau: 0.025
+    alpha: 0.996
+  - label: seed2026_alpha0p997
+    seed: 2026
+    K: None
+    tau: 0.025
+    alpha: 0.997
+  - label: seed2026_alpha0p998
+    seed: 2026
+    K: None
+    tau: 0.025
+    alpha: 0.998
+  - label: seed2026_alpha0p999
+    seed: 2026
+    K: None
+    tau: 0.025
+    alpha: 0.999

@@ -1,0 +1,5080 @@
+"""Research diagnostics for PP disk/cross transient experiments.
+
+This module intentionally keeps transient experiment machinery out of
+``pp_cs_equilibria.py``.  It reuses the production PP simulator components but
+adds direct-pairwise validation, optional center/clip suppression, diagnostic
+time series, sweep outputs, and toy models for the near-alpha-one artifact
+study.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+import warnings
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any, Callable, Literal, Sequence
+
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - tqdm is optional for research runs
+    tqdm = None  # type: ignore[assignment]
+
+from .PP import (
+    Array,
+    FFTPeszekPoyato2D,
+    TorchPeszekPoyato2D,
+    _adaptive_step_factor,
+    _cfl_limited_dt,
+    _clamp_dt,
+    _dt_history_summary,
+    _make_pp_backend,
+    _projective_external_numpy,
+    cic_indices_weights,
+    deposit_mass,
+    direct_hessian_at,
+    interp_grid_with_weights,
+    resolve_pp_K,
+)
+from .pp_initializers import (
+    DEFAULT_SHAPES,
+    InitialCondition,
+    InitializerConfig,
+    _apply_initialization_algorithm,
+    make_initial_condition,
+    validate_initial_condition,
+)
+from .pp_cs_equilibria import (
+    IntegratorChoice,
+    PredictiveModeChoice,
+    SimulationConfig,
+    SimulationResult,
+    _adaptive_rk4_trial,
+    _config_to_json,
+    _jsonable,
+    _predictive_theta_from_config,
+    _predictive_theta_label,
+    finite_horizon_negative_velocity_at,
+    _seed_from_args,
+    _trajectory_frame_limit,
+    _trajectory_stride,
+    _validate_runtime_config,
+    finite_horizon_gauge_average_field,
+    fiber_colors,
+    run_finite_horizon_gauge_averaged_simulation,
+    write_time_diagnostics,
+)
+
+
+ForceBackendChoice = Literal["fft", "direct"]
+AnimationBatchRightModel = Literal["finite_horizon", "ordinary_pp_adaptive"]
+
+RESEARCH_DASHBOARD_FILENAME = "pp_transient_research_diagnostics.html"
+FINAL_MORPHOLOGY_FILENAME = "final_morphology.html"
+EXPERIMENT_PNG_COMPRESS_LEVEL = 9
+EXPERIMENT_MP4_CRF = 28
+EXPERIMENT_MP4_PRESET = "slow"
+
+RESEARCH_DIAGNOSTIC_FIELDS = (
+    "step",
+    "time",
+    "dt",
+    "r_min",
+    "r_nn_q01",
+    "r_nn_q05",
+    "r_nn_median",
+    "lambda_max_max",
+    "lambda_max_p99",
+    "lambda_min_min",
+    "trace_max",
+    "trace_mean",
+    "anisotropy_p99",
+    "q_max",
+    "q_p99",
+    "rk2_shell_radius",
+    "R_cont_rms",
+    "R_cont_max",
+    "R_disc_rms",
+    "R_disc_max",
+    "energy",
+    "delta_energy",
+    "disk_radius",
+    "disk_width",
+    "boundary_mass_fraction",
+    "interior_uniformity_score",
+    "axis_mass_fraction",
+    "hyperbola_score",
+    "fourfold_mode",
+    "covariance_anisotropy",
+    "clip_events",
+)
+
+
+@dataclass(frozen=True)
+class TransientResearchConfig(SimulationConfig):
+    """Simulation configuration with transient-research extensions."""
+
+    force_backend: ForceBackendChoice = "fft"
+    center_each_step: bool = True
+    clip_each_step: bool = True
+    record_research_diagnostics: bool = False
+    research_diagnostics_every: int | None = None
+    research_diagnostic_sample_size: int = 2500
+    research_energy_sample_size: int = 1200
+    research_nn_chunk: int = 512
+
+
+@dataclass(frozen=True)
+class ResearchSimulationResult(SimulationResult):
+    """PP simulation result carrying the research diagnostics matrix."""
+
+    research_diagnostics: Array | None
+
+
+def _validate_research_config(config: TransientResearchConfig) -> None:
+    if config.force_backend not in ("fft", "direct"):
+        raise ValueError("force_backend must be one of 'fft' or 'direct'")
+    if config.research_diagnostics_every is not None and config.research_diagnostics_every <= 0:
+        raise ValueError("research_diagnostics_every must be positive when set")
+    if config.research_diagnostic_sample_size <= 0:
+        raise ValueError("research_diagnostic_sample_size must be positive")
+    if config.research_energy_sample_size <= 0:
+        raise ValueError("research_energy_sample_size must be positive")
+    if config.research_nn_chunk <= 0:
+        raise ValueError("research_nn_chunk must be positive")
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"none", "null", "~", ""}:
+        return None
+    return float(value)
+
+
+def direct_A_at(
+    points: Array,
+    sources: Array,
+    alpha: float,
+    K: float | None,
+    chunk: int = 128,
+) -> Array:
+    """Direct finite-particle PP interaction field at query points."""
+
+    K_eff = resolve_pp_K(alpha, K)
+    points = np.asarray(points, dtype=np.float64)
+    sources = np.asarray(sources, dtype=np.float64)
+    out = np.zeros((points.shape[0], 2), dtype=np.float64)
+    N = sources.shape[0]
+    if N == 0:
+        raise ValueError("direct PP field requires at least one source particle")
+    for a in range(0, points.shape[0], max(1, int(chunk))):
+        p = points[a : a + max(1, int(chunk))]
+        diff = p[:, None, :] - sources[None, :, :]
+        r = np.linalg.norm(diff, axis=-1)
+        mask = r > 1e-14
+        scale = np.zeros_like(r)
+        scale[mask] = K_eff * (r[mask] ** (-float(alpha))) / (1.0 - float(alpha)) / N
+        out[a : a + max(1, int(chunk))] = np.sum(diff * scale[..., None], axis=1)
+    return out
+
+
+class DirectPeszekPoyato2D:
+    """Direct O(N^2) PP evaluator for small-N integrator/backend validation."""
+
+    def __init__(self, alpha: float, K: float | None, grid_size: int, domain_radius: float, *, chunk: int = 128):
+        if not 0.0 <= alpha <= 2.0:
+            raise ValueError("alpha must lie in [0, 2] for the PP kernel normalization")
+        if abs(alpha - 1.0) < 1e-9:
+            raise ValueError("alpha = 1 is the singular PP point (1/(1-alpha) diverges); choose alpha != 1")
+        if grid_size < 4:
+            raise ValueError("grid_size must be at least 4")
+        if domain_radius <= 0:
+            raise ValueError("domain_radius must be positive")
+        if chunk <= 0:
+            raise ValueError("chunk must be positive")
+
+        self.alpha = float(alpha)
+        self.K = resolve_pp_K(self.alpha, K)
+        self.G = int(grid_size)
+        self.L = float(domain_radius)
+        self.h = 2 * self.L / self.G
+        self.chunk = int(chunk)
+        self.backend_name = "direct"
+        self.device_name = "cpu"
+        self.dtype_name = "float64"
+
+    def clip_inside(self, x: Array) -> Array:
+        margin = 2.1 * self.h
+        return np.clip(x, -self.L + margin, self.L - margin)
+
+    def clip_inside_with_count(self, x: Array) -> tuple[Array, int]:
+        margin = 2.1 * self.h
+        lo = -self.L + margin
+        hi = self.L - margin
+        clipped = np.any((x < lo) | (x > hi), axis=1)
+        return np.clip(x, lo, hi), int(np.count_nonzero(clipped))
+
+    def asarray(self, x: Array) -> Array:
+        return np.asarray(x, dtype=np.float64)
+
+    def copy_state(self, x: Array) -> Array:
+        return np.array(x, dtype=np.float64, copy=True)
+
+    def to_numpy(self, x: Any) -> Array:
+        return np.asarray(x, dtype=np.float64)
+
+    def center(self, x: Array) -> Array:
+        return x - x.mean(axis=0, keepdims=True)
+
+    def speed_stats(self, v: Array) -> tuple[float, float]:
+        speed2 = np.sum(v * v, axis=1)
+        return float(np.sqrt(np.mean(speed2))), float(np.sqrt(np.max(speed2)))
+
+    def rms_delta(self, a: Array, b: Array) -> float:
+        delta = a - b
+        return float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
+
+    def synchronize(self) -> None:
+        return None
+
+    def A_grid_from_particles(self, x: Array) -> tuple[Array, Array, Array]:
+        rho_grid = deposit_mass(np.asarray(x, dtype=np.float64), self.G, self.L)
+        return rho_grid, np.zeros_like(rho_grid), np.zeros_like(rho_grid)
+
+    def A_at_particles(self, x: Array) -> tuple[Array, Array]:
+        x_np = np.asarray(x, dtype=np.float64)
+        return direct_A_at(x_np, x_np, self.alpha, self.K, chunk=self.chunk), deposit_mass(x_np, self.G, self.L)
+
+    def velocity(self, x: Array, omega: Array) -> tuple[Array, Array]:
+        A, _ = self.A_at_particles(x)
+        return omega - A, A
+
+    def projective_external(self, x: Array, omega: Array, eps: float) -> Array:
+        return _projective_external_numpy(np.asarray(x, dtype=np.float64), np.asarray(omega, dtype=np.float64), float(eps))
+
+    def hessian_at_particles(self, x: Array) -> Array:
+        x_np = np.asarray(x, dtype=np.float64)
+        return direct_hessian_at(x_np, x_np, self.alpha, self.K, chunk=self.chunk)
+
+
+def _make_research_backend(config: TransientResearchConfig) -> FFTPeszekPoyato2D | TorchPeszekPoyato2D | DirectPeszekPoyato2D:
+    if config.force_backend == "direct":
+        if config.backend != "numpy":
+            warnings.warn("force_backend='direct' uses the NumPy CPU path; backend/device/dtype are ignored.", RuntimeWarning, stacklevel=2)
+        return DirectPeszekPoyato2D(
+            config.alpha,
+            config.K,
+            config.grid_size,
+            config.domain_radius,
+            chunk=config.direct_hessian_chunk,
+        )
+    return _make_pp_backend(config)
+
+
+def run_research_simulation(
+    config: TransientResearchConfig,
+    initial: InitialCondition | None = None,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+) -> ResearchSimulationResult:
+    """Run the PP particle simulation with transient-research extensions enabled."""
+
+    _validate_runtime_config(config)
+    _validate_research_config(config)
+
+    def _raise_if_cancelled() -> None:
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("PP simulation cancelled.")
+
+    raw_initial = make_initial_condition(config) if initial is None else validate_initial_condition(initial)
+    initial, initialization_meta = _apply_initialization_algorithm(config, raw_initial)
+    solver = _make_research_backend(config)
+
+    def maybe_clip_state(state_x: Any) -> tuple[Any, int]:
+        if not config.clip_each_step:
+            return state_x, 0
+        return solver.clip_inside_with_count(state_x)
+
+    def maybe_center_state(state_x: Any) -> Any:
+        if not config.center_each_step:
+            return state_x
+        return solver.center(state_x)
+
+    x = solver.asarray(initial.x)
+    omega = solver.asarray(initial.omega)
+    x, clip_count = maybe_clip_state(solver.copy_state(x))
+    x_initial = solver.to_numpy(x).copy()
+    diagnostics: list[tuple[int, float, float, float, float, int, int, int, int]] = []
+    research_diagnostics: list[Array] = []
+    trajectory_x: list[Array] = []
+    trajectory_rho: list[Array] = []
+    trajectory_steps: list[int] = []
+    trajectory_times: list[float] = []
+    trajectory_stride = _trajectory_stride(config)
+    trajectory_limit = _trajectory_frame_limit(config)
+    field_evaluations = 0
+    accepted_steps = 0
+    rejected_steps = 0
+    clip_events = int(clip_count)
+    dt_current = _clamp_dt(float(config.dt), config)
+    dt_history: list[float] = []
+    t = 0.0
+    time_sign = -1.0 if config.time_direction == "backward" else 1.0
+    research_every = int(config.record_every if config.research_diagnostics_every is None else config.research_diagnostics_every)
+    last_research_energy: float | None = None
+
+    proj_eps = float(config.projective_epsilon)
+    use_projective = config.external_field == "projective" and proj_eps != 0.0
+
+    def velocity_fn(state_x: Any) -> tuple[Any, Any]:
+        if not use_projective:
+            return solver.velocity(state_x, omega)
+        A_loc, _ = solver.A_at_particles(state_x)
+        drift = solver.projective_external(state_x, omega, proj_eps)
+        return drift - A_loc, A_loc
+
+    def record_trajectory(step_: int, x_: Any, time_: float, *, force: bool = False) -> None:
+        if not config.make_animation:
+            return
+        if trajectory_steps and not force and step_ % trajectory_stride != 0 and step_ != config.max_steps:
+            return
+        if trajectory_limit is not None and len(trajectory_steps) >= trajectory_limit and not force and step_ != config.max_steps:
+            return
+        density_x = solver.to_numpy(x_)
+        density_grid_size = config.animation_density_grid_size
+        if density_grid_size is None or int(density_grid_size) == solver.G:
+            rho = deposit_mass(density_x, solver.G, solver.L)
+        else:
+            rho = deposit_mass(density_x, int(density_grid_size), solver.L)
+        trajectory_x.append(density_x.astype(np.float32, copy=True))
+        trajectory_rho.append(rho.astype(np.float32, copy=False))
+        trajectory_steps.append(int(step_))
+        trajectory_times.append(float(time_))
+
+    def append_diagnostic(step_: int, time_: float, rms_: float, maxv_: float, dt_: float) -> None:
+        diagnostics.append(
+            (
+                int(step_),
+                float(time_),
+                float(rms_),
+                float(maxv_),
+                float(dt_),
+                int(field_evaluations),
+                int(accepted_steps),
+                int(rejected_steps),
+                int(clip_events),
+            )
+        )
+
+    def append_research_diagnostic(step_: int, time_: float, dt_: float, x_: Any) -> None:
+        nonlocal last_research_energy
+        if not config.record_research_diagnostics:
+            return
+        row, last_research_energy = _research_diagnostic_row(
+            config,
+            solver.to_numpy(x_),
+            initial.omega,
+            step=step_,
+            time_value=time_,
+            dt=dt_,
+            clip_events=clip_events,
+            previous_energy=last_research_energy,
+        )
+        research_diagnostics.append(row)
+
+    start = time.time()
+
+    if config.integrator == "fixed_rk2":
+        dt_fixed = float(config.dt)
+        for _ in range(config.max_steps + 1):
+            _raise_if_cancelled()
+            record_trajectory(accepted_steps, x, t)
+            vf, _ = velocity_fn(x)
+            field_evaluations += 1
+            rms, maxv = solver.speed_stats(vf)
+            if accepted_steps % config.record_every == 0:
+                append_diagnostic(accepted_steps, t, rms, maxv, dt_fixed)
+            if accepted_steps % research_every == 0:
+                append_research_diagnostic(accepted_steps, t, dt_fixed, x)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+            x_pred, clipped = maybe_clip_state(x + time_sign * dt_fixed * vf)
+            clip_events += clipped
+            k2, _ = velocity_fn(x_pred)
+            field_evaluations += 1
+            x = x + 0.5 * time_sign * dt_fixed * (vf + k2)
+            x = maybe_center_state(x)
+            x, clipped = maybe_clip_state(x)
+            clip_events += clipped
+            t += dt_fixed
+            accepted_steps += 1
+            dt_history.append(dt_fixed)
+    elif config.integrator == "adaptive_rk4":
+        while True:
+            _raise_if_cancelled()
+            record_trajectory(accepted_steps, x, t)
+            vf, _ = velocity_fn(x)
+            field_evaluations += 1
+            rms, maxv = solver.speed_stats(vf)
+            if accepted_steps % config.record_every == 0:
+                append_diagnostic(accepted_steps, t, rms, maxv, dt_current)
+            if accepted_steps % research_every == 0:
+                append_research_diagnostic(accepted_steps, t, dt_current, x)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+
+            trial_dt = _cfl_limited_dt(dt_current, maxv, solver.h, config)
+            while True:
+                x_trial, local_err, trial_evals, trial_clips = _adaptive_rk4_trial(
+                    solver, velocity_fn, x, trial_dt, time_sign, vf
+                )
+                field_evaluations += trial_evals
+                clip_events += trial_clips
+                if not np.isfinite(local_err):
+                    if trial_dt <= config.dt_min * (1 + 1e-12):
+                        raise FloatingPointError("adaptive RK4 local error is non-finite at dt_min")
+                    rejected_steps += 1
+                    trial_dt = max(
+                        float(config.dt_min),
+                        trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False, order=5),
+                    )
+                    continue
+                if local_err <= config.adaptive_tol or trial_dt <= config.dt_min * (1 + 1e-12):
+                    break
+                rejected_steps += 1
+                trial_dt = max(
+                    float(config.dt_min),
+                    trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False, order=5),
+                )
+
+            x = maybe_center_state(x_trial)
+            x, clipped = maybe_clip_state(x)
+            clip_events += clipped
+            t += trial_dt
+            accepted_steps += 1
+            dt_history.append(trial_dt)
+            dt_current = _clamp_dt(
+                trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=True, order=5), config
+            )
+    else:
+        while True:
+            _raise_if_cancelled()
+            record_trajectory(accepted_steps, x, t)
+            vf, _ = velocity_fn(x)
+            field_evaluations += 1
+            rms, maxv = solver.speed_stats(vf)
+            if accepted_steps % config.record_every == 0:
+                append_diagnostic(accepted_steps, t, rms, maxv, dt_current)
+            if accepted_steps % research_every == 0:
+                append_research_diagnostic(accepted_steps, t, dt_current, x)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+
+            trial_dt = _cfl_limited_dt(dt_current, maxv, solver.h, config)
+            while True:
+                x_pred, clipped = maybe_clip_state(x + time_sign * trial_dt * vf)
+                clip_events += clipped
+                k2, _ = velocity_fn(x_pred)
+                field_evaluations += 1
+                x_euler = x + time_sign * trial_dt * vf
+                x_heun = x + 0.5 * time_sign * trial_dt * (vf + k2)
+                local_err = solver.rms_delta(x_heun, x_euler)
+                if not np.isfinite(local_err):
+                    if trial_dt <= config.dt_min * (1 + 1e-12):
+                        raise FloatingPointError("adaptive RK2 local error is non-finite at dt_min")
+                    rejected_steps += 1
+                    trial_dt = max(float(config.dt_min), trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False))
+                    continue
+                if local_err <= config.adaptive_tol or trial_dt <= config.dt_min * (1 + 1e-12):
+                    break
+                rejected_steps += 1
+                trial_dt = max(float(config.dt_min), trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False))
+
+            x = maybe_center_state(x_heun)
+            x, clipped = maybe_clip_state(x)
+            clip_events += clipped
+            t += trial_dt
+            accepted_steps += 1
+            dt_history.append(trial_dt)
+            dt_current = _clamp_dt(trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=True), config)
+
+    runtime = time.time() - start
+    if config.make_animation and (not trajectory_steps or trajectory_steps[-1] != accepted_steps):
+        record_trajectory(accepted_steps, x, t, force=True)
+    A_final_backend, rho_grid_backend = solver.A_at_particles(x)
+    field_evaluations += 1
+    solver.synchronize()
+    x_final = solver.to_numpy(x).copy()
+    A_final = solver.to_numpy(A_final_backend)
+    rho_grid = solver.to_numpy(rho_grid_backend)
+    if use_projective:
+        drift_final = solver.to_numpy(solver.projective_external(x, omega, proj_eps))
+        residual = drift_final - A_final
+    else:
+        residual = initial.omega - A_final
+    residual_speed2 = np.sum(residual * residual, axis=1)
+    dt_min_observed, dt_max_observed, dt_mean = _dt_history_summary(dt_history)
+    return ResearchSimulationResult(
+        initial=initial,
+        x_initial=x_initial,
+        x_final=x_final,
+        A_final=A_final,
+        residual=residual,
+        rho_grid=rho_grid,
+        diagnostics=np.array(diagnostics, dtype=np.float64),
+        trajectory_x=np.stack(trajectory_x) if trajectory_x else None,
+        trajectory_rho=np.stack(trajectory_rho) if trajectory_rho else None,
+        trajectory_steps=np.array(trajectory_steps, dtype=np.int64) if trajectory_steps else None,
+        trajectory_times=np.array(trajectory_times, dtype=np.float64) if trajectory_times else None,
+        steps=int(accepted_steps),
+        final_time=float(t),
+        runtime_seconds=float(runtime),
+        rms_residual=float(np.sqrt(np.mean(residual_speed2))),
+        max_residual=float(np.sqrt(np.max(residual_speed2))),
+        backend=solver.backend_name,
+        device=solver.device_name,
+        dtype=solver.dtype_name,
+        field_evaluations=int(field_evaluations),
+        accepted_steps=int(accepted_steps),
+        rejected_steps=int(rejected_steps),
+        dt_min_observed=dt_min_observed,
+        dt_max_observed=dt_max_observed,
+        dt_mean=dt_mean,
+        clip_events=int(clip_events),
+        initialization_algorithm=str(initialization_meta["algorithm"]),
+        initialization_steps=int(initialization_meta["steps"]),
+        initialization_time=float(initialization_meta["time"]),
+        initialization_stop_metric=float(initialization_meta["stop_metric"]),
+        research_diagnostics=(
+            np.stack(research_diagnostics).astype(np.float64, copy=False)
+            if research_diagnostics
+            else (np.zeros((0, len(RESEARCH_DIAGNOSTIC_FIELDS)), dtype=np.float64) if config.record_research_diagnostics else None)
+        ),
+    )
+
+
+def _diagnostic_sample_indices(n: int, max_size: int, seed: int) -> Array:
+    if n <= 0:
+        return np.empty((0,), dtype=np.int64)
+    max_size = int(max_size)
+    if max_size <= 0 or n <= max_size:
+        return np.arange(n, dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.choice(n, size=max_size, replace=False))
+
+
+def nearest_neighbor_distances(points: Array, *, chunk: int = 512) -> Array:
+    """Nearest-neighbor distances inside a point cloud, computed in chunks."""
+
+    x = np.asarray(points, dtype=np.float64)
+    n = int(x.shape[0])
+    if n < 2:
+        return np.full((n,), np.inf, dtype=np.float64)
+    chunk = max(1, int(chunk))
+    nn2 = np.full((n,), np.inf, dtype=np.float64)
+    for a in range(0, n, chunk):
+        b = min(n, a + chunk)
+        diff = x[a:b, None, :] - x[None, :, :]
+        d2 = np.sum(diff * diff, axis=2)
+        rows = np.arange(b - a)
+        d2[rows, a + rows] = np.inf
+        nn2[a:b] = np.min(d2, axis=1)
+    return np.sqrt(np.maximum(nn2, 0.0))
+
+
+def nearest_neighbor_quantiles(points: Array, *, chunk: int = 512) -> dict[str, float]:
+    nn = nearest_neighbor_distances(points, chunk=chunk)
+    finite = nn[np.isfinite(nn)]
+    if len(finite) == 0:
+        return {"r_min": float("inf"), "r_nn_q01": float("inf"), "r_nn_q05": float("inf"), "r_nn_median": float("inf")}
+    return {
+        "r_min": float(np.min(finite)),
+        "r_nn_q01": float(np.quantile(finite, 0.01)),
+        "r_nn_q05": float(np.quantile(finite, 0.05)),
+        "r_nn_median": float(np.median(finite)),
+    }
+
+
+def _hessian_components_to_stats(H: Array) -> dict[str, Array]:
+    H = np.asarray(H, dtype=np.float64)
+    if H.ndim != 3 or H.shape[1:] != (2, 2):
+        raise ValueError("H must have shape (N, 2, 2)")
+    hxx = H[:, 0, 0]
+    hxy = 0.5 * (H[:, 0, 1] + H[:, 1, 0])
+    hyy = H[:, 1, 1]
+    trace = hxx + hyy
+    disc = np.sqrt(np.maximum((hxx - hyy) ** 2 + 4.0 * hxy * hxy, 0.0))
+    lam_min = 0.5 * (trace - disc)
+    lam_max = 0.5 * (trace + disc)
+    det = hxx * hyy - hxy * hxy
+    anisotropy = lam_max / np.maximum(lam_min, 1e-30)
+    return {
+        "lambda_min": lam_min,
+        "lambda_max": lam_max,
+        "trace": trace,
+        "det": det,
+        "anisotropy": anisotropy,
+    }
+
+
+def evaluate_A_and_H_at_particles(
+    config: TransientResearchConfig,
+    x: Array,
+    *,
+    query: Array | None = None,
+    force_backend: ForceBackendChoice | None = None,
+) -> dict[str, Array]:
+    """Evaluate PP force and Hessian at particles or supplied query points."""
+
+    sources = np.asarray(x, dtype=np.float64)
+    points = sources if query is None else np.asarray(query, dtype=np.float64)
+    backend = config.force_backend if force_backend is None else force_backend
+    if backend == "direct":
+        A = direct_A_at(points, sources, config.alpha, config.K, chunk=config.direct_hessian_chunk)
+        H = direct_hessian_at(points, sources, config.alpha, config.K, chunk=config.direct_hessian_chunk)
+        rho = deposit_mass(sources, config.grid_size, config.domain_radius)
+    elif backend == "fft":
+        solver = FFTPeszekPoyato2D(config.alpha, config.K, config.grid_size, config.domain_radius)
+        rho, Ax_grid, Ay_grid = solver.A_grid_from_particles(sources)
+        weights = cic_indices_weights(points, solver.G, solver.L)
+        A = np.c_[interp_grid_with_weights(Ax_grid, weights), interp_grid_with_weights(Ay_grid, weights)]
+        Hxx, Hxy, Hyy = solver.hessian_grid_from_rho(rho)
+        H = np.empty((len(points), 2, 2), dtype=np.float64)
+        H[:, 0, 0] = interp_grid_with_weights(Hxx, weights)
+        H[:, 0, 1] = interp_grid_with_weights(Hxy, weights)
+        H[:, 1, 0] = H[:, 0, 1]
+        H[:, 1, 1] = interp_grid_with_weights(Hyy, weights)
+    else:
+        raise ValueError(f"unknown force_backend: {backend!r}")
+    stats = _hessian_components_to_stats(H)
+    return {"A": A, "H": H, "rho_grid": rho, **stats}
+
+
+def evaluate_A_at_particles(
+    config: TransientResearchConfig,
+    x: Array,
+    *,
+    query: Array | None = None,
+    force_backend: ForceBackendChoice | None = None,
+) -> Array:
+    sources = np.asarray(x, dtype=np.float64)
+    points = sources if query is None else np.asarray(query, dtype=np.float64)
+    backend = config.force_backend if force_backend is None else force_backend
+    if backend == "direct":
+        return direct_A_at(points, sources, config.alpha, config.K, chunk=config.direct_hessian_chunk)
+    if backend == "fft":
+        solver = FFTPeszekPoyato2D(config.alpha, config.K, config.grid_size, config.domain_radius)
+        rho, Ax_grid, Ay_grid = solver.A_grid_from_particles(sources)
+        weights = cic_indices_weights(points, solver.G, solver.L)
+        return np.c_[interp_grid_with_weights(Ax_grid, weights), interp_grid_with_weights(Ay_grid, weights)]
+    raise ValueError(f"unknown force_backend: {backend!r}")
+
+
+def evaluate_velocity_numpy(
+    config: TransientResearchConfig,
+    x: Array,
+    omega: Array,
+    *,
+    force_backend: ForceBackendChoice | None = None,
+) -> tuple[Array, Array]:
+    A = evaluate_A_at_particles(config, x, force_backend=force_backend)
+    if config.external_field == "projective" and float(config.projective_epsilon) != 0.0:
+        drift = _projective_external_numpy(x, omega, float(config.projective_epsilon))
+    else:
+        drift = np.asarray(omega, dtype=np.float64)
+    return drift - A, A
+
+
+def _clip_numpy_with_count(x: Array, config: SimulationConfig) -> tuple[Array, int]:
+    h = 2.0 * float(config.domain_radius) / int(config.grid_size)
+    margin = 2.1 * h
+    lo = -float(config.domain_radius) + margin
+    hi = float(config.domain_radius) - margin
+    clipped = np.any((x < lo) | (x > hi), axis=1)
+    return np.clip(x, lo, hi), int(np.count_nonzero(clipped))
+
+
+def rk2_step_numpy(
+    config: TransientResearchConfig,
+    x: Array,
+    omega: Array,
+    dt: float | None = None,
+    *,
+    force_backend: ForceBackendChoice | None = None,
+    center_each_step: bool | None = None,
+    clip_each_step: bool | None = None,
+) -> Array:
+    """One fixed midpoint/Heun RK2 map with the research centering/clipping convention."""
+
+    h = float(config.dt if dt is None else dt)
+    time_sign = -1.0 if config.time_direction == "backward" else 1.0
+    center = bool(config.center_each_step if center_each_step is None else center_each_step)
+    clip = bool(config.clip_each_step if clip_each_step is None else clip_each_step)
+    x0 = np.asarray(x, dtype=np.float64)
+    omega0 = np.asarray(omega, dtype=np.float64)
+    k1, _ = evaluate_velocity_numpy(config, x0, omega0, force_backend=force_backend)
+    x_pred = x0 + time_sign * h * k1
+    if clip:
+        x_pred, _ = _clip_numpy_with_count(x_pred, config)
+    k2, _ = evaluate_velocity_numpy(config, x_pred, omega0, force_backend=force_backend)
+    out = x0 + 0.5 * time_sign * h * (k1 + k2)
+    if center:
+        out = out - out.mean(axis=0, keepdims=True)
+    if clip:
+        out, _ = _clip_numpy_with_count(out, config)
+    return out
+
+
+def rk2_map_residual(
+    config: TransientResearchConfig,
+    x: Array,
+    omega: Array,
+    dt: float | None = None,
+    *,
+    force_backend: ForceBackendChoice | None = None,
+) -> Array:
+    return rk2_step_numpy(config, x, omega, dt, force_backend=force_backend) - np.asarray(x, dtype=np.float64)
+
+
+def pp_particle_energy(
+    x: Array,
+    omega: Array,
+    alpha: float,
+    K: float | None,
+    *,
+    sample_size: int = 1200,
+    seed: int = 0,
+    chunk: int = 256,
+) -> float:
+    """Direct particle PP energy, sampled deterministically for large clouds."""
+
+    K_eff = resolve_pp_K(alpha, K)
+    x_full = np.asarray(x, dtype=np.float64)
+    omega_full = np.asarray(omega, dtype=np.float64)
+    idx = _diagnostic_sample_indices(len(x_full), int(sample_size), seed)
+    xs = x_full[idx]
+    os = omega_full[idx]
+    m = int(len(xs))
+    if m == 0:
+        return float("nan")
+    linear = -float(np.mean(np.sum(os * xs, axis=1)))
+    pair_sum = 0.0
+    denom = (2.0 - float(alpha)) * (1.0 - float(alpha))
+    for a in range(0, m, max(1, int(chunk))):
+        p = xs[a : a + max(1, int(chunk))]
+        r = np.linalg.norm(p[:, None, :] - xs[None, :, :], axis=2)
+        mask = r > 1e-14
+        w = np.zeros_like(r)
+        w[mask] = K_eff * (r[mask] ** (2.0 - float(alpha))) / denom
+        pair_sum += float(np.sum(w))
+    return linear + 0.5 * pair_sum / float(m * m)
+
+
+def compute_morphology_metrics(x: Array, *, grid_dx: float | None = None) -> dict[str, float]:
+    """Disk/cross/fourfold morphology scores for a particle cloud."""
+
+    pts = np.asarray(x, dtype=np.float64)
+    n = int(len(pts))
+    if n == 0:
+        return {
+            "disk_radius": 0.0,
+            "disk_width": 0.0,
+            "boundary_mass_fraction": 0.0,
+            "interior_uniformity_score": 0.0,
+            "axis_mass_fraction": 0.0,
+            "hyperbola_score": 0.0,
+            "fourfold_mode": 0.0,
+            "covariance_anisotropy": 0.0,
+        }
+
+    centered = pts - pts.mean(axis=0, keepdims=True)
+    radius = np.linalg.norm(centered, axis=1)
+    cloud_radius = float(np.quantile(radius, 0.98)) if n > 1 else float(radius[0])
+    max_r = max(float(np.max(radius)), 1e-12)
+    bins = max(12, min(96, int(np.sqrt(n))))
+    counts, edges = np.histogram(radius, bins=bins, range=(0.0, max_r))
+    widths = np.maximum(np.diff(edges), 1e-12)
+    density = counts / widths
+    peak_idx = int(np.argmax(density)) if len(density) else 0
+    disk_radius = float(0.5 * (edges[peak_idx] + edges[peak_idx + 1]))
+    dist_to_peak = np.abs(radius - disk_radius)
+    disk_width = float(2.0 * np.quantile(dist_to_peak, 0.5))
+    dx = 0.0 if grid_dx is None else float(grid_dx)
+    bandwidth = max(0.05 * max(disk_radius, max_r), 2.0 * dx, 1e-12)
+    boundary_mass_fraction = float(np.mean(dist_to_peak < bandwidth))
+
+    interior = radius <= max(disk_radius, 1e-12)
+    if np.count_nonzero(interior) >= 4 and disk_radius > 0:
+        scaled = np.sort((radius[interior] / disk_radius) ** 2)
+        empirical = (np.arange(len(scaled)) + 0.5) / len(scaled)
+        interior_rmse = float(np.sqrt(np.mean((scaled - empirical) ** 2)))
+        interior_uniformity_score = float(1.0 / (interior_rmse + 1e-12))
+    else:
+        interior_uniformity_score = 0.0
+
+    eps_axis = max(2.0 * dx, 0.05 * max(cloud_radius, max_r), 1e-12)
+    axis_distance = np.minimum(np.abs(centered[:, 0]), np.abs(centered[:, 1]))
+    axis_mass_fraction = float(np.mean(axis_distance < eps_axis))
+
+    away = (np.abs(centered[:, 0]) > eps_axis) & (np.abs(centered[:, 1]) > eps_axis)
+    quadrant_codes = (centered[:, 0] > 0).astype(np.int64) + 2 * (centered[:, 1] > 0).astype(np.int64)
+    variances: list[float] = []
+    weights: list[int] = []
+    s = np.log(np.abs(centered[:, 0] * centered[:, 1]) + 1e-30)
+    for q in range(4):
+        mask = away & (quadrant_codes == q)
+        count = int(np.count_nonzero(mask))
+        if count >= 4:
+            variances.append(float(np.var(s[mask])))
+            weights.append(count)
+    hyperbola_score = float(1.0 / (np.average(variances, weights=weights) + 1e-12)) if weights else 0.0
+
+    theta_mask = radius > 1e-14
+    if np.any(theta_mask):
+        theta = np.arctan2(centered[theta_mask, 1], centered[theta_mask, 0])
+        fourfold_mode = float(abs(np.mean(np.exp(4j * theta))))
+    else:
+        fourfold_mode = 0.0
+
+    if n >= 3:
+        cov = np.cov(centered.T)
+        eig = np.linalg.eigvalsh(cov)
+        covariance_anisotropy = float(eig[-1] / max(eig[0], 1e-30))
+    else:
+        covariance_anisotropy = 0.0
+
+    return {
+        "disk_radius": disk_radius,
+        "disk_width": disk_width,
+        "boundary_mass_fraction": boundary_mass_fraction,
+        "interior_uniformity_score": interior_uniformity_score,
+        "axis_mass_fraction": axis_mass_fraction,
+        "hyperbola_score": hyperbola_score,
+        "fourfold_mode": fourfold_mode,
+        "covariance_anisotropy": covariance_anisotropy,
+    }
+
+
+def rk2_shell_radius(alpha: float, K: float | None, dt: float) -> float:
+    K_eff = resolve_pp_K(alpha, K)
+    return float(abs(dt) * abs(K_eff) / max(2.0 * abs(1.0 - float(alpha)), 1e-30))
+
+
+def _research_diagnostic_row(
+    config: TransientResearchConfig,
+    x: Array,
+    omega: Array,
+    *,
+    step: int,
+    time_value: float,
+    dt: float,
+    clip_events: int,
+    previous_energy: float | None,
+) -> tuple[Array, float]:
+    x_np = np.asarray(x, dtype=np.float64)
+    omega_np = np.asarray(omega, dtype=np.float64)
+    sample_idx = _diagnostic_sample_indices(
+        len(x_np),
+        int(config.research_diagnostic_sample_size),
+        int(config.seed) + 1009 * int(step) + 17,
+    )
+    x_sample = x_np[sample_idx]
+    omega_sample = omega_np[sample_idx]
+
+    nn = nearest_neighbor_quantiles(x_sample, chunk=config.research_nn_chunk)
+    evaluated = evaluate_A_and_H_at_particles(config, x_np, query=x_sample, force_backend=config.force_backend)
+    hstats = {key: np.asarray(evaluated[key], dtype=np.float64) for key in ("lambda_min", "lambda_max", "trace", "anisotropy")}
+    lam_max = hstats["lambda_max"]
+    lam_min = hstats["lambda_min"]
+    trace = hstats["trace"]
+    anisotropy = hstats["anisotropy"]
+    lambda_max_max = float(np.max(lam_max)) if len(lam_max) else 0.0
+    lambda_max_p99 = float(np.quantile(lam_max, 0.99)) if len(lam_max) else 0.0
+    lambda_min_min = float(np.min(lam_min)) if len(lam_min) else 0.0
+    trace_max = float(np.max(trace)) if len(trace) else 0.0
+    trace_mean = float(np.mean(trace)) if len(trace) else 0.0
+    anisotropy_p99 = float(np.quantile(anisotropy[np.isfinite(anisotropy)], 0.99)) if np.any(np.isfinite(anisotropy)) else 0.0
+
+    A_sample = np.asarray(evaluated["A"], dtype=np.float64)
+    if config.external_field == "projective" and float(config.projective_epsilon) != 0.0:
+        drift_sample = _projective_external_numpy(x_sample, omega_sample, float(config.projective_epsilon))
+    else:
+        drift_sample = omega_sample
+    R_cont = drift_sample - A_sample
+    R_cont_norm = np.linalg.norm(R_cont, axis=1) if len(R_cont) else np.zeros((0,), dtype=np.float64)
+    R_cont_rms = float(np.sqrt(np.mean(R_cont_norm * R_cont_norm))) if len(R_cont_norm) else 0.0
+    R_cont_max = float(np.max(R_cont_norm)) if len(R_cont_norm) else 0.0
+
+    if config.force_backend == "direct" and len(x_np) > int(config.research_diagnostic_sample_size):
+        disc_x = x_sample
+        disc_omega = omega_sample
+    else:
+        disc_x = x_np
+        disc_omega = omega_np
+    R_disc = rk2_map_residual(config, disc_x, disc_omega, dt, force_backend=config.force_backend)
+    R_disc_norm = np.linalg.norm(R_disc, axis=1) if len(R_disc) else np.zeros((0,), dtype=np.float64)
+    R_disc_rms = float(np.sqrt(np.mean(R_disc_norm * R_disc_norm))) if len(R_disc_norm) else 0.0
+    R_disc_max = float(np.max(R_disc_norm)) if len(R_disc_norm) else 0.0
+
+    energy = pp_particle_energy(
+        x_np,
+        omega_np,
+        config.alpha,
+        config.K,
+        sample_size=config.research_energy_sample_size,
+        seed=int(config.seed) + 811 * int(step) + 29,
+        chunk=max(64, min(512, int(config.research_nn_chunk))),
+    )
+    delta_energy = 0.0 if previous_energy is None or not np.isfinite(previous_energy) else float(energy - previous_energy)
+
+    morphology = compute_morphology_metrics(x_np, grid_dx=2.0 * float(config.domain_radius) / int(config.grid_size))
+    row_values = {
+        "step": float(step),
+        "time": float(time_value),
+        "dt": float(dt),
+        **nn,
+        "lambda_max_max": lambda_max_max,
+        "lambda_max_p99": lambda_max_p99,
+        "lambda_min_min": lambda_min_min,
+        "trace_max": trace_max,
+        "trace_mean": trace_mean,
+        "anisotropy_p99": anisotropy_p99,
+        "q_max": float(abs(dt) * lambda_max_max),
+        "q_p99": float(abs(dt) * lambda_max_p99),
+        "rk2_shell_radius": rk2_shell_radius(config.alpha, config.K, dt),
+        "R_cont_rms": R_cont_rms,
+        "R_cont_max": R_cont_max,
+        "R_disc_rms": R_disc_rms,
+        "R_disc_max": R_disc_max,
+        "energy": float(energy),
+        "delta_energy": delta_energy,
+        **morphology,
+        "clip_events": float(clip_events),
+    }
+    return np.array([row_values[name] for name in RESEARCH_DIAGNOSTIC_FIELDS], dtype=np.float64), float(energy)
+
+
+def _research_diag_column(diagnostics: Array, name: str) -> Array:
+    return np.asarray(diagnostics[:, RESEARCH_DIAGNOSTIC_FIELDS.index(name)], dtype=np.float64)
+
+
+def make_final_morphology_figure(result: ResearchSimulationResult, config: TransientResearchConfig, *, title: str | None = None) -> go.Figure:
+    """Final particle scatter with fixed axes and reproducible fiber colors."""
+
+    rng = np.random.default_rng(config.seed + 31)
+    group_id = result.initial.group_id
+    group_names = result.initial.group_names
+    colors = fiber_colors(config, result.initial.omega_atoms, len(group_names))
+    fig = go.Figure()
+    for k, name in enumerate(group_names):
+        idx_all = np.where(group_id == k)[0]
+        if len(idx_all) == 0:
+            continue
+        idx = rng.choice(idx_all, size=min(config.max_plot_points_per_group, len(idx_all)), replace=False)
+        fig.add_trace(
+            go.Scattergl(
+                x=result.x_final[idx, 0],
+                y=result.x_final[idx, 1],
+                mode="markers",
+                marker=dict(size=4, color=colors[k], opacity=0.72),
+                name=f"fiber {k + 1}: {name}",
+            )
+        )
+    fig.update_xaxes(range=[-config.domain_radius, config.domain_radius], title_text="x1", scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(range=[-config.domain_radius, config.domain_radius], title_text="x2")
+    fig.update_layout(
+        title=dict(
+            text=title
+            or (
+                f"Final morphology: {config.integrator}, force={config.force_backend}, "
+                f"alpha={config.alpha:g}, K={resolve_pp_K(config.alpha, config.K):g}, h={config.dt:g}, grid={config.grid_size}, "
+                f"steps={result.steps}, t={result.final_time:.4g}, seed={config.seed}"
+            ),
+            x=0.5,
+        ),
+        width=820,
+        height=760,
+        template="plotly_white",
+        legend=dict(itemsizing="constant"),
+    )
+    return fig
+
+
+def make_research_diagnostics_dashboard(result: ResearchSimulationResult, config: TransientResearchConfig) -> go.Figure:
+    """Plot diagnostics used to separate RK2, grid, and continuous-time effects."""
+
+    if result.research_diagnostics is None or len(result.research_diagnostics) == 0:
+        raise ValueError("run_research_simulation must be called with record_research_diagnostics=True")
+    diag = np.asarray(result.research_diagnostics, dtype=np.float64)
+    t = _research_diag_column(diag, "time")
+    fig = make_subplots(
+        rows=4,
+        cols=2,
+        specs=[
+            [{"type": "scattergl"}, {"type": "histogram"}],
+            [{"type": "scatter"}, {"type": "scatter"}],
+            [{"type": "scatter"}, {"type": "scatter"}],
+            [{"type": "scatter"}, {"type": "scatter"}],
+        ],
+        subplot_titles=[
+            "Final morphology",
+            "Final radius histogram",
+            "Nearest-neighbor distance floor",
+            "Hessian precision and q = dt Lambda",
+            "Continuous vs RK2 map residual",
+            "Disk/cross morphology scores",
+            "PP energy increments",
+            "Observed vs predicted shell scale",
+        ],
+        horizontal_spacing=0.10,
+        vertical_spacing=0.095,
+    )
+
+    morphology = make_final_morphology_figure(result, config)
+    for trace in morphology.data:
+        fig.add_trace(trace, row=1, col=1)
+
+    radius = np.linalg.norm(result.x_final - result.x_final.mean(axis=0, keepdims=True), axis=1)
+    fig.add_trace(go.Histogram(x=radius, nbinsx=60, name="radius", showlegend=False), row=1, col=2)
+    final_shell = float(_research_diag_column(diag, "rk2_shell_radius")[-1])
+    fig.add_vline(x=final_shell, line_dash="dash", line_color="#d62728", row=1, col=2)
+
+    for name, label in (
+        ("r_min", "r_min"),
+        ("r_nn_q01", "NN q01"),
+        ("r_nn_q05", "NN q05"),
+        ("r_nn_median", "NN median"),
+    ):
+        fig.add_trace(go.Scatter(x=t, y=_research_diag_column(diag, name), mode="lines+markers", name=label), row=2, col=1)
+
+    for name, label in (
+        ("lambda_max_max", "Lambda max"),
+        ("lambda_max_p99", "Lambda p99"),
+        ("q_max", "q max"),
+        ("q_p99", "q p99"),
+    ):
+        fig.add_trace(go.Scatter(x=t, y=_research_diag_column(diag, name), mode="lines+markers", name=label), row=2, col=2)
+    fig.add_hline(y=1.0, line_dash="dot", line_color="#555", row=2, col=2)
+    fig.add_hline(y=2.0, line_dash="dot", line_color="#999", row=2, col=2)
+
+    for name, label in (
+        ("R_cont_rms", "continuous RMS"),
+        ("R_cont_max", "continuous max"),
+        ("R_disc_rms", "RK2 map RMS"),
+        ("R_disc_max", "RK2 map max"),
+    ):
+        fig.add_trace(go.Scatter(x=t, y=_research_diag_column(diag, name), mode="lines+markers", name=label), row=3, col=1)
+
+    for name, label in (
+        ("disk_radius", "disk radius"),
+        ("boundary_mass_fraction", "boundary mass"),
+        ("axis_mass_fraction", "axis mass"),
+        ("fourfold_mode", "fourfold mode"),
+        ("hyperbola_score", "hyperbola score"),
+    ):
+        fig.add_trace(go.Scatter(x=t, y=_research_diag_column(diag, name), mode="lines+markers", name=label), row=3, col=2)
+
+    fig.add_trace(go.Scatter(x=t, y=_research_diag_column(diag, "energy"), mode="lines+markers", name="energy"), row=4, col=1)
+    fig.add_trace(go.Bar(x=t, y=_research_diag_column(diag, "delta_energy"), name="Delta energy"), row=4, col=1)
+
+    fig.add_trace(go.Scatter(x=t, y=_research_diag_column(diag, "disk_radius"), mode="lines+markers", name="observed disk radius"), row=4, col=2)
+    fig.add_trace(go.Scatter(x=t, y=_research_diag_column(diag, "rk2_shell_radius"), mode="lines", name="hK/[2(1-alpha)]", line=dict(dash="dash")), row=4, col=2)
+    fig.add_trace(go.Scatter(x=t, y=_research_diag_column(diag, "r_min"), mode="lines", name="r_min", line=dict(dash="dot")), row=4, col=2)
+
+    fig.update_xaxes(title_text="x1", range=[-config.domain_radius, config.domain_radius], scaleanchor="y", scaleratio=1, row=1, col=1)
+    fig.update_yaxes(title_text="x2", range=[-config.domain_radius, config.domain_radius], row=1, col=1)
+    fig.update_xaxes(title_text="radius", row=1, col=2)
+    for row in (2, 3, 4):
+        fig.update_xaxes(title_text="time", row=row, col=1)
+        fig.update_xaxes(title_text="time", row=row, col=2)
+    fig.update_yaxes(type="log", row=2, col=1)
+    fig.update_yaxes(type="log", row=2, col=2)
+    fig.update_yaxes(type="log", row=3, col=1)
+    fig.update_yaxes(type="log", row=4, col=2)
+    fig.update_layout(
+        title=dict(
+            text=(
+                "PP transient artifact diagnostics<br>"
+                f"<sup>integrator={config.integrator}, force={config.force_backend}, alpha={config.alpha:g}, "
+                f"K={resolve_pp_K(config.alpha, config.K):g}, h={config.dt:g}, grid={config.grid_size}, seed={config.seed}, "
+                f"center={config.center_each_step}, clip={config.clip_each_step}</sup>"
+            ),
+            x=0.5,
+        ),
+        width=1450,
+        height=1550,
+        template="plotly_white",
+        legend=dict(groupclick="togglegroup", itemsizing="constant"),
+    )
+    return fig
+
+
+def write_research_diagnostics(path: Path, diagnostics: Array) -> None:
+    with path.open("w") as f:
+        f.write(",".join(RESEARCH_DIAGNOSTIC_FIELDS) + "\n")
+        for row in diagnostics:
+            f.write(",".join(map(str, row)) + "\n")
+
+
+def summarize_research_run(result: ResearchSimulationResult, config: TransientResearchConfig) -> dict[str, object]:
+    """Compact JSON-friendly summary for sweep tables."""
+
+    dx = float(2.0 * config.domain_radius / config.grid_size)
+    K_eff = resolve_pp_K(config.alpha, config.K)
+    summary: dict[str, object] = {
+        "seed": int(config.seed),
+        "alpha": float(config.alpha),
+        "K": float(K_eff),
+        "K_config": None if config.K is None else float(config.K),
+        "delta": float(1.0 - config.alpha),
+        "inv_delta": float(1.0 / max(abs(1.0 - config.alpha), 1e-30)),
+        "dt": float(config.dt),
+        "grid_size": int(config.grid_size),
+        "dx": dx,
+        "domain_radius": float(config.domain_radius),
+        "n_particles": int(len(result.x_final)),
+        "n_fibers": int(len(result.initial.group_names)),
+        "force_backend": config.force_backend,
+        "integrator": config.integrator,
+        "center_each_step": bool(config.center_each_step),
+        "clip_each_step": bool(config.clip_each_step),
+        "steps": int(result.steps),
+        "final_time": float(result.final_time),
+        "runtime_seconds": float(result.runtime_seconds),
+        "rms_residual": float(result.rms_residual),
+        "max_residual": float(result.max_residual),
+        "field_evaluations": int(result.field_evaluations),
+        "accepted_steps": int(result.accepted_steps),
+        "rejected_steps": int(result.rejected_steps),
+        "clip_events": int(result.clip_events),
+        "dt_min_observed": float(result.dt_min_observed),
+        "dt_max_observed": float(result.dt_max_observed),
+        "dt_mean": float(result.dt_mean),
+    }
+    morphology = compute_morphology_metrics(result.x_final, grid_dx=dx)
+    summary.update({f"final_{key}": float(value) for key, value in morphology.items()})
+    if result.research_diagnostics is not None and len(result.research_diagnostics):
+        diag = np.asarray(result.research_diagnostics, dtype=np.float64)
+        last = diag[-1]
+        for name, value in zip(RESEARCH_DIAGNOSTIC_FIELDS, last, strict=True):
+            summary[f"last_{name}"] = float(value)
+        for name in ("q_max", "q_p99", "lambda_max_max", "R_cont_rms", "R_disc_rms", "energy"):
+            values = _research_diag_column(diag, name)
+            if name == "energy":
+                summary[f"min_{name}"] = float(np.nanmin(values))
+                summary[f"max_{name}"] = float(np.nanmax(values))
+            else:
+                summary[f"max_{name}"] = float(np.nanmax(values))
+        delta_e = _research_diag_column(diag, "delta_energy")
+        summary["energy_increase_fraction"] = float(np.mean(delta_e > 1e-12)) if len(delta_e) else 0.0
+    return summary
+
+
+def save_research_run_outputs(
+    result: ResearchSimulationResult,
+    config: TransientResearchConfig,
+    out_dir: Path | str,
+    *,
+    initial: InitialCondition | None = None,
+) -> dict[str, object]:
+    """Save lightweight per-run artifacts for parameter sweeps."""
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    summary = summarize_research_run(result, config)
+    (out / "config.json").write_text(json.dumps(_config_to_json(config), indent=2))
+    (out / "metrics.json").write_text(json.dumps(_jsonable(summary), indent=2))
+    write_time_diagnostics(out / "time_diagnostics.csv", result.diagnostics)
+    if result.research_diagnostics is not None:
+        write_research_diagnostics(out / "research_diagnostics.csv", result.research_diagnostics)
+    if initial is not None:
+        np.savez_compressed(
+            out / "initial_condition.npz",
+            x=initial.x.astype(np.float32),
+            omega=initial.omega.astype(np.float32),
+            group_id=initial.group_id.astype(np.int32),
+            omega_atoms=initial.omega_atoms.astype(np.float32),
+            group_names=np.array(initial.group_names),
+        )
+    np.savez_compressed(
+        out / "run_state.npz",
+        x_initial=result.x_initial.astype(np.float32),
+        x_final=result.x_final.astype(np.float32),
+        omega=result.initial.omega.astype(np.float32),
+        group_id=result.initial.group_id.astype(np.int32),
+        A_final=result.A_final.astype(np.float32),
+        residual=result.residual.astype(np.float32),
+        diagnostics=result.diagnostics.astype(np.float64),
+        research_diagnostics=(
+            np.empty((0, len(RESEARCH_DIAGNOSTIC_FIELDS)), dtype=np.float64)
+            if result.research_diagnostics is None
+            else result.research_diagnostics.astype(np.float64)
+        ),
+    )
+    make_final_morphology_figure(result, config).write_html(str(out / FINAL_MORPHOLOGY_FILENAME), include_plotlyjs="cdn")
+    if result.research_diagnostics is not None and len(result.research_diagnostics):
+        make_research_diagnostics_dashboard(result, config).write_html(str(out / RESEARCH_DASHBOARD_FILENAME), include_plotlyjs="cdn")
+    return summary
+
+
+def _default_research_sweep_values(sweep: str) -> tuple[object, ...]:
+    if sweep == "timestep":
+        return (0.09, 0.055, 0.03, 0.015, 0.0075, 0.00375)
+    if sweep == "alpha":
+        return (0.95, 0.97, 0.98, 0.99, 0.995)
+    if sweep == "k_renormalization":
+        return ("1", "delta", "sqrt_delta", "0.5delta", "2delta")
+    if sweep == "grid":
+        return (128, 256, 512)
+    if sweep == "domain":
+        return (3.0, 4.0, 6.0, 8.0, 12.0)
+    if sweep == "particles":
+        return (25, 50, 100, 200, 500)
+    if sweep == "integrator_backend":
+        return (
+            ("fft", "fixed_rk2"),
+            ("fft", "adaptive_rk2"),
+            ("direct", "fixed_rk2"),
+            ("direct", "adaptive_rk2"),
+        )
+    raise ValueError(f"unknown research sweep {sweep!r}")
+
+
+def _research_sweep_config(base: TransientResearchConfig, sweep: str, value: object) -> TransientResearchConfig:
+    if sweep == "timestep":
+        return replace(base, dt=float(value), integrator="fixed_rk2", dt_max=max(float(value), base.dt_max))
+    if sweep == "alpha":
+        return replace(base, alpha=float(value))
+    if sweep == "k_renormalization":
+        delta = max(abs(1.0 - float(base.alpha)), 1e-30)
+        label = str(value)
+        if label == "1":
+            K = 1.0
+        elif label == "delta":
+            K = delta
+        elif label == "sqrt_delta":
+            K = float(np.sqrt(delta))
+        elif label == "0.5delta":
+            K = 0.5 * delta
+        elif label == "2delta":
+            K = 2.0 * delta
+        else:
+            K = float(value)  # type: ignore[arg-type]
+        return replace(base, K=K)
+    if sweep == "grid":
+        return replace(base, grid_size=int(value))
+    if sweep == "domain":
+        return replace(base, domain_radius=float(value))
+    if sweep == "particles":
+        return replace(base, n_per_fiber=int(value))
+    if sweep == "integrator_backend":
+        force_backend, integrator = value  # type: ignore[misc]
+        return replace(base, force_backend=force_backend, integrator=integrator)  # type: ignore[arg-type]
+    raise ValueError(f"unknown research sweep {sweep!r}")
+
+
+def _slugify_sweep_value(value: object) -> str:
+    if isinstance(value, tuple):
+        return "_".join(_slugify_sweep_value(part) for part in value)
+    text = str(value).replace(".", "p").replace("-", "m")
+    return "".join(ch if ch.isalnum() or ch in ("_", "p", "m") else "_" for ch in text)
+
+
+def _same_particle_layout(a: SimulationConfig, b: SimulationConfig) -> bool:
+    return (
+        a.n_fibers == b.n_fibers
+        and a.n_per_fiber == b.n_per_fiber
+        and a.fibers == b.fibers
+        and tuple(a.shape_names) == tuple(b.shape_names)
+        and a.seed == b.seed
+    )
+
+
+def write_sweep_metrics_csv(path: Path, summaries: Sequence[dict[str, object]]) -> None:
+    if not summaries:
+        path.write_text("")
+        return
+    keys: list[str] = []
+    for summary in summaries:
+        for key in summary:
+            if key not in keys:
+                keys.append(key)
+    with path.open("w") as f:
+        f.write(",".join(keys) + "\n")
+        for summary in summaries:
+            f.write(",".join(str(summary.get(key, "")) for key in keys) + "\n")
+
+
+def make_sweep_summary_figure(summaries: Sequence[dict[str, object]], *, sweep: str) -> go.Figure:
+    if not summaries:
+        raise ValueError("cannot plot an empty sweep")
+    if sweep == "timestep":
+        x_key = "dt"
+        x_title = "fixed timestep h"
+    elif sweep == "alpha":
+        x_key = "inv_delta"
+        x_title = "1 / |1 - alpha|"
+    elif sweep == "grid":
+        x_key = "dx"
+        x_title = "grid spacing dx"
+    elif sweep == "domain":
+        x_key = "domain_radius"
+        x_title = "domain radius"
+    elif sweep == "particles":
+        x_key = "n_particles"
+        x_title = "particle count"
+    else:
+        x_key = "case_index"
+        x_title = "case"
+
+    x_vals = np.arange(len(summaries), dtype=np.float64) if x_key == "case_index" else np.array([float(s[x_key]) for s in summaries])
+    labels = [str(s.get("case_label", i)) for i, s in enumerate(summaries)]
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=[
+            "Disk radius and predicted shell",
+            "Stiffness q",
+            "Continuous/discrete residual",
+            "Disk/cross scores",
+        ],
+        horizontal_spacing=0.10,
+        vertical_spacing=0.12,
+    )
+    disk = np.array([float(s.get("last_disk_radius", s.get("final_disk_radius", np.nan))) for s in summaries])
+    shell = np.array([float(s.get("last_rk2_shell_radius", np.nan)) for s in summaries])
+    fig.add_trace(go.Scatter(x=x_vals, y=disk, text=labels, mode="markers+lines", name="observed disk radius"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x_vals, y=shell, text=labels, mode="markers+lines", name="predicted RK2 shell", line=dict(dash="dash")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x_vals, y=[float(s.get("max_q_max", np.nan)) for s in summaries], text=labels, mode="markers+lines", name="max q"), row=1, col=2)
+    fig.add_trace(go.Scatter(x=x_vals, y=[float(s.get("max_q_p99", np.nan)) for s in summaries], text=labels, mode="markers+lines", name="max q p99"), row=1, col=2)
+    fig.add_hline(y=1.0, line_dash="dot", line_color="#555", row=1, col=2)
+    fig.add_hline(y=2.0, line_dash="dot", line_color="#999", row=1, col=2)
+    fig.add_trace(go.Scatter(x=x_vals, y=[float(s.get("last_R_cont_rms", np.nan)) for s in summaries], text=labels, mode="markers+lines", name="continuous RMS"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=x_vals, y=[float(s.get("last_R_disc_rms", np.nan)) for s in summaries], text=labels, mode="markers+lines", name="RK2 map RMS"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=x_vals, y=[float(s.get("last_boundary_mass_fraction", np.nan)) for s in summaries], text=labels, mode="markers+lines", name="boundary mass"), row=2, col=2)
+    fig.add_trace(go.Scatter(x=x_vals, y=[float(s.get("last_axis_mass_fraction", np.nan)) for s in summaries], text=labels, mode="markers+lines", name="axis mass"), row=2, col=2)
+    fig.add_trace(go.Scatter(x=x_vals, y=[float(s.get("last_fourfold_mode", np.nan)) for s in summaries], text=labels, mode="markers+lines", name="fourfold mode"), row=2, col=2)
+    for row in (1, 2):
+        for col in (1, 2):
+            fig.update_xaxes(title_text=x_title, row=row, col=col)
+    fig.update_yaxes(type="log", row=1, col=2)
+    fig.update_yaxes(type="log", row=2, col=1)
+    fig.update_layout(
+        title=dict(text=f"PP research sweep summary: {sweep}", x=0.5),
+        width=1250,
+        height=900,
+        template="plotly_white",
+        legend=dict(groupclick="togglegroup", itemsizing="constant"),
+    )
+    return fig
+
+
+def make_sweep_morphology_grid(
+    cases: Sequence[tuple[ResearchSimulationResult, TransientResearchConfig, dict[str, object]]],
+    *,
+    sweep: str,
+    columns: int = 3,
+) -> go.Figure:
+    if not cases:
+        raise ValueError("cannot plot an empty sweep")
+    columns = max(1, int(columns))
+    rows = int(np.ceil(len(cases) / columns))
+    titles = [str(summary.get("case_label", i)) for i, (_, _, summary) in enumerate(cases)]
+    fig = make_subplots(rows=rows, cols=columns, subplot_titles=titles, horizontal_spacing=0.05, vertical_spacing=0.09)
+    for case_idx, (result, config, _) in enumerate(cases):
+        row = case_idx // columns + 1
+        col = case_idx % columns + 1
+        colors = fiber_colors(config, result.initial.omega_atoms, len(result.initial.group_names))
+        for k in range(len(result.initial.group_names)):
+            idx = np.where(result.initial.group_id == k)[0]
+            if len(idx) == 0:
+                continue
+            if len(idx) > config.max_plot_points_per_group:
+                rng = np.random.default_rng(config.seed + 101 * case_idx + k)
+                idx = np.sort(rng.choice(idx, size=config.max_plot_points_per_group, replace=False))
+            fig.add_trace(
+                go.Scattergl(
+                    x=result.x_final[idx, 0],
+                    y=result.x_final[idx, 1],
+                    mode="markers",
+                    marker=dict(size=3.2, color=colors[k], opacity=0.70),
+                    showlegend=False,
+                ),
+                row=row,
+                col=col,
+            )
+        scale_y = "y" if case_idx == 0 else f"y{case_idx + 1}"
+        fig.update_xaxes(range=[-config.domain_radius, config.domain_radius], scaleanchor=scale_y, scaleratio=1, row=row, col=col)
+        fig.update_yaxes(range=[-config.domain_radius, config.domain_radius], row=row, col=col)
+    fig.update_layout(
+        title=dict(text=f"Final morphology grid: {sweep}", x=0.5),
+        width=420 * columns,
+        height=390 * rows + 90,
+        template="plotly_white",
+    )
+    return fig
+
+
+def run_pp_research_sweep(
+    base_config: TransientResearchConfig,
+    sweep: str,
+    values: Sequence[object] | None = None,
+    *,
+    out_dir: Path | str | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> list[dict[str, object]]:
+    """Run a structured transient-artifact sweep and save diagnostics/figures."""
+
+    sweep_values = tuple(_default_research_sweep_values(sweep) if values is None else values)
+    root = Path(out_dir) if out_dir is not None else Path(base_config.out_dir) / f"research_{sweep}_sweep"
+    root.mkdir(parents=True, exist_ok=True)
+    base = replace(
+        base_config,
+        record_research_diagnostics=True,
+        make_dashboard=False,
+        make_animation=False,
+        backend="numpy" if base_config.force_backend == "direct" else base_config.backend,
+    )
+    base_initial = make_initial_condition(base)
+    np.savez_compressed(
+        root / "base_initial_condition.npz",
+        x=base_initial.x.astype(np.float32),
+        omega=base_initial.omega.astype(np.float32),
+        group_id=base_initial.group_id.astype(np.int32),
+        omega_atoms=base_initial.omega_atoms.astype(np.float32),
+        group_names=np.array(base_initial.group_names),
+    )
+
+    summaries: list[dict[str, object]] = []
+    cases: list[tuple[ResearchSimulationResult, TransientResearchConfig, dict[str, object]]] = []
+    for case_index, value in enumerate(sweep_values):
+        cfg = _research_sweep_config(base, sweep, value)
+        cfg = replace(
+            cfg,
+            record_research_diagnostics=True,
+            make_dashboard=False,
+            make_animation=False,
+            out_dir=root / f"case_{case_index:02d}_{_slugify_sweep_value(value)}",
+        )
+        initial = base_initial if _same_particle_layout(base, cfg) else make_initial_condition(cfg)
+        result = run_research_simulation(cfg, initial, cancel_check=cancel_check)
+        summary = save_research_run_outputs(result, cfg, cfg.out_dir, initial=initial)
+        summary["case_index"] = int(case_index)
+        summary["case_value"] = str(value)
+        summary["case_label"] = f"{sweep}={value}"
+        summaries.append(summary)
+        cases.append((result, cfg, summary))
+
+    (root / "sweep_metrics.json").write_text(json.dumps(_jsonable(summaries), indent=2))
+    write_sweep_metrics_csv(root / "sweep_metrics.csv", summaries)
+    make_sweep_summary_figure(summaries, sweep=sweep).write_html(str(root / "sweep_summary.html"), include_plotlyjs="cdn")
+    make_sweep_morphology_grid(cases, sweep=sweep).write_html(str(root / "morphology_grid.html"), include_plotlyjs="cdn")
+    return summaries
+
+
+def _k_scale_csv(path: Path, rows: Sequence[dict[str, object]]) -> None:
+    if not rows:
+        path.write_text("")
+        return
+    keys: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in keys:
+                keys.append(key)
+    with path.open("w") as f:
+        f.write(",".join(keys) + "\n")
+        for row in rows:
+            f.write(",".join(str(row.get(key, "")) for key in keys) + "\n")
+
+
+def _k_scale_boundary_summary(result: ResearchSimulationResult, config: TransientResearchConfig) -> dict[str, float | bool]:
+    trajectory = result.trajectory_x
+    if trajectory is None:
+        trajectory = result.x_final[None, :, :]
+    traj = np.asarray(trajectory, dtype=np.float64)
+    max_abs = float(np.max(np.abs(traj))) if traj.size else 0.0
+    boundary_fraction = max_abs / max(float(config.domain_radius), 1e-30)
+    scale_values = np.array([_cloud_halfwidth(frame, q=0.9975, pad=1.0, floor=1e-12) for frame in traj], dtype=np.float64)
+    return {
+        "max_abs_coordinate": max_abs,
+        "max_boundary_fraction": float(boundary_fraction),
+        "transient_scale_max": float(np.max(scale_values)) if scale_values.size else float("nan"),
+        "boundary_clip_hit": bool(result.clip_events > 0),
+    }
+
+
+def _plot_k_scale_calibration(root: Path, selected_rows: Sequence[dict[str, object]], aggregate_rows: Sequence[dict[str, object]]) -> None:
+    if not selected_rows:
+        return
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    alphas = np.array([float(row["alpha"]) for row in aggregate_rows], dtype=np.float64)
+    median_k = np.array([float(row["median_selected_K"]) for row in aggregate_rows], dtype=np.float64)
+    median_deviation = np.array([float(row["median_selected_deviation"]) for row in aggregate_rows], dtype=np.float64)
+    ok_counts = np.array([int(row["selected_seed_count"]) for row in aggregate_rows], dtype=np.int64)
+
+    order = np.argsort(alphas)
+    fig, ax = plt.subplots(figsize=(8.5, 5.0), dpi=160)
+    ax.plot(alphas[order], median_k[order], marker="o", linewidth=1.6)
+    ax.set_xlabel("alpha")
+    ax.set_ylabel("selected K")
+    ax.set_title("Adaptive K-deviation calibration")
+    ax.grid(True, alpha=0.25)
+    for x, y, n in zip(alphas[order], median_k[order], ok_counts[order], strict=True):
+        ax.annotate(f"n={n}", (x, y), textcoords="offset points", xytext=(0, 7), ha="center", fontsize=7)
+    fig.tight_layout()
+    _save_experiment_png(fig, root / "k_opt_vs_alpha.png", dpi=180)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.0), dpi=160)
+    ax.plot(alphas[order], median_deviation[order], marker="o", linewidth=1.6, color="#b35c00")
+    ax.set_xlabel("alpha")
+    ax.set_ylabel("selected deviation from K_baseline")
+    ax.set_title("Deviation from selected baseline K(alpha)")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    _save_experiment_png(fig, root / "k_deviation_vs_alpha.png", dpi=180)
+    plt.close(fig)
+
+
+def _fixed_traction_K(alpha: float, *, reference_alpha: float, reference_K: float) -> float:
+    denom = 1.0 - float(reference_alpha)
+    if denom <= 0.0:
+        raise ValueError("reference_alpha must be < 1 for fixed-traction K calibration")
+    delta = 1.0 - float(alpha)
+    if delta <= 0.0:
+        raise ValueError("K-scale calibration currently expects alpha < 1")
+    return float(reference_K) * delta / denom
+
+
+def _estimate_scale_crossing(rows: Sequence[dict[str, object]]) -> tuple[float | None, float | None]:
+    safe = sorted(
+        (row for row in rows if bool(row["evolved_enough"]) and np.isfinite(float(row["scale_error_log"]))),
+        key=lambda row: float(row["K_deviation"]),
+    )
+    if not safe:
+        return None, None
+    for left, right in zip(safe[:-1], safe[1:], strict=False):
+        y0 = float(left["scale_error_log"])
+        y1 = float(right["scale_error_log"])
+        if y0 == 0.0:
+            return float(left["K_deviation"]), float(left["K"])
+        if y0 * y1 > 0.0:
+            continue
+        log_d0 = np.log(float(left["K_deviation"]))
+        log_d1 = np.log(float(right["K_deviation"]))
+        if y1 == y0:
+            log_d = 0.5 * (log_d0 + log_d1)
+        else:
+            log_d = log_d0 - y0 * (log_d1 - log_d0) / (y1 - y0)
+        deviation = float(np.exp(log_d))
+        baseline = float(left["K_baseline"])
+        return deviation, float(baseline * deviation)
+    best = min(safe, key=lambda row: float(row["abs_scale_error_log"]))
+    return float(best["K_deviation"]), float(best["K"])
+
+
+def _k_scale_row_usable(row: dict[str, object]) -> bool:
+    return (
+        not bool(row["boundary_hit"])
+        and bool(row["evolved_enough"])
+        and np.isfinite(float(row["scale_error_log"]))
+    )
+
+
+def _k_scale_row_contracting(row: dict[str, object]) -> bool:
+    return _k_scale_row_usable(row) and float(row["scale_error_log"]) <= 0.0
+
+
+def _k_scale_row_search_status(row: dict[str, object]) -> Literal["safe_contracting", "safe_expanding", "unsafe"]:
+    if _k_scale_row_contracting(row):
+        return "safe_contracting"
+    if _k_scale_row_usable(row):
+        return "safe_expanding"
+    return "unsafe"
+
+
+class _TextProgress:
+    def __init__(self, total: int, *, label: str = "simulations") -> None:
+        self.total = max(0, int(total))
+        self.label = label
+        self.count = 0
+
+    def __enter__(self) -> "_TextProgress":
+        if self.total:
+            print(f"{self.label}: 0/{self.total}", flush=True)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.total:
+            print(f"{self.label}: {self.count}/{self.total}", flush=True)
+
+    def update(self, n: int = 1) -> None:
+        self.count += int(n)
+        if self.total and (self.count == self.total or self.count % max(1, self.total // 20) == 0):
+            print(f"{self.label}: {self.count}/{self.total}", flush=True)
+
+
+def run_k_scale_calibration(
+    out_dir: Path | str,
+    *,
+    base_config: TransientResearchConfig | dict[str, Any] | None = None,
+    alphas: Sequence[float] | None = None,
+    alpha_delta_min: float = 0.005,
+    alpha_delta_max: float = 0.5,
+    alpha_count: int = 9,
+    seeds: Sequence[int] = (2026, 2027, 2028),
+    reference_alpha: float = 0.99,
+    reference_K: float = 1.0,
+    baseline: Literal["current_auto", "fixed_traction"] = "current_auto",
+    deviation_min: float = 0.03125,
+    deviation_max: float = 1.0,
+    search_points_per_iteration: int = 5,
+    search_iterations: int = 3,
+    bracket_multiplier: float = 2.0,
+    max_bracket_iterations: int = 10,
+    boundary_hit_fraction: float = 0.985,
+    min_final_time: float = 2.0,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[str, object]:
+    """Calibrate the multiplicative deviation around a baseline K relationship."""
+    _ = search_points_per_iteration  # Accepted for older YAML files; no grid is used.
+
+    root = Path(out_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    if base_config is None:
+        base = TransientResearchConfig()
+    elif isinstance(base_config, TransientResearchConfig):
+        base = base_config
+    else:
+        base = TransientResearchConfig(**dict(base_config))
+
+    if alphas is None:
+        deltas = np.geomspace(float(alpha_delta_max), float(alpha_delta_min), int(alpha_count))
+        alpha_values = tuple(float(1.0 - delta) for delta in deltas)
+    else:
+        alpha_values = tuple(float(alpha) for alpha in alphas)
+    seed_values = tuple(int(seed) for seed in seeds)
+
+    run_rows: list[dict[str, object]] = []
+    selected_rows: list[dict[str, object]] = []
+    aggregate_rows: list[dict[str, object]] = []
+    estimated_total = len(alpha_values) * len(seed_values) * (
+        1 + max(0, int(max_bracket_iterations)) + max(0, int(search_iterations))
+    )
+    progress_context: Any
+    if tqdm is not None:
+        progress_context = tqdm(total=estimated_total, desc="K-scale sims", unit="sim")
+    else:
+        progress_context = _TextProgress(estimated_total, label="K-scale sims")
+
+    with progress_context as progress:
+        for alpha_index, alpha in enumerate(alpha_values):
+            for seed in seed_values:
+                seed_base = replace(
+                    base,
+                    alpha=float(alpha),
+                    K=None,
+                    seed=int(seed),
+                    integrator=base.integrator,
+                    make_dashboard=False,
+                    make_animation=True,
+                    backend="numpy" if base.force_backend == "direct" else base.backend,
+                    out_dir=root / f"alpha_{alpha_index:02d}_seed_{seed}",
+                )
+                initial = make_initial_condition(seed_base)
+                K_current_auto = resolve_pp_K(alpha, None)
+                K_fixed_traction = _fixed_traction_K(
+                    alpha, reference_alpha=float(reference_alpha), reference_K=float(reference_K)
+                )
+                if baseline == "current_auto":
+                    K_baseline = K_current_auto
+                elif baseline == "fixed_traction":
+                    K_baseline = K_fixed_traction
+                else:
+                    raise ValueError("baseline must be 'current_auto' or 'fixed_traction'")
+
+                candidates: list[dict[str, object]] = []
+                evaluated: dict[float, dict[str, object]] = {}
+
+                def evaluate_deviation(deviation: float, *, phase: str, iteration: int) -> dict[str, object]:
+                    if cancel_check is not None and cancel_check():
+                        raise InterruptedError("K-scale calibration cancelled.")
+                    bounded_deviation = float(np.clip(float(deviation), float(deviation_min), float(deviation_max)))
+                    deviation_key = round(bounded_deviation, 14)
+                    if deviation_key in evaluated:
+                        return evaluated[deviation_key]
+
+                    K_value = float(K_baseline * bounded_deviation)
+                    cfg = replace(seed_base, K=K_value)
+                    result = run_research_simulation(cfg, initial, cancel_check=cancel_check)
+                    initial_scale = _cloud_halfwidth(result.x_initial, q=0.9975, pad=1.0, floor=1e-12)
+                    final_scale = _cloud_halfwidth(result.x_final, q=0.9975, pad=1.0, floor=1e-12)
+                    boundary = _k_scale_boundary_summary(result, cfg)
+                    boundary_hit = bool(boundary["boundary_clip_hit"]) or float(boundary["max_boundary_fraction"]) >= float(boundary_hit_fraction)
+                    evolved_enough = float(result.final_time) >= float(min_final_time)
+                    scale_ratio = float(final_scale / max(initial_scale, 1e-30))
+                    scale_error_log = float(np.log(max(scale_ratio, 1e-30)))
+                    row: dict[str, object] = {
+                        "phase": str(phase),
+                        "iteration": int(iteration),
+                        "alpha": float(alpha),
+                        "delta": float(1.0 - alpha),
+                        "seed": int(seed),
+                        "K_current_auto": float(K_current_auto),
+                        "K_fixed_traction": float(K_fixed_traction),
+                        "K_baseline": float(K_baseline),
+                        "K_deviation": bounded_deviation,
+                        "K": float(K_value),
+                        "boundary_hit": bool(boundary_hit),
+                        "evolved_enough": bool(evolved_enough),
+                        "contracting": bool(scale_error_log <= 0.0),
+                        "usable_contracting": False,
+                        "clip_events": int(result.clip_events),
+                        "steps": int(result.steps),
+                        "final_time": float(result.final_time),
+                        "rms_residual": float(result.rms_residual),
+                        "initial_scale": float(initial_scale),
+                        "final_scale": float(final_scale),
+                        "final_to_initial_scale": scale_ratio,
+                        "scale_error_log": scale_error_log,
+                        "abs_scale_error_log": abs(scale_error_log),
+                        "dt_mean": float(result.dt_mean),
+                        "dt_min_observed": float(result.dt_min_observed),
+                        "dt_max_observed": float(result.dt_max_observed),
+                        **boundary,
+                    }
+                    row["usable_contracting"] = _k_scale_row_contracting(row)
+                    row["search_status"] = _k_scale_row_search_status(row)
+                    run_rows.append(row)
+                    candidates.append(row)
+                    evaluated[deviation_key] = row
+                    progress.update(1)
+                    return row
+
+                multiplier = max(1.01, float(bracket_multiplier))
+                start_deviation = float(np.clip(1.0, float(deviation_min), float(deviation_max)))
+                start_row = evaluate_deviation(start_deviation, phase="start", iteration=0)
+                expanding_low: dict[str, object] | None = None
+                contracting_high: dict[str, object] | None = None
+                unsafe_high: dict[str, object] | None = None
+
+                start_status = _k_scale_row_search_status(start_row)
+                if start_status == "safe_contracting":
+                    contracting_high = start_row
+                    direction = "down"
+                elif start_status == "safe_expanding":
+                    expanding_low = start_row
+                    direction = "up"
+                else:
+                    unsafe_high = start_row
+                    direction = "down"
+
+                current = start_deviation
+                for iteration in range(max(0, int(max_bracket_iterations))):
+                    if direction == "down":
+                        if current <= float(deviation_min) * (1.0 + 1e-12):
+                            break
+                        current = max(float(deviation_min), current / multiplier)
+                        row = evaluate_deviation(current, phase="bracket_down", iteration=iteration + 1)
+                    else:
+                        if current >= float(deviation_max) * (1.0 - 1e-12):
+                            break
+                        current = min(float(deviation_max), current * multiplier)
+                        row = evaluate_deviation(current, phase="bracket_up", iteration=iteration + 1)
+
+                    status = _k_scale_row_search_status(row)
+                    if direction == "down":
+                        if status == "safe_contracting":
+                            contracting_high = row
+                            continue
+                        if status == "safe_expanding":
+                            expanding_low = row
+                            break
+                        unsafe_high = row
+                        if contracting_high is not None:
+                            break
+                    else:
+                        if status == "safe_expanding":
+                            expanding_low = row
+                            continue
+                        if status == "safe_contracting":
+                            contracting_high = row
+                            break
+                        unsafe_high = row
+                        break
+
+                for iteration in range(max(0, int(search_iterations))):
+                    if expanding_low is not None and contracting_high is not None:
+                        low_dev = float(expanding_low["K_deviation"])
+                        high_dev = float(contracting_high["K_deviation"])
+                        phase = "refine_contracting_edge"
+                    elif expanding_low is not None and unsafe_high is not None:
+                        low_dev = float(expanding_low["K_deviation"])
+                        high_dev = float(unsafe_high["K_deviation"])
+                        phase = "discover_safe_contraction"
+                    else:
+                        break
+                    if low_dev <= 0.0 or high_dev <= 0.0 or low_dev >= high_dev:
+                        break
+                    mid_dev = float(np.exp(0.5 * (np.log(low_dev) + np.log(high_dev))))
+                    row = evaluate_deviation(mid_dev, phase=phase, iteration=iteration + 1)
+                    status = _k_scale_row_search_status(row)
+                    if status == "safe_contracting":
+                        contracting_high = row
+                    elif status == "safe_expanding":
+                        expanding_low = row
+                    else:
+                        unsafe_high = row
+
+                contracting_rows = [row for row in candidates if _k_scale_row_contracting(row)]
+                selected = min(contracting_rows, key=lambda row: float(row["K_deviation"])) if contracting_rows else None
+                if selected is not None:
+                    critical_deviation, critical_K = _estimate_scale_crossing(candidates)
+                    selected_row = dict(selected)
+                    selected_row["selected"] = True
+                    selected_row["critical_deviation"] = critical_deviation
+                    selected_row["critical_K"] = critical_K
+                    selected_rows.append(selected_row)
+
+            alpha_selected = [row for row in selected_rows if float(row["alpha"]) == float(alpha)]
+            if alpha_selected:
+                aggregate_rows.append(
+                    {
+                        "alpha": float(alpha),
+                        "delta": float(1.0 - alpha),
+                        "selected_seed_count": int(len(alpha_selected)),
+                        "median_selected_K": float(np.median([float(row["K"]) for row in alpha_selected])),
+                        "mean_selected_K": float(np.mean([float(row["K"]) for row in alpha_selected])),
+                        "median_K_baseline": float(np.median([float(row["K_baseline"]) for row in alpha_selected])),
+                        "median_K_fixed_traction": float(np.median([float(row["K_fixed_traction"]) for row in alpha_selected])),
+                        "median_K_current_auto": float(np.median([float(row["K_current_auto"]) for row in alpha_selected])),
+                        "median_selected_deviation": float(np.median([float(row["K_deviation"]) for row in alpha_selected])),
+                        "mean_selected_deviation": float(np.mean([float(row["K_deviation"]) for row in alpha_selected])),
+                        "median_critical_K": float(
+                            np.median([float(row["critical_K"]) for row in alpha_selected if row["critical_K"] is not None])
+                        ),
+                        "median_critical_deviation": float(
+                            np.median(
+                                [
+                                    float(row["critical_deviation"])
+                                    for row in alpha_selected
+                                    if row["critical_deviation"] is not None
+                                ]
+                            )
+                        ),
+                        "median_final_scale": float(np.median([float(row["final_scale"]) for row in alpha_selected])),
+                        "median_final_to_initial_scale": float(
+                            np.median([float(row["final_to_initial_scale"]) for row in alpha_selected])
+                        ),
+                        "median_abs_scale_error_log": float(
+                            np.median([float(row["abs_scale_error_log"]) for row in alpha_selected])
+                        ),
+                    }
+                )
+            else:
+                aggregate_rows.append(
+                    {
+                        "alpha": float(alpha),
+                        "delta": float(1.0 - alpha),
+                        "selected_seed_count": 0,
+                        "median_selected_K": float("nan"),
+                        "mean_selected_K": float("nan"),
+                        "median_K_baseline": float("nan"),
+                        "median_K_fixed_traction": float(
+                            _fixed_traction_K(alpha, reference_alpha=float(reference_alpha), reference_K=float(reference_K))
+                        ),
+                        "median_K_current_auto": float(resolve_pp_K(alpha, None)),
+                        "median_selected_deviation": float("nan"),
+                        "mean_selected_deviation": float("nan"),
+                        "median_critical_K": float("nan"),
+                        "median_critical_deviation": float("nan"),
+                        "median_final_scale": float("nan"),
+                        "median_final_to_initial_scale": float("nan"),
+                        "median_abs_scale_error_log": float("nan"),
+                    }
+                )
+
+    result_summary: dict[str, object] = {
+        "experiment": "k_scale_calibration",
+        "out_dir": str(root),
+        "alpha_count": int(len(alpha_values)),
+        "seed_count": int(len(seed_values)),
+        "reference_alpha": float(reference_alpha),
+        "reference_K": float(reference_K),
+        "baseline": str(baseline),
+        "deviation_min": float(deviation_min),
+        "deviation_max": float(deviation_max),
+        "search_policy": "multiplicative_bracket_refine",
+        "bracket_multiplier": float(bracket_multiplier),
+        "max_bracket_iterations": int(max_bracket_iterations),
+        "search_iterations": int(search_iterations),
+        "alphas": list(alpha_values),
+        "seeds": list(seed_values),
+        "boundary_hit_fraction": float(boundary_hit_fraction),
+        "min_final_time": float(min_final_time),
+        "aggregate": aggregate_rows,
+    }
+    (root / "k_scale_runs.json").write_text(json.dumps(_jsonable(run_rows), indent=2))
+    (root / "k_scale_selected.json").write_text(json.dumps(_jsonable(selected_rows), indent=2))
+    (root / "k_scale_aggregate.json").write_text(json.dumps(_jsonable(aggregate_rows), indent=2))
+    (root / "summary.json").write_text(json.dumps(_jsonable(result_summary), indent=2))
+    _k_scale_csv(root / "k_scale_runs.csv", run_rows)
+    _k_scale_csv(root / "k_scale_selected.csv", selected_rows)
+    _k_scale_csv(root / "k_scale_aggregate.csv", aggregate_rows)
+    _plot_k_scale_calibration(root, selected_rows, aggregate_rows)
+    return result_summary
+
+
+def _long_cross_point_colors(config: TransientResearchConfig, result: ResearchSimulationResult) -> Array:
+    colors = np.array(fiber_colors(config, result.initial.omega_atoms, len(result.initial.group_names)))
+    return colors[result.initial.group_id]
+
+
+def _cloud_halfwidth(x: Array, q: float = 0.995, pad: float = 1.25, floor: float = 1e-8) -> float:
+    rel = np.asarray(x, dtype=np.float64) - np.mean(x, axis=0, keepdims=True)
+    r = np.linalg.norm(rel, axis=1)
+    return max(float(floor), float(pad * np.quantile(r, q)))
+
+
+def _smooth_delayed_zoom_scales(
+    raw_scales: Sequence[float],
+    *,
+    smoothing_radius: int = 2,
+    delay_frames: int = 4,
+) -> Array:
+    """Smooth dynamic zoom half-widths and delay zoom-in to avoid visual jitter."""
+
+    raw = np.asarray(raw_scales, dtype=np.float64)
+    if raw.ndim != 1:
+        raise ValueError("raw_scales must be one-dimensional")
+    if len(raw) == 0:
+        return raw
+    if not np.all(np.isfinite(raw)):
+        raise ValueError("raw_scales must be finite")
+    raw = np.maximum(raw, 1e-12)
+
+    radius = max(0, int(smoothing_radius))
+    if radius > 0 and len(raw) > 1:
+        offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+        weights = radius + 1.0 - np.abs(offsets)
+        weights = weights / np.sum(weights)
+        padded = np.pad(raw, (radius, radius), mode="edge")
+        smoothed = np.convolve(padded, weights, mode="valid")
+    else:
+        smoothed = raw.copy()
+
+    delay = max(0, int(delay_frames))
+    delayed = np.empty_like(smoothed)
+    for i in range(len(smoothed)):
+        delayed[i] = smoothed[max(0, i - delay)]
+
+    # Never let the delayed axis clip the current frame if the cloud expands.
+    return np.maximum(delayed, raw)
+
+
+def _long_cross_prefix(max_steps: int) -> str:
+    return f"fig_long_{int(max_steps)}"
+
+
+def _plot_long_cross_final(
+    results: dict[str, tuple[TransientResearchConfig, ResearchSimulationResult]],
+    out_dir: Path,
+    *,
+    max_steps: int,
+    zoom_quantile: float,
+    zoom_pad: float,
+) -> str:
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 12))
+    for col, name in enumerate(("fixed_rk2", "adaptive_rk2")):
+        cfg, result = results[name]
+        x = result.x_final
+        pc = _long_cross_point_colors(cfg, result)
+        axes[0, col].scatter(x[:, 0], x[:, 1], s=4, c=pc, alpha=0.72, linewidths=0)
+        axes[0, col].set_xlim(-cfg.domain_radius, cfg.domain_radius)
+        axes[0, col].set_ylim(-cfg.domain_radius, cfg.domain_radius)
+        axes[0, col].set_title(f"{name} full domain")
+
+        zoom = cfg.domain_radius if name == "fixed_rk2" else _cloud_halfwidth(x, q=zoom_quantile, pad=zoom_pad, floor=1e-6)
+        axes[1, col].scatter(x[:, 0], x[:, 1], s=4, c=pc, alpha=0.72, linewidths=0)
+        axes[1, col].set_xlim(-zoom, zoom)
+        axes[1, col].set_ylim(-zoom, zoom)
+        axes[1, col].set_title(f"{name} zoom half-width={zoom:.3g}")
+
+    for ax in axes.ravel():
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.18)
+    fig.suptitle(f"Long run, max_steps={int(max_steps)}: disk scale vs cross scale")
+    fig.tight_layout()
+    filename = f"{_long_cross_prefix(max_steps)}_final_full_and_zoom.png"
+    _save_experiment_png(fig, out_dir / filename, dpi=200)
+    plt.close(fig)
+    return filename
+
+
+def _plot_long_cross_montage(
+    config: TransientResearchConfig,
+    result: ResearchSimulationResult,
+    out_dir: Path,
+    *,
+    name: str,
+    dynamic_zoom: bool,
+    max_steps: int,
+    zoom_quantile: float,
+    zoom_pad: float,
+) -> str | None:
+    if result.trajectory_x is None or result.trajectory_steps is None or result.trajectory_times is None:
+        return None
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    traj = np.asarray(result.trajectory_x, dtype=np.float64)
+    steps = np.asarray(result.trajectory_steps)
+    times = np.asarray(result.trajectory_times)
+    pc = _long_cross_point_colors(config, result)
+    cols = 5
+    rows = int(np.ceil(len(traj) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(3.0 * cols, 3.0 * rows), squeeze=False)
+    for ax in axes.ravel():
+        ax.axis("off")
+    for i, x in enumerate(traj):
+        ax = axes[i // cols][i % cols]
+        ax.axis("on")
+        ax.scatter(x[:, 0], x[:, 1], s=3, c=pc, alpha=0.70, linewidths=0)
+        lim = _cloud_halfwidth(x, q=zoom_quantile, pad=zoom_pad, floor=1e-6) if dynamic_zoom else config.domain_radius
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.12)
+        ax.set_title(f"step {int(steps[i])}, t={float(times[i]):.3g}", fontsize=8)
+    suffix = "dynamic zoom" if dynamic_zoom else "full-domain"
+    fig.suptitle(f"Long run montage: {name} ({suffix})")
+    fig.tight_layout()
+    filename = f"{_long_cross_prefix(max_steps)}_montage_{name}.png"
+    _save_experiment_png(fig, out_dir / filename, dpi=200)
+    plt.close(fig)
+    return filename
+
+
+def _plot_long_cross_adaptive_details(
+    config: TransientResearchConfig,
+    result: ResearchSimulationResult,
+    out_dir: Path,
+    *,
+    max_steps: int,
+    zoom_quantile: float,
+    zoom_pad: float,
+) -> str:
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    x = result.x_final
+    rel = x - np.mean(x, axis=0, keepdims=True)
+    pc = _long_cross_point_colors(config, result)
+    xy = rel[:, 0] * rel[:, 1]
+    log_abs_xy = np.log10(np.abs(xy) + 1e-40)
+    radius = np.linalg.norm(rel, axis=1)
+    zoom = _cloud_halfwidth(x, q=zoom_quantile, pad=zoom_pad, floor=1e-6)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    axes[0].scatter(rel[:, 0], rel[:, 1], s=5, c=pc, alpha=0.75, linewidths=0)
+    axes[0].set_title("adaptive final: fiber colors")
+    im = axes[1].scatter(rel[:, 0], rel[:, 1], s=5, c=log_abs_xy, cmap="viridis", alpha=0.85, linewidths=0)
+    axes[1].set_title(r"adaptive final colored by $\log_{10}|xy|$")
+    fig.colorbar(im, ax=axes[1], shrink=0.82)
+    axes[2].hist(radius, bins=80, color="#4c78a8", alpha=0.85)
+    axes[2].set_title("adaptive final radial histogram")
+    axes[2].set_xlabel("radius")
+    for ax in axes[:2]:
+        ax.axhline(0.0, color="0.25", linewidth=0.7, alpha=0.5)
+        ax.axvline(0.0, color="0.25", linewidth=0.7, alpha=0.5)
+        ax.set_xlim(-zoom, zoom)
+        ax.set_ylim(-zoom, zoom)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.18)
+    fig.suptitle(f"Adaptive cross-scale diagnostics, zoom half-width={zoom:.3g}")
+    fig.tight_layout()
+    filename = f"{_long_cross_prefix(max_steps)}_adaptive_cross_details.png"
+    _save_experiment_png(fig, out_dir / filename, dpi=200)
+    plt.close(fig)
+    return filename
+
+
+def _long_cross_case_report_line(name: str, result: ResearchSimulationResult) -> str:
+    diag = result.research_diagnostics
+    if diag is None or len(diag) == 0:
+        return f"- `{name}`: steps={result.steps}, final_time={result.final_time:.6g}, clip_events={result.clip_events}."
+    last = dict(zip(RESEARCH_DIAGNOSTIC_FIELDS, diag[-1], strict=True))
+    max_q = float(np.nanmax(diag[:, RESEARCH_DIAGNOSTIC_FIELDS.index("q_max")]))
+    return (
+        f"- `{name}`: steps={result.steps}, final_time={result.final_time:.6g}, "
+        f"disk_radius_metric={last['disk_radius']:.6g}, r_min={last['r_min']:.6g}, "
+        f"q_max_max={max_q:.6g}, R_cont_rms={last['R_cont_rms']:.6g}, "
+        f"R_disc_rms={last['R_disc_rms']:.6g}, clip_events={result.clip_events}."
+    )
+
+
+def _write_long_cross_report(
+    results: dict[str, tuple[TransientResearchConfig, ResearchSimulationResult]],
+    out_dir: Path,
+    *,
+    figure_files: Sequence[str],
+    max_steps: int,
+) -> str:
+    fixed_config = results["fixed_rk2"][0]
+    report_name = f"REPORT_LONG_{int(max_steps)}.md"
+    lines = [
+        f"# Long max_steps={int(max_steps)} PP Cross/Disk Reference",
+        "",
+        (
+            f"Configuration: `n_fibers={fixed_config.n_fibers}`, `n_per_fiber={fixed_config.n_per_fiber}`, "
+            f"`alpha={fixed_config.alpha:g}`, `K={resolve_pp_K(fixed_config.alpha, fixed_config.K):g}`, `grid_size={fixed_config.grid_size}`, "
+            f"`dt={fixed_config.dt:g}`, same seed/initial condition."
+        ),
+        "",
+        "## Figures",
+        "",
+    ]
+    prefix = _long_cross_prefix(max_steps)
+    figure_labels = {
+        f"{prefix}_final_full_and_zoom.png": "Final full-domain and zoomed comparison",
+        f"{prefix}_montage_fixed_rk2.png": "Fixed-RK2 full-domain montage",
+        f"{prefix}_montage_adaptive_rk2.png": "Adaptive-RK2 cross montage with dynamic zoom",
+        f"{prefix}_adaptive_cross_details.png": "Adaptive cross-scale details",
+    }
+    for filename in figure_files:
+        label = figure_labels.get(filename, filename.replace(".png", "").replace("_", " "))
+        lines.append(f"- [{label}]({filename})")
+    lines.extend(["", "## Metrics", ""])
+    for name, (_, result) in results.items():
+        lines.append(_long_cross_case_report_line(name, result))
+    lines.extend(
+        [
+            "",
+            "## Interpretation",
+            "",
+            (
+                f"At `max_steps={int(max_steps)}`, fixed RK2 remains on the large disk/shell scale, while "
+                "adaptive RK2 evolves to a much smaller filamentary cross scale. The final adaptive figure "
+                "must be viewed with dynamic zoom; on disk-scale axes it is visually indistinguishable from a point."
+            ),
+            "",
+            "This long run reinforces the earlier diagnosis: the disk is a fixed-step map artifact, while the adaptive trajectory resolves the near-singular precision layer and continues toward cross-like collapse.",
+            "",
+        ]
+    )
+    (out_dir / report_name).write_text("\n".join(lines))
+    return report_name
+
+
+def run_long_cross_reference(
+    out_dir: Path | str,
+    *,
+    n_fibers: int = 10,
+    n_per_fiber: int = 100,
+    alpha: float = 0.99,
+    K: float | None = 1.0,
+    grid_size: int = 256,
+    domain_radius: float = 4.0,
+    dt: float = 0.055,
+    dt_min: float = 2.5e-4,
+    dt_max: float = 0.09,
+    max_steps: int = 2000,
+    min_steps: int | None = None,
+    tol_rms: float = 0.0,
+    max_displacement_per_step: float = 0.75,
+    seed: int = 2026,
+    trajectory_frame_count: int = 25,
+    make_animation: bool = True,
+    record_every: int = 100,
+    research_diagnostics_every: int | None = 100,
+    research_diagnostic_sample_size: int = 900,
+    research_energy_sample_size: int = 900,
+    research_nn_chunk: int = 384,
+    max_plot_points_per_group: int = 1200,
+    max_animation_points_per_group: int = 1200,
+    zoom_quantile: float = 0.9975,
+    zoom_pad: float = 1.35,
+    cross_detail_zoom_pad: float = 1.45,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[str, object]:
+    """Run the long fixed-RK2 disk versus adaptive-RK2 cross reference experiment."""
+
+    K = _optional_float(K)
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    effective_min_steps = int(max_steps) + 10 if min_steps is None else int(min_steps)
+    base = TransientResearchConfig(
+        n_fibers=n_fibers,
+        n_per_fiber=n_per_fiber,
+        alpha=alpha,
+        K=K,
+        grid_size=grid_size,
+        domain_radius=domain_radius,
+        dt=dt,
+        dt_min=dt_min,
+        dt_max=dt_max,
+        max_steps=max_steps,
+        min_steps=effective_min_steps,
+        tol_rms=tol_rms,
+        max_displacement_per_step=max_displacement_per_step,
+        backend="numpy",
+        force_backend="fft",
+        color_scheme="phase_color",
+        seed=seed,
+        make_dashboard=False,
+        make_animation=make_animation,
+        trajectory_frame_count=max(2, int(trajectory_frame_count)),
+        max_animation_points_per_group=max_animation_points_per_group,
+        record_research_diagnostics=True,
+        record_every=max(1, int(record_every)),
+        research_diagnostics_every=(
+            max(1, int(research_diagnostics_every)) if research_diagnostics_every is not None else None
+        ),
+        research_diagnostic_sample_size=research_diagnostic_sample_size,
+        research_energy_sample_size=research_energy_sample_size,
+        research_nn_chunk=research_nn_chunk,
+        max_plot_points_per_group=max_plot_points_per_group,
+        out_dir=out,
+    )
+    initial = make_initial_condition(base)
+    np.savez_compressed(
+        out / "base_initial_condition.npz",
+        x=initial.x.astype(np.float32),
+        omega=initial.omega.astype(np.float32),
+        group_id=initial.group_id.astype(np.int32),
+        omega_atoms=initial.omega_atoms.astype(np.float32),
+        group_names=np.array(initial.group_names),
+    )
+
+    results: dict[str, tuple[TransientResearchConfig, ResearchSimulationResult]] = {}
+    summaries: dict[str, dict[str, object]] = {}
+    for integrator in ("fixed_rk2", "adaptive_rk2"):
+        cfg = replace(base, integrator=integrator, out_dir=out / integrator)
+        result = run_research_simulation(cfg, initial, cancel_check=cancel_check)
+        summaries[integrator] = save_research_run_outputs(result, cfg, cfg.out_dir, initial=initial)
+        results[integrator] = (cfg, result)
+
+    figure_files: list[str] = []
+    figure_files.append(
+        _plot_long_cross_final(
+            results,
+            out,
+            max_steps=max_steps,
+            zoom_quantile=zoom_quantile,
+            zoom_pad=zoom_pad,
+        )
+    )
+    for name, dynamic_zoom in (("fixed_rk2", False), ("adaptive_rk2", True)):
+        montage = _plot_long_cross_montage(
+            *results[name],
+            out,
+            name=name,
+            dynamic_zoom=dynamic_zoom,
+            max_steps=max_steps,
+            zoom_quantile=zoom_quantile,
+            zoom_pad=zoom_pad,
+        )
+        if montage is not None:
+            figure_files.append(montage)
+    figure_files.append(
+        _plot_long_cross_adaptive_details(
+            *results["adaptive_rk2"],
+            out,
+            max_steps=max_steps,
+            zoom_quantile=zoom_quantile,
+            zoom_pad=cross_detail_zoom_pad,
+        )
+    )
+    report = _write_long_cross_report(results, out, figure_files=figure_files, max_steps=max_steps)
+
+    output = {
+        "experiment": "long_cross_reference",
+        "out_dir": str(out),
+        "max_steps": int(max_steps),
+        "figures": figure_files,
+        "report": report,
+        "summaries": summaries,
+    }
+    (out / "long_cross_reference_metrics.json").write_text(json.dumps(_jsonable(output), indent=2))
+    return output
+
+
+def angular_synchronization_score(x: Array, omega: Array) -> float:
+    """Circular alignment score for arg(x) ~= arg(omega)."""
+
+    pts = np.asarray(x, dtype=np.float64)
+    labels = np.asarray(omega, dtype=np.float64)
+    r = np.linalg.norm(pts, axis=1)
+    w = np.linalg.norm(labels, axis=1)
+    mask = (r > 1e-12) & (w > 1e-12)
+    if not np.any(mask):
+        return 0.0
+    theta_x = np.arctan2(pts[mask, 1], pts[mask, 0])
+    theta_w = np.arctan2(labels[mask, 1], labels[mask, 0])
+    return float(abs(np.mean(np.exp(1j * (theta_x - theta_w)))))
+
+
+def finite_horizon_model_residual(
+    config: SimulationConfig,
+    x: Array,
+    omega: Array,
+) -> Array:
+    """Residual of the finite-horizon gauge-averaged model at a particle state."""
+
+    solver = FFTPeszekPoyato2D(config.alpha, config.K, config.grid_size, config.domain_radius)
+    residual, _, _ = finite_horizon_gauge_average_field(
+        solver,
+        solver.clip_inside(np.asarray(x, dtype=np.float64)),
+        np.asarray(omega, dtype=np.float64),
+        float(config.prediction_horizon_tau),
+        _predictive_theta_from_config(config),
+    )
+    return np.asarray(residual, dtype=np.float64)
+
+
+def evaluate_predictive_residuals(
+    config: SimulationConfig,
+    x: Array,
+    omega: Array,
+) -> dict[str, Array]:
+    """Evaluate present, averaged-predictive, and pure-predictive residuals."""
+
+    solver = FFTPeszekPoyato2D(config.alpha, config.K, config.grid_size, config.domain_radius)
+    x_now = solver.clip_inside(np.asarray(x, dtype=np.float64))
+    omega_now = np.asarray(omega, dtype=np.float64)
+    A_now, _ = solver.A_at_particles(x_now)
+    tau = float(config.prediction_horizon_tau)
+    if tau == 0.0:
+        x_tau = x_now
+        A_tau = A_now
+    else:
+        x_tau = solver.clip_inside(x_now + tau * (omega_now - A_now))
+        A_tau, _ = solver.A_at_particles(x_tau)
+    avg_A = 0.5 * (A_now + A_tau)
+    return {
+        "A_now": A_now,
+        "A_tau": A_tau,
+        "x_tau": np.asarray(x_tau, dtype=np.float64),
+        "present_residual": omega_now - A_now,
+        "avg_predictive_residual": omega_now - avg_A,
+        "pure_predictive_residual": omega_now - A_tau,
+    }
+
+
+def predictive_mode_diagnostics(config: SimulationConfig, result: SimulationResult) -> dict[str, object]:
+    """Final-state diagnostics for averaged/pure predictive PP comparisons."""
+
+    dx = float(2.0 * config.domain_radius / config.grid_size)
+    morph = compute_morphology_metrics(result.x_final, grid_dx=dx)
+    residuals = evaluate_predictive_residuals(config, result.x_final, result.initial.omega)
+    norms = {key: np.linalg.norm(value, axis=1) for key, value in residuals.items() if key.endswith("_residual")}
+    eval_config = _ordinary_pp_fft_eval_config(config)
+    hessian = evaluate_A_and_H_at_particles(eval_config, result.x_final)
+    center = result.x_final.mean(axis=0, keepdims=True)
+    radius = np.linalg.norm(result.x_final - center, axis=1)
+    R_peak = float(morph["disk_radius"])
+    bandwidth = max(2.0 * dx, 0.05 * max(R_peak, dx))
+    boundary = np.abs(radius - R_peak) <= bandwidth
+    if not np.any(boundary):
+        boundary = np.ones(len(radius), dtype=bool)
+    lambda_boundary = np.asarray(hessian["lambda_max"], dtype=np.float64)[boundary]
+    tau_lambda_peak = float(config.prediction_horizon_tau) * float(np.median(lambda_boundary))
+    theta = _predictive_theta_from_config(config)
+    mode = f"theta={theta:g}"
+    expected_threshold = float("inf") if theta <= 0.0 else float(1.0 / theta)
+    return {
+        "predictive_mode": mode,
+        "R_peak": R_peak,
+        "disk_radius": R_peak,
+        "boundary_bandwidth": float(bandwidth),
+        "boundary_count": int(np.count_nonzero(boundary)),
+        "lambda_max_boundary_median": float(np.median(lambda_boundary)),
+        "lambda_max_boundary_p90": float(np.quantile(lambda_boundary, 0.90)),
+        "tau_lambda_peak": tau_lambda_peak,
+        "expected_tau_lambda_threshold": expected_threshold,
+        "threshold_error": float(tau_lambda_peak - expected_threshold),
+        "present_residual_rms": float(np.sqrt(np.mean(norms["present_residual"] ** 2))),
+        "present_residual_median": float(np.median(norms["present_residual"])),
+        "avg_predictive_residual_rms": float(np.sqrt(np.mean(norms["avg_predictive_residual"] ** 2))),
+        "avg_predictive_residual_median": float(np.median(norms["avg_predictive_residual"])),
+        "pure_predictive_residual_rms": float(np.sqrt(np.mean(norms["pure_predictive_residual"] ** 2))),
+        "pure_predictive_residual_median": float(np.median(norms["pure_predictive_residual"])),
+        "boundary_mass_fraction": float(morph["boundary_mass_fraction"]),
+        "axis_mass_fraction": float(morph["axis_mass_fraction"]),
+        "fourfold_mode": float(morph["fourfold_mode"]),
+    }
+
+
+def _ordinary_pp_fft_eval_config(config: SimulationConfig) -> TransientResearchConfig:
+    """Minimal research config for evaluating ordinary PP residuals by FFT."""
+
+    return TransientResearchConfig(
+        alpha=config.alpha,
+        K=config.K,
+        n_fibers=config.n_fibers,
+        n_per_fiber=config.n_per_fiber,
+        fibers=config.fibers,
+        shape_names=config.shape_names,
+        omega_atoms=config.omega_atoms,
+        seed=config.seed,
+        color_scheme=config.color_scheme,
+        initialization_algorithm=config.initialization_algorithm,
+        initializer_config=config.initializer_config,
+        initialization_fast_steps=config.initialization_fast_steps,
+        initialization_fast_min_steps=config.initialization_fast_min_steps,
+        initialization_fast_window=config.initialization_fast_window,
+        initialization_fast_displacement_tol=config.initialization_fast_displacement_tol,
+        grid_size=config.grid_size,
+        domain_radius=config.domain_radius,
+        dt=config.dt,
+        max_steps=config.max_steps,
+        tol_rms=config.tol_rms,
+        min_steps=config.min_steps,
+        record_every=config.record_every,
+        backend="numpy",
+        force_backend="fft",
+        device=config.device,
+        dtype=config.dtype,
+        integrator=config.integrator,
+        time_direction=config.time_direction,
+        external_field=config.external_field,
+        projective_epsilon=config.projective_epsilon,
+        adaptive_tol=config.adaptive_tol,
+        dt_min=config.dt_min,
+        dt_max=config.dt_max,
+        max_displacement_per_step=config.max_displacement_per_step,
+        direct_hessian_chunk=config.direct_hessian_chunk,
+        max_plot_points_per_group=config.max_plot_points_per_group,
+        max_metric_plot_points=config.max_metric_plot_points,
+        max_particle_csv_rows=config.max_particle_csv_rows,
+        make_dashboard=False,
+        make_animation=False,
+        out_dir=config.out_dir,
+    )
+
+
+def summarize_finite_horizon_comparison(
+    old_result: ResearchSimulationResult,
+    old_config: TransientResearchConfig,
+    new_result: SimulationResult,
+    new_config: SimulationConfig,
+) -> dict[str, object]:
+    old_dx = float(2.0 * old_config.domain_radius / old_config.grid_size)
+    new_dx = float(2.0 * new_config.domain_radius / new_config.grid_size)
+    old_morph = compute_morphology_metrics(old_result.x_final, grid_dx=old_dx)
+    new_morph = compute_morphology_metrics(new_result.x_final, grid_dx=new_dx)
+    new_pp_residual = evaluate_velocity_numpy(
+        _ordinary_pp_fft_eval_config(new_config),
+        new_result.x_final,
+        new_result.initial.omega,
+    )[0]
+    new_pp_norm = np.linalg.norm(new_pp_residual, axis=1)
+    new_model_norm = np.linalg.norm(new_result.residual, axis=1)
+    return {
+        "tau": float(new_config.prediction_horizon_tau),
+        "old_fixed_dt": float(old_config.dt),
+        "new_dt_initial": float(new_config.dt),
+        "new_dt_max": float(new_config.dt_max),
+        "alpha": float(new_config.alpha),
+        "K": float(resolve_pp_K(new_config.alpha, new_config.K)),
+        "K_config": None if new_config.K is None else float(new_config.K),
+        "grid_size": int(new_config.grid_size),
+        "n_particles": int(len(new_result.x_final)),
+        "old_steps": int(old_result.steps),
+        "old_final_time": float(old_result.final_time),
+        "old_disk_radius": float(old_morph["disk_radius"]),
+        "old_boundary_mass_fraction": float(old_morph["boundary_mass_fraction"]),
+        "old_pp_residual_rms": float(old_result.rms_residual),
+        "old_angular_sync": angular_synchronization_score(old_result.x_final, old_result.initial.omega),
+        "new_steps": int(new_result.steps),
+        "new_final_time": float(new_result.final_time),
+        "new_disk_radius": float(new_morph["disk_radius"]),
+        "new_boundary_mass_fraction": float(new_morph["boundary_mass_fraction"]),
+        "new_model_residual_rms": float(np.sqrt(np.mean(new_model_norm * new_model_norm))),
+        "new_pp_residual_rms": float(np.sqrt(np.mean(new_pp_norm * new_pp_norm))),
+        "new_angular_sync": angular_synchronization_score(new_result.x_final, new_result.initial.omega),
+        "radius_ratio_new_over_old": float(new_morph["disk_radius"] / max(float(old_morph["disk_radius"]), 1e-30)),
+    }
+
+
+def make_finite_horizon_comparison_figure(
+    old_result: ResearchSimulationResult,
+    old_config: TransientResearchConfig,
+    new_result: SimulationResult,
+    new_config: SimulationConfig,
+    *,
+    right_title: str = "Finite-horizon gauge-averaged PP, adaptive RK2",
+    right_hist_title: str = "Finite-horizon radius histogram",
+    title_text: str | None = None,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+) -> go.Figure:
+    group_names = old_result.initial.group_names
+    colors = fiber_colors(old_config, old_result.initial.omega_atoms, len(group_names))
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        specs=[
+            [{"type": "scattergl"}, {"type": "scattergl"}],
+            [{"type": "histogram"}, {"type": "histogram"}],
+        ],
+        subplot_titles=[
+            "Original PP, fixed RK2 discovery run",
+            right_title,
+            "Original PP radius histogram",
+            right_hist_title,
+        ],
+        horizontal_spacing=0.08,
+        vertical_spacing=0.12,
+    )
+    for col, (result, cfg) in enumerate(((old_result, old_config), (new_result, new_config)), start=1):
+        rng = np.random.default_rng(int(cfg.seed) + 401 + col)
+        for k, name in enumerate(group_names):
+            idx_all = np.where(result.initial.group_id == k)[0]
+            if len(idx_all) == 0:
+                continue
+            idx = rng.choice(idx_all, size=min(cfg.max_plot_points_per_group, len(idx_all)), replace=False)
+            fig.add_trace(
+                go.Scattergl(
+                    x=result.x_final[idx, 0],
+                    y=result.x_final[idx, 1],
+                    mode="markers",
+                    marker=dict(size=4, color=colors[k], opacity=0.72),
+                    name=f"{name}",
+                    showlegend=(col == 1),
+                    legendgroup=f"fiber{k}",
+                ),
+                row=1,
+                col=col,
+            )
+        radius = np.linalg.norm(result.x_final - result.x_final.mean(axis=0, keepdims=True), axis=1)
+        fig.add_trace(go.Histogram(x=radius, nbinsx=64, showlegend=False), row=2, col=col)
+        zoom = (
+            _cloud_halfwidth(result.x_final, q=right_zoom_quantile, pad=right_zoom_pad, floor=1e-6)
+            if col == 2 and right_dynamic_zoom
+            else float(cfg.domain_radius)
+        )
+        fig.update_xaxes(range=[-zoom, zoom], scaleanchor=f"y{col}", scaleratio=1, row=1, col=col)
+        fig.update_yaxes(range=[-zoom, zoom], row=1, col=col)
+        fig.update_xaxes(title_text="radius", row=2, col=col)
+    if title_text is None:
+        K_eff = resolve_pp_K(new_config.alpha, new_config.K)
+        title_text = (
+            "Finite-horizon predictive model test<br>"
+            f"<sup>tau={new_config.prediction_horizon_tau:g}, adaptive dt_max={new_config.dt_max:g}; "
+            f"old fixed h={old_config.dt:g}, alpha={new_config.alpha:g}, K={K_eff:g}, seed={new_config.seed}</sup>"
+        )
+    fig.update_layout(
+        title=dict(
+            text=title_text,
+            x=0.5,
+        ),
+        width=1350,
+        height=980,
+        template="plotly_white",
+        legend=dict(groupclick="togglegroup", itemsizing="constant"),
+    )
+    return fig
+
+
+def make_finite_horizon_residual_figure(
+    new_result: SimulationResult,
+    new_config: SimulationConfig,
+) -> go.Figure:
+    pp_residual = evaluate_velocity_numpy(
+        _ordinary_pp_fft_eval_config(new_config),
+        new_result.x_final,
+        new_result.initial.omega,
+    )[0]
+    pp_norm = np.linalg.norm(pp_residual, axis=1)
+    model_norm = np.linalg.norm(new_result.residual, axis=1)
+    values = (pp_norm, model_norm)
+    titles = ("ordinary PP residual |omega - A_rho|", "finite-horizon residual |G_tau|")
+    colors = fiber_colors(new_config, new_result.initial.omega_atoms, len(new_result.initial.group_names))
+    fig = make_subplots(rows=1, cols=2, subplot_titles=titles, horizontal_spacing=0.08)
+    for col, (norm, title) in enumerate(zip(values, titles, strict=True), start=1):
+        fig.add_trace(
+            go.Scattergl(
+                x=new_result.x_final[:, 0],
+                y=new_result.x_final[:, 1],
+                mode="markers",
+                marker=dict(
+                    size=4,
+                    color=np.log10(norm + 1e-30),
+                    colorscale="Magma",
+                    showscale=True,
+                    colorbar=dict(title="log10 residual", x=0.46 if col == 1 else 1.0),
+                ),
+                name=title,
+                showlegend=False,
+            ),
+            row=1,
+            col=col,
+        )
+        for k, color in enumerate(colors):
+            idx = np.where(new_result.initial.group_id == k)[0]
+            fig.add_trace(
+                go.Scattergl(
+                    x=new_result.x_final[idx, 0],
+                    y=new_result.x_final[idx, 1],
+                    mode="markers",
+                    marker=dict(size=1.4, color=color, opacity=0.25),
+                    showlegend=False,
+                ),
+                row=1,
+                col=col,
+            )
+        fig.update_xaxes(range=[-new_config.domain_radius, new_config.domain_radius], scaleanchor=f"y{col}", scaleratio=1, row=1, col=col)
+        fig.update_yaxes(range=[-new_config.domain_radius, new_config.domain_radius], row=1, col=col)
+    fig.update_layout(
+        title=dict(text="Finite-horizon adaptive state: original PP residual vs new model residual", x=0.5),
+        width=1250,
+        height=600,
+        template="plotly_white",
+    )
+    return fig
+
+
+def make_pp_adaptive_residual_figure(
+    result: ResearchSimulationResult,
+    config: TransientResearchConfig,
+    *,
+    dynamic_zoom: bool = True,
+    zoom_quantile: float = 0.9975,
+    zoom_pad: float = 1.35,
+) -> go.Figure:
+    pp_norm = np.linalg.norm(result.residual, axis=1)
+    map_residual = rk2_map_residual(config, result.x_final, result.initial.omega, dt=max(float(result.dt_mean), float(config.dt_min)))
+    map_norm = np.linalg.norm(map_residual, axis=1)
+    values = (pp_norm, map_norm)
+    titles = ("ordinary PP residual |omega - A_rho|", "adaptive RK2 map residual |Phi_dt(x)-x|")
+    colors = fiber_colors(config, result.initial.omega_atoms, len(result.initial.group_names))
+    zoom = _cloud_halfwidth(result.x_final, q=zoom_quantile, pad=zoom_pad, floor=1e-6) if dynamic_zoom else float(config.domain_radius)
+    fig = make_subplots(rows=1, cols=2, subplot_titles=titles, horizontal_spacing=0.08)
+    for col, (norm, title) in enumerate(zip(values, titles, strict=True), start=1):
+        fig.add_trace(
+            go.Scattergl(
+                x=result.x_final[:, 0],
+                y=result.x_final[:, 1],
+                mode="markers",
+                marker=dict(
+                    size=4,
+                    color=np.log10(norm + 1e-30),
+                    colorscale="Magma",
+                    showscale=True,
+                    colorbar=dict(title="log10 residual", x=0.46 if col == 1 else 1.0),
+                ),
+                name=title,
+                showlegend=False,
+            ),
+            row=1,
+            col=col,
+        )
+        for k, color in enumerate(colors):
+            idx = np.where(result.initial.group_id == k)[0]
+            fig.add_trace(
+                go.Scattergl(
+                    x=result.x_final[idx, 0],
+                    y=result.x_final[idx, 1],
+                    mode="markers",
+                    marker=dict(size=1.4, color=color, opacity=0.25),
+                    showlegend=False,
+                ),
+                row=1,
+                col=col,
+            )
+        fig.update_xaxes(range=[-zoom, zoom], scaleanchor=f"y{col}", scaleratio=1, row=1, col=col)
+        fig.update_yaxes(range=[-zoom, zoom], row=1, col=col)
+    fig.update_layout(
+        title=dict(text="Adaptive ordinary PP state: continuous residual vs RK2 map residual", x=0.5),
+        width=1250,
+        height=600,
+        template="plotly_white",
+    )
+    return fig
+
+
+def _write_finite_horizon_comparison_png(
+    old_result: ResearchSimulationResult,
+    old_config: TransientResearchConfig,
+    new_result: SimulationResult,
+    new_config: SimulationConfig,
+    path: Path,
+    *,
+    right_title: str = "Finite-horizon PP, adaptive RK2",
+    suptitle: str | None = None,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+) -> None:
+    """Write a static PNG companion for the finite-horizon comparison."""
+
+    import os
+    import tempfile
+
+    mpl_config = Path(tempfile.gettempdir()) / "lmsspp_mplconfig"
+    mpl_config.mkdir(parents=True, exist_ok=True)
+    xdg_cache = Path(tempfile.gettempdir()) / "lmsspp_cache"
+    xdg_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_config))
+    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache))
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    group_names = old_result.initial.group_names
+    colors = fiber_colors(old_config, old_result.initial.omega_atoms, len(group_names))
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.0))
+    panels = (
+        (old_result, old_config, "Original PP, fixed RK2"),
+        (new_result, new_config, right_title),
+    )
+    for col, (result, cfg, title) in enumerate(panels):
+        ax = axes[0, col]
+        for k, color in enumerate(colors):
+            idx = np.where(result.initial.group_id == k)[0]
+            ax.scatter(result.x_final[idx, 0], result.x_final[idx, 1], s=7, c=color, alpha=0.72, linewidths=0)
+        ax.set_title(title)
+        zoom = (
+            _cloud_halfwidth(result.x_final, q=right_zoom_quantile, pad=right_zoom_pad, floor=1e-6)
+            if col == 1 and right_dynamic_zoom
+            else float(cfg.domain_radius)
+        )
+        ax.set_xlim(-zoom, zoom)
+        ax.set_ylim(-zoom, zoom)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.15)
+        radius = np.linalg.norm(result.x_final - result.x_final.mean(axis=0, keepdims=True), axis=1)
+        axes[1, col].hist(radius, bins=64, color="0.25", alpha=0.85)
+        axes[1, col].set_xlabel("radius")
+        axes[1, col].set_ylabel("count")
+    if suptitle is None:
+        suptitle = (
+            f"Finite-horizon predictive model test: tau={new_config.prediction_horizon_tau:g}, "
+            f"adaptive dt_max={new_config.dt_max:g}, old fixed h={old_config.dt:g}"
+        )
+    fig.suptitle(
+        suptitle,
+        y=0.98,
+    )
+    fig.tight_layout()
+    _save_experiment_png(fig, path, dpi=180)
+    plt.close(fig)
+
+
+def _write_finite_horizon_residual_png(
+    new_result: SimulationResult,
+    new_config: SimulationConfig,
+    path: Path,
+) -> None:
+    """Write a static PNG showing ordinary PP residual versus finite-horizon residual."""
+
+    import os
+    import tempfile
+
+    mpl_config = Path(tempfile.gettempdir()) / "lmsspp_mplconfig"
+    mpl_config.mkdir(parents=True, exist_ok=True)
+    xdg_cache = Path(tempfile.gettempdir()) / "lmsspp_cache"
+    xdg_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_config))
+    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache))
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    pp_residual = evaluate_velocity_numpy(
+        _ordinary_pp_fft_eval_config(new_config),
+        new_result.x_final,
+        new_result.initial.omega,
+    )[0]
+    residuals = (
+        (np.linalg.norm(pp_residual, axis=1), "ordinary PP residual |omega - A_rho|"),
+        (np.linalg.norm(new_result.residual, axis=1), "finite-horizon residual |G_tau|"),
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(12.0, 5.2))
+    for ax, (norm, title) in zip(axes, residuals, strict=True):
+        sc = ax.scatter(
+            new_result.x_final[:, 0],
+            new_result.x_final[:, 1],
+            c=np.log10(norm + 1e-30),
+            s=7,
+            cmap="magma",
+            linewidths=0,
+        )
+        ax.set_title(title)
+        ax.set_xlim(-new_config.domain_radius, new_config.domain_radius)
+        ax.set_ylim(-new_config.domain_radius, new_config.domain_radius)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.15)
+        fig.colorbar(sc, ax=ax, label="log10 residual")
+    fig.suptitle("Finite-horizon adaptive state: original PP residual vs new model residual", y=0.98)
+    fig.tight_layout()
+    _save_experiment_png(fig, path, dpi=180)
+    plt.close(fig)
+
+
+def _write_pp_adaptive_residual_png(
+    result: ResearchSimulationResult,
+    config: TransientResearchConfig,
+    path: Path,
+    *,
+    dynamic_zoom: bool = True,
+    zoom_quantile: float = 0.9975,
+    zoom_pad: float = 1.35,
+) -> None:
+    """Write a static PNG showing continuous PP residual versus adaptive RK2 map residual."""
+
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    pp_norm = np.linalg.norm(result.residual, axis=1)
+    map_residual = rk2_map_residual(config, result.x_final, result.initial.omega, dt=max(float(result.dt_mean), float(config.dt_min)))
+    residuals = (
+        (pp_norm, "ordinary PP residual |omega - A_rho|"),
+        (np.linalg.norm(map_residual, axis=1), "adaptive RK2 map residual |Phi_dt(x)-x|"),
+    )
+    zoom = _cloud_halfwidth(result.x_final, q=zoom_quantile, pad=zoom_pad, floor=1e-6) if dynamic_zoom else float(config.domain_radius)
+    fig, axes = plt.subplots(1, 2, figsize=(12.0, 5.2))
+    for ax, (norm, title) in zip(axes, residuals, strict=True):
+        sc = ax.scatter(
+            result.x_final[:, 0],
+            result.x_final[:, 1],
+            c=np.log10(norm + 1e-30),
+            s=7,
+            cmap="magma",
+            linewidths=0,
+        )
+        ax.set_title(title)
+        ax.set_xlim(-zoom, zoom)
+        ax.set_ylim(-zoom, zoom)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.15)
+        fig.colorbar(sc, ax=ax, label="log10 residual")
+    fig.suptitle("Adaptive ordinary PP state: continuous residual vs RK2 map residual", y=0.98)
+    fig.tight_layout()
+    _save_experiment_png(fig, path, dpi=180)
+    plt.close(fig)
+
+
+def make_predictive_mode_comparison_figure(
+    avg_result: SimulationResult,
+    avg_config: SimulationConfig,
+    pure_result: SimulationResult,
+    pure_config: SimulationConfig,
+    *,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+) -> go.Figure:
+    group_names = avg_result.initial.group_names
+    colors = fiber_colors(avg_config, avg_result.initial.omega_atoms, len(group_names))
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        specs=[
+            [{"type": "scattergl"}, {"type": "scattergl"}],
+            [{"type": "histogram"}, {"type": "histogram"}],
+        ],
+        subplot_titles=[
+            "Averaged predictive PP, adaptive RK2",
+            "Pure predictive PP, adaptive RK2",
+            "Averaged radius histogram",
+            "Pure radius histogram",
+        ],
+        horizontal_spacing=0.08,
+        vertical_spacing=0.12,
+    )
+    for col, (result, cfg) in enumerate(((avg_result, avg_config), (pure_result, pure_config)), start=1):
+        rng = np.random.default_rng(int(cfg.seed) + 173 + col)
+        for k, name in enumerate(group_names):
+            idx_all = np.where(result.initial.group_id == k)[0]
+            if len(idx_all) == 0:
+                continue
+            idx = rng.choice(idx_all, size=min(cfg.max_plot_points_per_group, len(idx_all)), replace=False)
+            fig.add_trace(
+                go.Scattergl(
+                    x=result.x_final[idx, 0],
+                    y=result.x_final[idx, 1],
+                    mode="markers",
+                    marker=dict(size=4, color=colors[k], opacity=0.72),
+                    name=f"{name}",
+                    showlegend=(col == 1),
+                    legendgroup=f"fiber{k}",
+                ),
+                row=1,
+                col=col,
+            )
+        radius = np.linalg.norm(result.x_final - result.x_final.mean(axis=0, keepdims=True), axis=1)
+        fig.add_trace(go.Histogram(x=radius, nbinsx=64, showlegend=False), row=2, col=col)
+        if col == 1 and left_dynamic_zoom:
+            zoom = _cloud_halfwidth(result.x_final, q=left_zoom_quantile, pad=left_zoom_pad, floor=1e-6)
+        elif col == 2 and right_dynamic_zoom:
+            zoom = _cloud_halfwidth(result.x_final, q=right_zoom_quantile, pad=right_zoom_pad, floor=1e-6)
+        else:
+            zoom = float(cfg.domain_radius)
+        fig.update_xaxes(range=[-zoom, zoom], scaleanchor=f"y{col}", scaleratio=1, row=1, col=col)
+        fig.update_yaxes(range=[-zoom, zoom], row=1, col=col)
+        fig.update_xaxes(title_text="radius", row=2, col=col)
+    predicted_ratio = 2.0 ** (1.0 / float(avg_config.alpha))
+    fig.update_layout(
+        title=dict(
+            text=(
+                "Averaged versus pure predictive PP<br>"
+                f"<sup>alpha={avg_config.alpha:g}, tau={avg_config.prediction_horizon_tau:g}, "
+                f"predicted R_pure/R_avg~{predicted_ratio:.3g}, seed={avg_config.seed}</sup>"
+            ),
+            x=0.5,
+        ),
+        width=1350,
+        height=980,
+        template="plotly_white",
+        legend=dict(groupclick="togglegroup", itemsizing="constant"),
+    )
+    return fig
+
+
+def _write_predictive_mode_comparison_png(
+    avg_result: SimulationResult,
+    avg_config: SimulationConfig,
+    pure_result: SimulationResult,
+    pure_config: SimulationConfig,
+    path: Path,
+    *,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+) -> None:
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    group_names = avg_result.initial.group_names
+    colors = fiber_colors(avg_config, avg_result.initial.omega_atoms, len(group_names))
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.0))
+    panels = (
+        (avg_result, avg_config, "Averaged predictive PP"),
+        (pure_result, pure_config, "Pure predictive PP"),
+    )
+    for col, (result, cfg, title) in enumerate(panels):
+        ax = axes[0, col]
+        for k, color in enumerate(colors):
+            idx = np.where(result.initial.group_id == k)[0]
+            ax.scatter(result.x_final[idx, 0], result.x_final[idx, 1], s=7, c=color, alpha=0.72, linewidths=0)
+        if col == 0 and left_dynamic_zoom:
+            zoom = _cloud_halfwidth(result.x_final, q=left_zoom_quantile, pad=left_zoom_pad, floor=1e-6)
+        elif col == 1 and right_dynamic_zoom:
+            zoom = _cloud_halfwidth(result.x_final, q=right_zoom_quantile, pad=right_zoom_pad, floor=1e-6)
+        else:
+            zoom = float(cfg.domain_radius)
+        ax.set_title(title)
+        ax.set_xlim(-zoom, zoom)
+        ax.set_ylim(-zoom, zoom)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.15)
+        radius = np.linalg.norm(result.x_final - result.x_final.mean(axis=0, keepdims=True), axis=1)
+        axes[1, col].hist(radius, bins=64, color="0.25", alpha=0.85)
+        axes[1, col].set_xlabel("radius")
+        axes[1, col].set_ylabel("count")
+    predicted_ratio = 2.0 ** (1.0 / float(avg_config.alpha))
+    fig.suptitle(
+        f"Averaged vs pure predictive PP: alpha={avg_config.alpha:g}, tau={avg_config.prediction_horizon_tau:g}, "
+        f"predicted R_pure/R_avg~{predicted_ratio:.3g}",
+        y=0.98,
+    )
+    fig.tight_layout()
+    _save_experiment_png(fig, path, dpi=180)
+    plt.close(fig)
+
+
+def _write_predictive_mode_statistics_png(
+    avg_diag: dict[str, object],
+    pure_diag: dict[str, object],
+    avg_config: SimulationConfig,
+    path: Path,
+) -> None:
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    labels = ("averaged", "pure")
+    R = np.array([float(avg_diag["R_peak"]), float(pure_diag["R_peak"])])
+    ratio = float(R[1] / max(R[0], 1e-30))
+    predicted_ratio = 2.0 ** (1.0 / float(avg_config.alpha))
+    residual_keys = ("present_residual_rms", "avg_predictive_residual_rms", "pure_predictive_residual_rms")
+    avg_res = [float(avg_diag[key]) for key in residual_keys]
+    pure_res = [float(pure_diag[key]) for key in residual_keys]
+    tau_lambda = [float(avg_diag["tau_lambda_peak"]), float(pure_diag["tau_lambda_peak"])]
+    thresholds = [float(avg_diag["expected_tau_lambda_threshold"]), float(pure_diag["expected_tau_lambda_threshold"])]
+    lambda_boundary = [float(avg_diag["lambda_max_boundary_median"]), float(pure_diag["lambda_max_boundary_median"])]
+    boundary_mass = [float(avg_diag["boundary_mass_fraction"]), float(pure_diag["boundary_mass_fraction"])]
+
+    fig, axes = plt.subplots(2, 3, figsize=(14.5, 8.2))
+    x = np.arange(2)
+    axes[0, 0].bar(x, R, color=["#4C78A8", "#F58518"])
+    axes[0, 0].set_xticks(x, labels)
+    axes[0, 0].set_ylabel("R_peak")
+    axes[0, 0].set_title(f"Disk radius peak\nR_pure/R_avg={ratio:.3g}, predicted={predicted_ratio:.3g}")
+
+    axes[0, 1].bar(np.arange(3) - 0.18, avg_res, width=0.36, label="averaged", color="#4C78A8")
+    axes[0, 1].bar(np.arange(3) + 0.18, pure_res, width=0.36, label="pure", color="#F58518")
+    axes[0, 1].set_xticks(np.arange(3), ["present", "avg", "pure"])
+    axes[0, 1].set_yscale("log")
+    axes[0, 1].set_ylabel("residual RMS")
+    axes[0, 1].set_title("Residual channels at final state")
+    axes[0, 1].legend()
+
+    axes[0, 2].bar(x, tau_lambda, color=["#4C78A8", "#F58518"])
+    axes[0, 2].scatter(x, thresholds, color="black", marker="_", s=240, label="expected")
+    axes[0, 2].set_xticks(x, labels)
+    axes[0, 2].set_ylabel("tau * median(lambda_max boundary)")
+    axes[0, 2].set_title("Finite-horizon threshold")
+    axes[0, 2].legend()
+
+    axes[1, 0].bar(x, lambda_boundary, color=["#4C78A8", "#F58518"])
+    axes[1, 0].set_xticks(x, labels)
+    axes[1, 0].set_ylabel("median lambda_max")
+    axes[1, 0].set_title("Boundary precision scale")
+
+    axes[1, 1].bar(x, boundary_mass, color=["#4C78A8", "#F58518"])
+    axes[1, 1].set_xticks(x, labels)
+    axes[1, 1].set_ylim(0.0, 1.0)
+    axes[1, 1].set_ylabel("boundary mass fraction")
+    axes[1, 1].set_title("Boundary concentration")
+
+    axes[1, 2].axis("off")
+    text = "\n".join(
+        [
+            f"alpha = {avg_config.alpha:g}",
+            f"tau = {avg_config.prediction_horizon_tau:g}",
+            f"K = {resolve_pp_K(avg_config.alpha, avg_config.K):g}",
+            f"seed = {avg_config.seed}",
+            "",
+            "Expected thresholds:",
+            "averaged: tau lambda ~= 2",
+            "pure: tau lambda ~= 1",
+        ]
+    )
+    axes[1, 2].text(0.02, 0.95, text, va="top", family="monospace")
+    fig.suptitle("Predictive PP averaged-vs-pure diagnostics", y=0.99)
+    fig.tight_layout()
+    _save_experiment_png(fig, path, dpi=180)
+    plt.close(fig)
+
+
+def _velocity_panel_halfwidth(
+    velocity: Array,
+    *,
+    dynamic_zoom: bool,
+    zoom_quantile: float,
+    zoom_pad: float,
+    static_vmax: float,
+) -> float:
+    if dynamic_zoom:
+        return _cloud_halfwidth(velocity, q=zoom_quantile, pad=zoom_pad, floor=1e-6)
+    return max(float(static_vmax), 1e-6)
+
+
+def _xv_position_panel_title() -> str:
+    return "Particle positions"
+
+
+def _xv_negative_velocity_panel_title(config: SimulationConfig) -> str:
+    theta = _predictive_theta_from_config(config)
+    return f"Negative velocity scatter (-x_dot, {_predictive_theta_label(theta)})"
+
+
+def _xv_comparison_figure_title(config: SimulationConfig) -> str:
+    theta = _predictive_theta_from_config(config)
+    return (
+        "Particle positions vs negative velocity<br>"
+        f"<sup>{_predictive_theta_label(theta)}; alpha={config.alpha:g}, "
+        f"tau={config.prediction_horizon_tau:g}, seed={config.seed}</sup>"
+    )
+
+
+def _xv_comparison_suptitle(config: SimulationConfig) -> str:
+    theta = _predictive_theta_from_config(config)
+    return (
+        f"Particle positions vs negative velocity: {_predictive_theta_label(theta)}; "
+        f"alpha={config.alpha:g}, tau={config.prediction_horizon_tau:g}, seed={config.seed}"
+    )
+
+
+def make_morphology_vs_negative_velocity_figure(
+    result: SimulationResult,
+    config: SimulationConfig,
+    *,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+) -> go.Figure:
+    group_names = result.initial.group_names
+    colors = fiber_colors(config, result.initial.omega_atoms, len(group_names))
+    negative_velocity = finite_horizon_negative_velocity_at(config, result.x_final, result.initial.omega)
+    velocity_norm = np.linalg.norm(negative_velocity, axis=1)
+    static_vmax = float(np.quantile(velocity_norm, 0.995) * 1.08) if velocity_norm.size else float(config.domain_radius)
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        specs=[
+            [{"type": "scattergl"}, {"type": "scattergl"}],
+            [{"type": "histogram"}, {"type": "histogram"}],
+        ],
+        subplot_titles=[
+            _xv_position_panel_title(),
+            _xv_negative_velocity_panel_title(config),
+            "Radial distance histogram",
+            "|-x_dot| histogram",
+        ],
+        horizontal_spacing=0.08,
+        vertical_spacing=0.12,
+    )
+    rng = np.random.default_rng(int(config.seed) + 173)
+    for k, name in enumerate(group_names):
+        idx_all = np.where(result.initial.group_id == k)[0]
+        if len(idx_all) == 0:
+            continue
+        idx = rng.choice(idx_all, size=min(config.max_plot_points_per_group, len(idx_all)), replace=False)
+        fig.add_trace(
+            go.Scattergl(
+                x=result.x_final[idx, 0],
+                y=result.x_final[idx, 1],
+                mode="markers",
+                marker=dict(size=4, color=colors[k], opacity=0.72),
+                name=f"{name}",
+                showlegend=True,
+                legendgroup=f"fiber{k}",
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scattergl(
+                x=negative_velocity[idx, 0],
+                y=negative_velocity[idx, 1],
+                mode="markers",
+                marker=dict(size=4, color=colors[k], opacity=0.72),
+                name=f"{name}",
+                showlegend=False,
+                legendgroup=f"fiber{k}",
+            ),
+            row=1,
+            col=2,
+        )
+    radius = np.linalg.norm(result.x_final - result.x_final.mean(axis=0, keepdims=True), axis=1)
+    fig.add_trace(go.Histogram(x=radius, nbinsx=64, showlegend=False), row=2, col=1)
+    fig.add_trace(go.Histogram(x=velocity_norm, nbinsx=64, showlegend=False), row=2, col=2)
+    left_zoom = (
+        _cloud_halfwidth(result.x_final, q=left_zoom_quantile, pad=left_zoom_pad, floor=1e-6)
+        if left_dynamic_zoom
+        else float(config.domain_radius)
+    )
+    right_zoom = _velocity_panel_halfwidth(
+        negative_velocity,
+        dynamic_zoom=right_dynamic_zoom,
+        zoom_quantile=right_zoom_quantile,
+        zoom_pad=right_zoom_pad,
+        static_vmax=static_vmax,
+    )
+    fig.update_xaxes(title_text="x1", range=[-left_zoom, left_zoom], scaleanchor="y", scaleratio=1, row=1, col=1)
+    fig.update_yaxes(title_text="x2", range=[-left_zoom, left_zoom], row=1, col=1)
+    fig.update_xaxes(title_text="v1", range=[-right_zoom, right_zoom], scaleanchor="y2", scaleratio=1, row=1, col=2)
+    fig.update_yaxes(title_text="v2", range=[-right_zoom, right_zoom], row=1, col=2)
+    fig.update_xaxes(title_text="radius", row=2, col=1)
+    fig.update_xaxes(title_text="|-x_dot|", row=2, col=2)
+    fig.update_layout(
+        title=dict(
+            text=_xv_comparison_figure_title(config),
+            x=0.5,
+        ),
+        width=1350,
+        height=980,
+        template="plotly_white",
+        legend=dict(groupclick="togglegroup", itemsizing="constant"),
+    )
+    return fig
+
+
+def _write_morphology_vs_negative_velocity_png(
+    result: SimulationResult,
+    config: SimulationConfig,
+    path: Path,
+    *,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+) -> None:
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    colors = fiber_colors(config, result.initial.omega_atoms, len(result.initial.group_names))
+    negative_velocity = finite_horizon_negative_velocity_at(config, result.x_final, result.initial.omega)
+    velocity_norm = np.linalg.norm(negative_velocity, axis=1)
+    static_vmax = float(np.quantile(velocity_norm, 0.995) * 1.08) if velocity_norm.size else float(config.domain_radius)
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.0))
+    for k, color in enumerate(colors):
+        idx = np.where(result.initial.group_id == k)[0]
+        axes[0, 0].scatter(result.x_final[idx, 0], result.x_final[idx, 1], s=7, c=color, alpha=0.72, linewidths=0)
+        axes[0, 1].scatter(negative_velocity[idx, 0], negative_velocity[idx, 1], s=7, c=color, alpha=0.72, linewidths=0)
+    left_zoom = (
+        _cloud_halfwidth(result.x_final, q=left_zoom_quantile, pad=left_zoom_pad, floor=1e-6)
+        if left_dynamic_zoom
+        else float(config.domain_radius)
+    )
+    right_zoom = _velocity_panel_halfwidth(
+        negative_velocity,
+        dynamic_zoom=right_dynamic_zoom,
+        zoom_quantile=right_zoom_quantile,
+        zoom_pad=right_zoom_pad,
+        static_vmax=static_vmax,
+    )
+    axes[0, 0].set_title(_xv_position_panel_title())
+    axes[0, 0].set_xlim(-left_zoom, left_zoom)
+    axes[0, 0].set_ylim(-left_zoom, left_zoom)
+    axes[0, 0].set_aspect("equal", adjustable="box")
+    axes[0, 0].set_xlabel("x1")
+    axes[0, 0].set_ylabel("x2")
+    axes[0, 0].grid(True, alpha=0.15)
+    axes[0, 1].set_title(_xv_negative_velocity_panel_title(config))
+    axes[0, 1].set_xlim(-right_zoom, right_zoom)
+    axes[0, 1].set_ylim(-right_zoom, right_zoom)
+    axes[0, 1].set_aspect("equal", adjustable="box")
+    axes[0, 1].set_xlabel("v1")
+    axes[0, 1].set_ylabel("v2")
+    axes[0, 1].grid(True, alpha=0.15)
+    radius = np.linalg.norm(result.x_final - result.x_final.mean(axis=0, keepdims=True), axis=1)
+    axes[1, 0].hist(radius, bins=64, color="0.25", alpha=0.85)
+    axes[1, 0].set_title("Radial distance histogram")
+    axes[1, 0].set_xlabel("radius")
+    axes[1, 0].set_ylabel("count")
+    axes[1, 1].hist(velocity_norm, bins=64, color="0.25", alpha=0.85)
+    axes[1, 1].set_title("|-x_dot| histogram")
+    axes[1, 1].set_xlabel("|-x_dot|")
+    axes[1, 1].set_ylabel("count")
+    fig.suptitle(_xv_comparison_suptitle(config), y=0.98)
+    fig.tight_layout()
+    _save_experiment_png(fig, path, dpi=180)
+    plt.close(fig)
+
+
+def _write_predictive_single_system_statistics_png(
+    diag: dict[str, object],
+    config: SimulationConfig,
+    path: Path,
+) -> None:
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    theta = _predictive_theta_from_config(config)
+    residual_keys = ("present_residual_rms", "avg_predictive_residual_rms", "pure_predictive_residual_rms")
+    residuals = [float(diag[key]) for key in residual_keys]
+    fig, axes = plt.subplots(1, 3, figsize=(13.0, 4.2))
+    axes[0].bar(["R_peak"], [float(diag["R_peak"])], color="#4C78A8")
+    axes[0].set_ylabel("R_peak")
+    axes[0].set_title("Disk radius peak")
+    axes[1].bar(["present", "avg", "pure"], residuals, color="#4C78A8")
+    axes[1].set_yscale("log")
+    axes[1].set_ylabel("residual RMS")
+    axes[1].set_title("Residual channels at final state")
+    axes[2].bar(
+        ["tau*lambda"],
+        [float(diag["tau_lambda_peak"])],
+        color="#4C78A8",
+    )
+    axes[2].axhline(float(diag["expected_tau_lambda_threshold"]), color="black", linestyle="--", label="expected")
+    axes[2].set_ylabel("tau * median(lambda_max boundary)")
+    axes[2].set_title("Finite-horizon threshold")
+    axes[2].legend()
+    fig.suptitle(
+        f"Predictive PP diagnostics: {_predictive_theta_label(theta)}; "
+        f"alpha={config.alpha:g}, tau={config.prediction_horizon_tau:g}, seed={config.seed}",
+        y=1.02,
+    )
+    fig.tight_layout()
+    _save_experiment_png(fig, path, dpi=180)
+    plt.close(fig)
+
+
+def write_morphology_vs_negative_velocity_animation(
+    result: SimulationResult,
+    config: SimulationConfig,
+    path: Path | str,
+    *,
+    frame_count: int = 72,
+    fps: int = 12,
+    max_points_per_group: int = 700,
+    left_title: str | None = None,
+    right_title: str | None = None,
+    suptitle_prefix: str = "Particle positions vs negative velocity",
+    suptitle_params: str | None = None,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    left_zoom_smoothing_radius: int = 2,
+    left_zoom_delay_frames: int = 4,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+    right_zoom_smoothing_radius: int = 2,
+    right_zoom_delay_frames: int = 4,
+) -> None:
+    """Write a two-panel MP4 for one predictive PP run.
+
+    The left panel shows particle morphology.  The right panel shows the same
+    sampled particles colored by fiber in the negative-velocity scatter used by
+    the finite-horizon dynamics widget with ``second_panel="velocity"``.
+    """
+
+    if frame_count < 2:
+        raise ValueError("frame_count must be at least 2")
+    if fps <= 0:
+        raise ValueError("fps must be positive")
+    if result.trajectory_times is None:
+        raise ValueError("result must include trajectory_times; run with make_animation=True")
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    omega = result.initial.omega
+    group_names = result.initial.group_names
+    colors = fiber_colors(config, result.initial.omega_atoms, len(group_names))
+    rng = np.random.default_rng(int(config.seed) + 5901)
+    sample_indices: list[Array] = []
+    for k in range(len(group_names)):
+        idx_all = np.where(result.initial.group_id == k)[0]
+        if len(idx_all) == 0:
+            sample_indices.append(np.array([], dtype=np.int64))
+            continue
+        sample_indices.append(np.sort(rng.choice(idx_all, size=min(int(max_points_per_group), len(idx_all)), replace=False)))
+
+    t_end = float(result.trajectory_times[-1])
+    target_times = np.linspace(0.0, t_end, int(frame_count))
+    position_frames = [_trajectory_at_time(result, float(t)) for t in target_times]
+    velocity_frames = [finite_horizon_negative_velocity_at(config, x_state, omega) for x_state in position_frames]
+    static_vmax = 1e-6
+    for velocity in velocity_frames:
+        norms = np.linalg.norm(velocity, axis=1)
+        if norms.size:
+            static_vmax = max(static_vmax, float(np.max(norms)))
+    static_vmax *= 1.08
+
+    left_zoom_scales: Array | None = None
+    if left_dynamic_zoom:
+        raw_zoom_scales = [
+            _cloud_halfwidth(x_state, q=left_zoom_quantile, pad=left_zoom_pad, floor=1e-6)
+            for x_state in position_frames
+        ]
+        left_zoom_scales = _smooth_delayed_zoom_scales(
+            raw_zoom_scales,
+            smoothing_radius=left_zoom_smoothing_radius,
+            delay_frames=left_zoom_delay_frames,
+        )
+    right_zoom_scales: Array | None = None
+    if right_dynamic_zoom:
+        raw_zoom_scales = [
+            _velocity_panel_halfwidth(
+                velocity_frames[i],
+                dynamic_zoom=True,
+                zoom_quantile=right_zoom_quantile,
+                zoom_pad=right_zoom_pad,
+                static_vmax=static_vmax,
+            )
+            for i in range(len(velocity_frames))
+        ]
+        right_zoom_scales = _smooth_delayed_zoom_scales(
+            raw_zoom_scales,
+            smoothing_radius=right_zoom_smoothing_radius,
+            delay_frames=right_zoom_delay_frames,
+        )
+
+    resolved_left_title = _xv_position_panel_title() if left_title is None else left_title
+    resolved_right_title = _xv_negative_velocity_panel_title(config) if right_title is None else right_title
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 6.4), dpi=150)
+    panels = (
+        (axes[0], resolved_left_title, ("x1", "x2")),
+        (axes[1], resolved_right_title, ("v1", "v2")),
+    )
+    traces: list[list[Any]] = []
+    for ax, title, axis_labels in panels:
+        ax.set_title(title)
+        ax.set_xlim(-config.domain_radius, config.domain_radius)
+        ax.set_ylim(-config.domain_radius, config.domain_radius)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.15)
+        ax.set_xlabel(axis_labels[0])
+        ax.set_ylabel(axis_labels[1])
+        panel_traces: list[Any] = []
+        for k, idx in enumerate(sample_indices):
+            scatter = ax.scatter([], [], s=8, c=colors[k], alpha=0.72, linewidths=0, label=group_names[k])
+            panel_traces.append(scatter)
+        traces.append(panel_traces)
+    axes[0].legend(loc="upper right", fontsize=6, markerscale=1.2, frameon=True)
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.94])
+
+    step_scale = result.steps / max(float(result.final_time), 1e-30)
+    if suptitle_params is None:
+        suptitle_params = _xv_comparison_suptitle(config)
+    writer = _experiment_mp4_writer(output, fps=int(fps))
+    try:
+        for frame_idx, t in enumerate(target_times):
+            x_state = position_frames[frame_idx]
+            v_state = velocity_frames[frame_idx]
+            for k, idx in enumerate(sample_indices):
+                traces[0][k].set_offsets(x_state[idx])
+                traces[1][k].set_offsets(v_state[idx])
+            if left_zoom_scales is not None:
+                zoom = float(left_zoom_scales[frame_idx])
+                axes[0].set_xlim(-zoom, zoom)
+                axes[0].set_ylim(-zoom, zoom)
+            if right_zoom_scales is not None:
+                zoom = float(right_zoom_scales[frame_idx])
+                axes[1].set_xlim(-zoom, zoom)
+                axes[1].set_ylim(-zoom, zoom)
+            elif not right_dynamic_zoom:
+                axes[1].set_xlim(-static_vmax, static_vmax)
+                axes[1].set_ylim(-static_vmax, static_vmax)
+            fig.suptitle(
+                f"{suptitle_prefix} "
+                f"| t={t:.3f}/{t_end:.3f} "
+                f"| step~{step_scale * t:.1f} "
+                f"| {suptitle_params}",
+                fontsize=11,
+            )
+            fig.canvas.draw()
+            rgba = np.asarray(fig.canvas.buffer_rgba())
+            writer.append_data(rgba[:, :, :3])
+    finally:
+        writer.close()
+        plt.close(fig)
+
+
+def run_predictive_velocity_animation_batch(
+    out_dir: Path | str,
+    *,
+    cases: Sequence[dict[str, object]] | None = None,
+    alpha: float = 0.99,
+    n_fibers: int = 20,
+    n_per_fiber: int = 200,
+    grid_size: int = 128,
+    domain_radius: float = 4.0,
+    adaptive_steps: int = 800,
+    adaptive_steps_per_horizon: int = 4,
+    adaptive_dt_min: float | None = None,
+    adaptive_dt_max: float | None = None,
+    record_every: int | None = None,
+    animation_frames: int = 200,
+    fps: int = 15,
+    left_dynamic_zoom: bool = True,
+    right_dynamic_zoom: bool = True,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    left_zoom_smoothing_radius: int = 3,
+    left_zoom_delay_frames: int = 0,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+    right_zoom_smoothing_radius: int = 3,
+    right_zoom_delay_frames: int = 0,
+) -> list[dict[str, object]]:
+    """Run one predictive PP case per weight and render morphology vs negative velocity."""
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    selected_cases = tuple(default_finite_horizon_animation_cases() if cases is None else cases)
+    summaries: list[dict[str, object]] = []
+    for case_idx, case in enumerate(selected_cases):
+        label = str(case.get("label", f"case_{case_idx:02d}"))
+        seed = int(case.get("seed", 2026 + case_idx))
+        case_alpha = float(case.get("alpha", alpha))
+        K = _optional_float(case.get("K", 1.0))
+        tau = float(case.get("tau", 0.055))
+        steps = int(case.get("adaptive_steps", adaptive_steps))
+        dt_adaptive = tau / max(1, int(adaptive_steps_per_horizon))
+        dt_min = float(adaptive_dt_min if adaptive_dt_min is not None else min(dt_adaptive / 10.0, 1.0e-4))
+        dt_max = float(adaptive_dt_max if adaptive_dt_max is not None else dt_adaptive)
+        case_record_every = int(case.get("record_every", record_every if record_every is not None else max(1, steps // 40)))
+        case_dir = out / label
+        case_dir.mkdir(parents=True, exist_ok=True)
+        predictive_pp_weight = case.get("predictive_pp_weight")
+        run_kwargs: dict[str, object] = {
+            "predictive_mode": "averaged_predictive",
+            "out_dir": case_dir / "predictive_adaptive",
+        }
+        if predictive_pp_weight is not None:
+            run_kwargs["predictive_pp_weight"] = predictive_pp_weight
+        run_config = SimulationConfig(
+            n_fibers=n_fibers,
+            n_per_fiber=n_per_fiber,
+            alpha=case_alpha,
+            K=K,
+            grid_size=grid_size,
+            domain_radius=domain_radius,
+            dt=dt_adaptive,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            max_steps=steps,
+            min_steps=steps + 10,
+            tol_rms=0.0,
+            max_displacement_per_step=0.75,
+            backend="numpy",
+            integrator="adaptive_rk2",
+            color_scheme="phase_color",
+            prediction_horizon_tau=tau,
+            seed=seed,
+            make_dashboard=False,
+            make_animation=True,
+            trajectory_frame_count=max(animation_frames, 2),
+            max_plot_points_per_group=1200,
+            record_every=case_record_every,
+            **run_kwargs,
+        )
+        initial = make_initial_condition(run_config)
+        run_result = run_finite_horizon_gauge_averaged_simulation(run_config, initial)
+        _save_finite_horizon_run_outputs(run_result, run_config, Path(run_config.out_dir))
+        diag = predictive_mode_diagnostics(run_config, run_result)
+        theta = float(_predictive_theta_from_config(run_config))
+        summary = {
+            "label": label,
+            "case_index": int(case_idx),
+            "alpha": case_alpha,
+            "predictive_pp_weight": None if predictive_pp_weight is None else theta,
+            "K": K,
+            "tau": tau,
+            "seed": seed,
+            "n_particles": int(len(run_result.x_final)),
+            "steps": int(run_result.steps),
+            "final_time": float(run_result.final_time),
+            "diagnostics": diag,
+            "time_aligned_mp4": "time_aligned_morphology_vs_negative_velocity.mp4",
+            "morphology_png": "morphology_vs_negative_velocity.png",
+            "statistics_png": "predictive_system_statistics.png",
+        }
+        (case_dir / "case_metrics.json").write_text(json.dumps(_jsonable(summary), indent=2))
+        make_morphology_vs_negative_velocity_figure(
+            run_result,
+            run_config,
+            left_dynamic_zoom=left_dynamic_zoom,
+            left_zoom_quantile=left_zoom_quantile,
+            left_zoom_pad=left_zoom_pad,
+            right_dynamic_zoom=right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+        ).write_html(str(case_dir / "morphology_vs_negative_velocity.html"), include_plotlyjs="cdn")
+        _write_morphology_vs_negative_velocity_png(
+            run_result,
+            run_config,
+            case_dir / "morphology_vs_negative_velocity.png",
+            left_dynamic_zoom=left_dynamic_zoom,
+            left_zoom_quantile=left_zoom_quantile,
+            left_zoom_pad=left_zoom_pad,
+            right_dynamic_zoom=right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+        )
+        _write_predictive_single_system_statistics_png(
+            diag,
+            run_config,
+            case_dir / "predictive_system_statistics.png",
+        )
+        write_morphology_vs_negative_velocity_animation(
+            run_result,
+            run_config,
+            case_dir / "time_aligned_morphology_vs_negative_velocity.mp4",
+            frame_count=int(animation_frames),
+            fps=int(fps),
+            suptitle_params=_xv_comparison_suptitle(run_config),
+            left_dynamic_zoom=left_dynamic_zoom,
+            left_zoom_quantile=left_zoom_quantile,
+            left_zoom_pad=left_zoom_pad,
+            left_zoom_smoothing_radius=left_zoom_smoothing_radius,
+            left_zoom_delay_frames=left_zoom_delay_frames,
+            right_dynamic_zoom=right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+            right_zoom_smoothing_radius=right_zoom_smoothing_radius,
+            right_zoom_delay_frames=right_zoom_delay_frames,
+        )
+        summaries.append(summary)
+
+    (out / "batch_metrics.json").write_text(json.dumps(_jsonable(summaries), indent=2))
+    report = [
+        "# Particle Positions Versus Negative Velocity Batch",
+        "",
+        "Each case runs one adaptive-RK2 predictive PP simulation. "
+        "The left animation panel shows particle positions; the right panel shows "
+        "the widget-style negative-velocity scatter ``-x_dot`` for the same sampled particles.",
+        "",
+        "## Cases",
+        "",
+    ]
+    for summary in summaries:
+        label = str(summary["label"])
+        report.extend(
+            [
+                f"### {label}",
+                "",
+                f"- [time-aligned MP4]({label}/{summary['time_aligned_mp4']})",
+                f"- [morphology PNG]({label}/{summary['morphology_png']})",
+                f"- [statistics PNG]({label}/{summary['statistics_png']})",
+                f"- theta={summary['predictive_pp_weight']}",
+                f"- R_peak={float(summary['diagnostics']['R_peak']):.6g}",
+                f"- tau*lambda peak={float(summary['diagnostics']['tau_lambda_peak']):.6g}",
+                "",
+            ]
+        )
+    (out / "REPORT_PREDICTIVE_VELOCITY_BATCH.md").write_text("\n".join(report))
+    return summaries
+
+
+def run_predictive_mode_comparison_batch(
+    out_dir: Path | str,
+    *,
+    cases: Sequence[dict[str, object]] | None = None,
+    n_fibers: int = 20,
+    n_per_fiber: int = 200,
+    grid_size: int = 128,
+    domain_radius: float = 4.0,
+    adaptive_steps: int = 800,
+    adaptive_steps_per_horizon: int = 4,
+    adaptive_dt_min: float | None = None,
+    adaptive_dt_max: float | None = None,
+    record_every: int | None = None,
+    animation_frames: int = 200,
+    fps: int = 15,
+    left_dynamic_zoom: bool = True,
+    right_dynamic_zoom: bool = True,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    left_zoom_smoothing_radius: int = 3,
+    left_zoom_delay_frames: int = 0,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+    right_zoom_smoothing_radius: int = 3,
+    right_zoom_delay_frames: int = 0,
+) -> list[dict[str, object]]:
+    """Compare averaged-predictive and pure-predictive PP, both with adaptive RK2."""
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    selected_cases = tuple(default_finite_horizon_animation_cases() if cases is None else cases)
+    summaries: list[dict[str, object]] = []
+    for case_idx, case in enumerate(selected_cases):
+        label = str(case.get("label", f"case_{case_idx:02d}"))
+        seed = int(case.get("seed", 2026 + case_idx))
+        alpha = float(case.get("alpha", 0.99))
+        K = _optional_float(case.get("K", 1.0))
+        tau = float(case.get("tau", 0.055))
+        steps = int(case.get("adaptive_steps", adaptive_steps))
+        dt_adaptive = tau / max(1, int(adaptive_steps_per_horizon))
+        dt_min = float(adaptive_dt_min if adaptive_dt_min is not None else min(dt_adaptive / 10.0, 1.0e-4))
+        dt_max = float(adaptive_dt_max if adaptive_dt_max is not None else dt_adaptive)
+        case_record_every = int(case.get("record_every", record_every if record_every is not None else max(1, steps // 40)))
+        case_dir = out / label
+        case_dir.mkdir(parents=True, exist_ok=True)
+        base_kwargs = dict(
+            n_fibers=n_fibers,
+            n_per_fiber=n_per_fiber,
+            alpha=alpha,
+            K=K,
+            grid_size=grid_size,
+            domain_radius=domain_radius,
+            dt=dt_adaptive,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            max_steps=steps,
+            min_steps=steps + 10,
+            tol_rms=0.0,
+            max_displacement_per_step=0.75,
+            backend="numpy",
+            integrator="adaptive_rk2",
+            color_scheme="phase_color",
+            prediction_horizon_tau=tau,
+            seed=seed,
+            make_dashboard=False,
+            make_animation=True,
+            trajectory_frame_count=max(animation_frames, 2),
+            max_plot_points_per_group=1200,
+            record_every=case_record_every,
+        )
+        predictive_pp_weight = case.get("predictive_pp_weight")
+        avg_kwargs: dict[str, object] = {
+            "predictive_mode": "averaged_predictive",
+            "out_dir": case_dir / "averaged_predictive_adaptive",
+        }
+        if predictive_pp_weight is not None:
+            avg_kwargs["predictive_pp_weight"] = predictive_pp_weight
+        avg_config = SimulationConfig(**base_kwargs, **avg_kwargs)
+        initial = make_initial_condition(avg_config)
+        avg_result = run_finite_horizon_gauge_averaged_simulation(avg_config, initial)
+        _save_finite_horizon_run_outputs(avg_result, avg_config, Path(avg_config.out_dir))
+        pure_kwargs: dict[str, object] = {
+            "predictive_mode": "pure_predictive",
+            "out_dir": case_dir / "pure_predictive_adaptive",
+        }
+        if predictive_pp_weight is not None:
+            pure_kwargs["predictive_pp_weight"] = 1.0
+        pure_config = replace(avg_config, **pure_kwargs)
+        pure_result = run_finite_horizon_gauge_averaged_simulation(pure_config, initial)
+        _save_finite_horizon_run_outputs(pure_result, pure_config, Path(pure_config.out_dir))
+
+        avg_diag = predictive_mode_diagnostics(avg_config, avg_result)
+        pure_diag = predictive_mode_diagnostics(pure_config, pure_result)
+        predicted_ratio = 2.0 ** (1.0 / alpha)
+        observed_ratio = float(pure_diag["R_peak"]) / max(float(avg_diag["R_peak"]), 1e-30)
+        comparison = {
+            "label": label,
+            "case_index": int(case_idx),
+            "alpha": alpha,
+            "predictive_pp_weight": None if predictive_pp_weight is None else float(_predictive_theta_from_config(avg_config)),
+            "K": K,
+            "tau": tau,
+            "seed": seed,
+            "n_particles": int(len(avg_result.x_final)),
+            "avg_steps": int(avg_result.steps),
+            "pure_steps": int(pure_result.steps),
+            "avg_final_time": float(avg_result.final_time),
+            "pure_final_time": float(pure_result.final_time),
+            "R_avg": float(avg_diag["R_peak"]),
+            "R_pure": float(pure_diag["R_peak"]),
+            "R_pure_over_R_avg": observed_ratio,
+            "predicted_R_pure_over_R_avg": float(predicted_ratio),
+            "ratio_error": float(observed_ratio - predicted_ratio),
+            "avg_diagnostics": avg_diag,
+            "pure_diagnostics": pure_diag,
+            "time_aligned_mp4": "time_aligned_averaged_vs_pure_predictive.mp4",
+            "morphology_png": "averaged_vs_pure_predictive.png",
+            "statistics_png": "predictive_mode_statistics.png",
+        }
+        (case_dir / "comparison_metrics.json").write_text(json.dumps(_jsonable(comparison), indent=2))
+        make_predictive_mode_comparison_figure(
+            avg_result,
+            avg_config,
+            pure_result,
+            pure_config,
+            left_dynamic_zoom=left_dynamic_zoom,
+            left_zoom_quantile=left_zoom_quantile,
+            left_zoom_pad=left_zoom_pad,
+            right_dynamic_zoom=right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+        ).write_html(str(case_dir / "averaged_vs_pure_predictive.html"), include_plotlyjs="cdn")
+        _write_predictive_mode_comparison_png(
+            avg_result,
+            avg_config,
+            pure_result,
+            pure_config,
+            case_dir / "averaged_vs_pure_predictive.png",
+            left_dynamic_zoom=left_dynamic_zoom,
+            left_zoom_quantile=left_zoom_quantile,
+            left_zoom_pad=left_zoom_pad,
+            right_dynamic_zoom=right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+        )
+        _write_predictive_mode_statistics_png(
+            avg_diag,
+            pure_diag,
+            avg_config,
+            case_dir / "predictive_mode_statistics.png",
+        )
+        write_time_aligned_finite_horizon_animation(
+            avg_result,
+            avg_config,
+            pure_result,
+            pure_config,
+            case_dir / "time_aligned_averaged_vs_pure_predictive.mp4",
+            frame_count=int(animation_frames),
+            fps=int(fps),
+            left_title="Averaged predictive PP, adaptive RK2",
+            right_title="Pure predictive PP, adaptive RK2",
+            suptitle_prefix="Time-aligned averaged-vs-pure predictive comparison",
+            suptitle_params=f"alpha={alpha:g}, tau={tau:g}, seed={seed}, predicted ratio={predicted_ratio:.3g}",
+            left_dynamic_zoom=left_dynamic_zoom,
+            left_zoom_quantile=left_zoom_quantile,
+            left_zoom_pad=left_zoom_pad,
+            left_zoom_smoothing_radius=left_zoom_smoothing_radius,
+            left_zoom_delay_frames=left_zoom_delay_frames,
+            right_dynamic_zoom=right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+            right_zoom_smoothing_radius=right_zoom_smoothing_radius,
+            right_zoom_delay_frames=right_zoom_delay_frames,
+        )
+        summaries.append(comparison)
+
+    (out / "batch_metrics.json").write_text(json.dumps(_jsonable(summaries), indent=2))
+    report = [
+        "# Averaged Versus Pure Predictive PP Batch",
+        "",
+        "Both panels use adaptive RK2. The left panel is averaged predictive PP; the right panel is pure predictive PP.",
+        "MP4 frames are sampled on a shared objective-time grid by linearly interpolating recorded trajectory frames.",
+        "",
+        "## Cases",
+        "",
+    ]
+    for summary in summaries:
+        label = str(summary["label"])
+        report.extend(
+            [
+                f"### {label}",
+                "",
+                f"- [time-aligned MP4]({label}/{summary['time_aligned_mp4']})",
+                f"- [morphology PNG]({label}/{summary['morphology_png']})",
+                f"- [statistics PNG]({label}/{summary['statistics_png']})",
+                f"- R_avg/R_pure: {float(summary['R_avg']):.6g} / {float(summary['R_pure']):.6g}",
+                f"- R_pure/R_avg observed/predicted: {float(summary['R_pure_over_R_avg']):.6g} / {float(summary['predicted_R_pure_over_R_avg']):.6g}",
+                f"- tau*lambda peak averaged/pure: {float(summary['avg_diagnostics']['tau_lambda_peak']):.6g} / {float(summary['pure_diagnostics']['tau_lambda_peak']):.6g}",
+                f"- residual RMS present/avg/pure at pure final state: "
+                f"{float(summary['pure_diagnostics']['present_residual_rms']):.6g} / "
+                f"{float(summary['pure_diagnostics']['avg_predictive_residual_rms']):.6g} / "
+                f"{float(summary['pure_diagnostics']['pure_predictive_residual_rms']):.6g}",
+                "",
+            ]
+        )
+    (out / "REPORT_PREDICTIVE_MODE_BATCH.md").write_text("\n".join(report))
+    return summaries
+
+
+def run_finite_horizon_comparison(
+    out_dir: Path | str,
+    *,
+    n_fibers: int = 10,
+    n_per_fiber: int = 50,
+    alpha: float = 0.99,
+    K: float | None = 1.0,
+    grid_size: int = 256,
+    domain_radius: float = 4.0,
+    tau: float = 0.055,
+    old_fixed_steps: int = 400,
+    adaptive_steps_per_horizon: int = 10,
+    seed: int = 2026,
+) -> dict[str, object]:
+    """Compare old fixed-RK2 PP discovery dynamics to the new finite-horizon model."""
+
+    K = _optional_float(K)
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    old_config = TransientResearchConfig(
+        n_fibers=n_fibers,
+        n_per_fiber=n_per_fiber,
+        alpha=alpha,
+        K=K,
+        grid_size=grid_size,
+        domain_radius=domain_radius,
+        dt=tau,
+        dt_min=min(tau / 20.0, 1.0e-4),
+        dt_max=tau,
+        max_steps=old_fixed_steps,
+        min_steps=old_fixed_steps + 10,
+        tol_rms=0.0,
+        max_displacement_per_step=0.75,
+        backend="numpy",
+        force_backend="fft",
+        integrator="fixed_rk2",
+        color_scheme="phase_color",
+        seed=seed,
+        make_dashboard=False,
+        make_animation=True,
+        trajectory_frame_count=24,
+        max_plot_points_per_group=1200,
+        record_research_diagnostics=True,
+        record_every=max(1, old_fixed_steps // 40),
+        research_diagnostics_every=max(1, old_fixed_steps // 40),
+        out_dir=out / "old_fixed_rk2_pp",
+    )
+    initial = make_initial_condition(old_config)
+    old_result = run_research_simulation(old_config, initial)
+    old_summary = save_research_run_outputs(old_result, old_config, old_config.out_dir, initial=initial)
+
+    dt_adaptive = float(tau) / max(1, int(adaptive_steps_per_horizon))
+    new_steps = int(old_fixed_steps) * max(1, int(adaptive_steps_per_horizon))
+    new_config = SimulationConfig(
+        n_fibers=n_fibers,
+        n_per_fiber=n_per_fiber,
+        alpha=alpha,
+        K=K,
+        grid_size=grid_size,
+        domain_radius=domain_radius,
+        dt=dt_adaptive,
+        dt_min=min(dt_adaptive / 10.0, 1.0e-4),
+        dt_max=dt_adaptive,
+        max_steps=new_steps,
+        min_steps=new_steps + 10,
+        tol_rms=0.0,
+        max_displacement_per_step=0.75,
+        backend="numpy",
+        integrator="adaptive_rk2",
+        color_scheme="phase_color",
+        prediction_horizon_tau=float(tau),
+        seed=seed,
+        make_dashboard=False,
+        make_animation=True,
+        trajectory_frame_count=24,
+        max_plot_points_per_group=1200,
+        record_every=max(1, new_steps // 40),
+        out_dir=out / "finite_horizon_adaptive",
+    )
+    new_result = run_finite_horizon_gauge_averaged_simulation(new_config, initial)
+
+    new_out = Path(new_config.out_dir)
+    new_out.mkdir(parents=True, exist_ok=True)
+    (new_out / "config.json").write_text(json.dumps(_config_to_json(new_config), indent=2))
+    write_time_diagnostics(new_out / "time_diagnostics.csv", new_result.diagnostics)
+    np.savez_compressed(
+        new_out / "run_state.npz",
+        x_initial=new_result.x_initial.astype(np.float32),
+        x_final=new_result.x_final.astype(np.float32),
+        omega=new_result.initial.omega.astype(np.float32),
+        group_id=new_result.initial.group_id.astype(np.int32),
+        A_final=new_result.A_final.astype(np.float32),
+        residual=new_result.residual.astype(np.float32),
+        diagnostics=new_result.diagnostics.astype(np.float64),
+    )
+
+    comparison = summarize_finite_horizon_comparison(old_result, old_config, new_result, new_config)
+    comparison["old_summary"] = old_summary
+    (out / "comparison_metrics.json").write_text(json.dumps(_jsonable(comparison), indent=2))
+    make_finite_horizon_comparison_figure(old_result, old_config, new_result, new_config).write_html(
+        str(out / "finite_horizon_vs_fixed_rk2.html"),
+        include_plotlyjs="cdn",
+    )
+    make_finite_horizon_residual_figure(new_result, new_config).write_html(
+        str(out / "finite_horizon_residual_split.html"),
+        include_plotlyjs="cdn",
+    )
+    _write_finite_horizon_comparison_png(
+        old_result,
+        old_config,
+        new_result,
+        new_config,
+        out / "finite_horizon_vs_fixed_rk2.png",
+    )
+    _write_finite_horizon_residual_png(
+        new_result,
+        new_config,
+        out / "finite_horizon_residual_split.png",
+    )
+
+    report = [
+        "# Finite-Horizon Gauge-Averaged PP Comparison",
+        "",
+        "This compares the original PP equation with fixed RK2 to the new finite-horizon gauge-averaged PP equation integrated with adaptive RK2.",
+        "",
+        "- [Morphology comparison](finite_horizon_vs_fixed_rk2.html)",
+        "- [Morphology comparison PNG](finite_horizon_vs_fixed_rk2.png)",
+        "- [Finite-horizon residual split](finite_horizon_residual_split.html)",
+        "- [Finite-horizon residual split PNG](finite_horizon_residual_split.png)",
+        "",
+        "## Metrics",
+        "",
+        "```json",
+        json.dumps(_jsonable(comparison), indent=2),
+        "```",
+        "",
+        "Interpretation target: if the finite-horizon adaptive run reproduces the old fixed-RK2 disk with small finite-horizon residual while ordinary PP residual remains large, then the disk can be reframed as a genuine phase of the predictive gauge-averaged model rather than as an endpoint of the original PP ODE.",
+        "",
+    ]
+    (out / "REPORT_FINITE_HORIZON.md").write_text("\n".join(report))
+    return comparison
+
+
+def _trajectory_at_time(result: SimulationResult, time_value: float) -> Array:
+    """Linearly interpolate a recorded trajectory to an objective time."""
+
+    if result.trajectory_x is None or result.trajectory_times is None:
+        raise ValueError("result must contain trajectory_x and trajectory_times; run with make_animation=True")
+    trajectory = np.asarray(result.trajectory_x, dtype=np.float64)
+    times = np.asarray(result.trajectory_times, dtype=np.float64)
+    if len(times) == 0:
+        raise ValueError("trajectory_times is empty")
+    t = float(time_value)
+    if t <= float(times[0]):
+        return trajectory[0]
+    if t >= float(times[-1]):
+        return trajectory[-1]
+    hi = int(np.searchsorted(times, t, side="left"))
+    lo = max(0, hi - 1)
+    t0 = float(times[lo])
+    t1 = float(times[hi])
+    if abs(t1 - t0) <= 1e-15:
+        return trajectory[hi]
+    w = (t - t0) / (t1 - t0)
+    return (1.0 - w) * trajectory[lo] + w * trajectory[hi]
+
+
+def _setup_matplotlib_caches() -> None:
+    import os
+    import tempfile
+
+    mpl_config = Path(tempfile.gettempdir()) / "lmsspp_mplconfig"
+    mpl_config.mkdir(parents=True, exist_ok=True)
+    xdg_cache = Path(tempfile.gettempdir()) / "lmsspp_cache"
+    xdg_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_config))
+    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache))
+
+
+def _save_experiment_png(fig: Any, path: Path | str, *, dpi: int) -> None:
+    """Save experiment PNGs with maximum lossless PNG compression."""
+
+    fig.savefig(path, dpi=dpi, pil_kwargs={"compress_level": EXPERIMENT_PNG_COMPRESS_LEVEL})
+
+
+def _experiment_mp4_writer(path: Path | str, *, fps: int) -> Any:
+    """Create a small, broadly compatible H.264 writer for experiment MP4s."""
+
+    import imageio.v2 as imageio
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return imageio.get_writer(
+        str(output),
+        format="FFMPEG",
+        fps=int(fps),
+        codec="libx264",
+        pixelformat="yuv420p",
+        macro_block_size=16,
+        output_params=[
+            "-crf",
+            str(EXPERIMENT_MP4_CRF),
+            "-preset",
+            EXPERIMENT_MP4_PRESET,
+            "-movflags",
+            "+faststart",
+        ],
+    )
+
+
+def write_time_aligned_finite_horizon_animation(
+    old_result: ResearchSimulationResult,
+    old_config: TransientResearchConfig,
+    new_result: SimulationResult,
+    new_config: SimulationConfig,
+    path: Path | str,
+    *,
+    frame_count: int = 72,
+    fps: int = 12,
+    max_points_per_group: int = 700,
+    left_title: str = "Original PP, fixed RK2",
+    right_title: str = "Finite-horizon PP, adaptive RK2",
+    suptitle_prefix: str = "Time-aligned finite-horizon comparison",
+    suptitle_params: str | None = None,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float = 0.9975,
+    left_zoom_pad: float = 1.35,
+    left_zoom_smoothing_radius: int = 2,
+    left_zoom_delay_frames: int = 4,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+    right_zoom_smoothing_radius: int = 2,
+    right_zoom_delay_frames: int = 4,
+) -> None:
+    """Write a two-panel MP4 comparing fixed-RK2 PP and adaptive finite-horizon PP.
+
+    Frames are sampled at common objective times, not by raw frame index, so
+    fixed and adaptive trajectories remain visually synchronized even when the
+    accepted-step counts differ.
+    """
+
+    if frame_count < 2:
+        raise ValueError("frame_count must be at least 2")
+    if fps <= 0:
+        raise ValueError("fps must be positive")
+    if old_result.trajectory_times is None or new_result.trajectory_times is None:
+        raise ValueError("both results must include trajectory_times")
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    group_names = old_result.initial.group_names
+    colors = fiber_colors(old_config, old_result.initial.omega_atoms, len(group_names))
+    rng = np.random.default_rng(int(old_config.seed) + 5901)
+    sample_indices: list[Array] = []
+    for k in range(len(group_names)):
+        idx_all = np.where(old_result.initial.group_id == k)[0]
+        if len(idx_all) == 0:
+            sample_indices.append(np.array([], dtype=np.int64))
+            continue
+        sample_indices.append(np.sort(rng.choice(idx_all, size=min(int(max_points_per_group), len(idx_all)), replace=False)))
+
+    t_end = min(float(old_result.trajectory_times[-1]), float(new_result.trajectory_times[-1]))
+    target_times = np.linspace(0.0, t_end, int(frame_count))
+    old_frames = [_trajectory_at_time(old_result, float(t)) for t in target_times]
+    new_frames = [_trajectory_at_time(new_result, float(t)) for t in target_times]
+    left_zoom_scales: Array | None = None
+    if left_dynamic_zoom:
+        raw_zoom_scales = [
+            _cloud_halfwidth(x_state, q=left_zoom_quantile, pad=left_zoom_pad, floor=1e-6)
+            for x_state in old_frames
+        ]
+        left_zoom_scales = _smooth_delayed_zoom_scales(
+            raw_zoom_scales,
+            smoothing_radius=left_zoom_smoothing_radius,
+            delay_frames=left_zoom_delay_frames,
+        )
+    right_zoom_scales: Array | None = None
+    if right_dynamic_zoom:
+        raw_zoom_scales = [
+            _cloud_halfwidth(x_state, q=right_zoom_quantile, pad=right_zoom_pad, floor=1e-6)
+            for x_state in new_frames
+        ]
+        right_zoom_scales = _smooth_delayed_zoom_scales(
+            raw_zoom_scales,
+            smoothing_radius=right_zoom_smoothing_radius,
+            delay_frames=right_zoom_delay_frames,
+        )
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 6.4), dpi=150)
+    panels = (
+        (axes[0], old_config, left_title),
+        (axes[1], new_config, right_title),
+    )
+    traces: list[list[Any]] = []
+    for ax, cfg, title in panels:
+        ax.set_title(title)
+        ax.set_xlim(-cfg.domain_radius, cfg.domain_radius)
+        ax.set_ylim(-cfg.domain_radius, cfg.domain_radius)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.15)
+        ax.set_xlabel("x1")
+        ax.set_ylabel("x2")
+        panel_traces: list[Any] = []
+        for k, idx in enumerate(sample_indices):
+            scatter = ax.scatter([], [], s=8, c=colors[k], alpha=0.72, linewidths=0, label=group_names[k])
+            panel_traces.append(scatter)
+        traces.append(panel_traces)
+    axes[0].legend(loc="upper right", fontsize=6, markerscale=1.2, frameon=True)
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.94])
+
+    old_step_scale = old_result.steps / max(float(old_result.final_time), 1e-30)
+    new_step_scale = new_result.steps / max(float(new_result.final_time), 1e-30)
+    if suptitle_params is None:
+        suptitle_params = f"alpha={new_config.alpha:g}, tau={new_config.prediction_horizon_tau:g}, seed={new_config.seed}"
+    writer = _experiment_mp4_writer(output, fps=int(fps))
+    try:
+        for frame_idx, t in enumerate(target_times):
+            old_x = old_frames[frame_idx]
+            new_x = new_frames[frame_idx]
+            for panel_idx, x_state in enumerate((old_x, new_x)):
+                for k, idx in enumerate(sample_indices):
+                    traces[panel_idx][k].set_offsets(x_state[idx])
+            if left_zoom_scales is not None:
+                zoom = float(left_zoom_scales[frame_idx])
+                axes[0].set_xlim(-zoom, zoom)
+                axes[0].set_ylim(-zoom, zoom)
+            if right_zoom_scales is not None:
+                zoom = float(right_zoom_scales[frame_idx])
+                axes[1].set_xlim(-zoom, zoom)
+                axes[1].set_ylim(-zoom, zoom)
+            fig.suptitle(
+                f"{suptitle_prefix} "
+                f"| t={t:.3f}/{t_end:.3f} "
+                f"| fixed step~{old_step_scale * t:.1f}, adaptive step~{new_step_scale * t:.1f} "
+                f"| {suptitle_params}",
+                fontsize=11,
+            )
+            fig.canvas.draw()
+            rgba = np.asarray(fig.canvas.buffer_rgba())
+            writer.append_data(rgba[:, :, :3])
+    finally:
+        writer.close()
+        plt.close(fig)
+
+
+def default_finite_horizon_animation_cases() -> tuple[dict[str, object], ...]:
+    """Default small batch of seeds and nearby finite-horizon configurations."""
+
+    return (
+        {"label": "seed2026_alpha0p99_tau0p055", "seed": 2026, "alpha": 0.99, "K": 1.0, "tau": 0.055},
+        {"label": "seed2027_alpha0p99_tau0p045", "seed": 2027, "alpha": 0.99, "K": 1.0, "tau": 0.045},
+        {"label": "seed2028_alpha0p995_tau0p0275", "seed": 2028, "alpha": 0.995, "K": 1.0, "tau": 0.0275},
+        {"label": "seed2029_alpha0p98_K1p2_tau0p055", "seed": 2029, "alpha": 0.98, "K": 1.2, "tau": 0.055},
+    )
+
+
+def _write_trajectory_npz(path: Path, result: SimulationResult) -> None:
+    np.savez_compressed(
+        path,
+        trajectory_x=(
+            np.empty((0, 0, 2), dtype=np.float32)
+            if result.trajectory_x is None
+            else result.trajectory_x.astype(np.float32)
+        ),
+        trajectory_times=(
+            np.empty((0,), dtype=np.float64)
+            if result.trajectory_times is None
+            else result.trajectory_times.astype(np.float64)
+        ),
+    )
+
+
+def _save_finite_horizon_run_outputs(result: SimulationResult, config: SimulationConfig, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "config.json").write_text(json.dumps(_config_to_json(config), indent=2))
+    write_time_diagnostics(out_dir / "time_diagnostics.csv", result.diagnostics)
+    np.savez_compressed(
+        out_dir / "run_state.npz",
+        x_initial=result.x_initial.astype(np.float32),
+        x_final=result.x_final.astype(np.float32),
+        omega=result.initial.omega.astype(np.float32),
+        group_id=result.initial.group_id.astype(np.int32),
+        A_final=result.A_final.astype(np.float32),
+        residual=result.residual.astype(np.float32),
+        diagnostics=result.diagnostics.astype(np.float64),
+        trajectory_x=(
+            np.empty((0, 0, 2), dtype=np.float32)
+            if result.trajectory_x is None
+            else result.trajectory_x.astype(np.float32)
+        ),
+        trajectory_times=(
+            np.empty((0,), dtype=np.float64)
+            if result.trajectory_times is None
+            else result.trajectory_times.astype(np.float64)
+        ),
+    )
+
+
+def _summarize_adaptive_pp_comparison(
+    old_result: ResearchSimulationResult,
+    old_config: TransientResearchConfig,
+    new_result: ResearchSimulationResult,
+    new_config: TransientResearchConfig,
+) -> dict[str, object]:
+    old_dx = float(2.0 * old_config.domain_radius / old_config.grid_size)
+    new_dx = float(2.0 * new_config.domain_radius / new_config.grid_size)
+    old_morph = compute_morphology_metrics(old_result.x_final, grid_dx=old_dx)
+    new_morph = compute_morphology_metrics(new_result.x_final, grid_dx=new_dx)
+    map_residual = rk2_map_residual(new_config, new_result.x_final, new_result.initial.omega, dt=max(float(new_result.dt_mean), float(new_config.dt_min)))
+    map_norm = np.linalg.norm(map_residual, axis=1)
+    return {
+        "tau": float(old_config.dt),
+        "old_fixed_dt": float(old_config.dt),
+        "new_dt_initial": float(new_config.dt),
+        "new_dt_max": float(new_config.dt_max),
+        "alpha": float(new_config.alpha),
+        "K": float(resolve_pp_K(new_config.alpha, new_config.K)),
+        "K_config": None if new_config.K is None else float(new_config.K),
+        "grid_size": int(new_config.grid_size),
+        "n_particles": int(len(new_result.x_final)),
+        "right_model": "ordinary_pp_adaptive",
+        "old_steps": int(old_result.steps),
+        "old_final_time": float(old_result.final_time),
+        "old_disk_radius": float(old_morph["disk_radius"]),
+        "old_boundary_mass_fraction": float(old_morph["boundary_mass_fraction"]),
+        "old_pp_residual_rms": float(old_result.rms_residual),
+        "old_angular_sync": angular_synchronization_score(old_result.x_final, old_result.initial.omega),
+        "new_steps": int(new_result.steps),
+        "new_final_time": float(new_result.final_time),
+        "new_disk_radius": float(new_morph["disk_radius"]),
+        "new_boundary_mass_fraction": float(new_morph["boundary_mass_fraction"]),
+        "new_model_residual_rms": float(new_result.rms_residual),
+        "new_pp_residual_rms": float(new_result.rms_residual),
+        "new_rk2_map_residual_rms": float(np.sqrt(np.mean(map_norm * map_norm))),
+        "new_angular_sync": angular_synchronization_score(new_result.x_final, new_result.initial.omega),
+        "radius_ratio_new_over_old": float(new_morph["disk_radius"] / max(float(old_morph["disk_radius"]), 1e-30)),
+        "new_dynamic_zoom_halfwidth": _cloud_halfwidth(new_result.x_final, q=0.9975, pad=1.35, floor=1e-6),
+    }
+
+
+def run_finite_horizon_animation_batch(
+    out_dir: Path | str,
+    *,
+    cases: Sequence[dict[str, object]] | None = None,
+    right_model: AnimationBatchRightModel = "finite_horizon",
+    n_fibers: int = 10,
+    n_per_fiber: int = 40,
+    grid_size: int = 128,
+    domain_radius: float = 4.0,
+    old_fixed_steps: int = 160,
+    adaptive_steps: int | None = None,
+    adaptive_steps_per_horizon: int = 4,
+    fixed_dt_min: float | None = None,
+    adaptive_dt_min: float | None = None,
+    adaptive_dt_max: float | None = None,
+    record_every: int | None = None,
+    research_diagnostics_every: int | None = None,
+    research_diagnostic_sample_size: int = 2500,
+    research_energy_sample_size: int = 1200,
+    research_nn_chunk: int = 512,
+    left_dynamic_zoom: bool = False,
+    left_zoom_quantile: float | None = None,
+    left_zoom_pad: float | None = None,
+    left_zoom_smoothing_radius: int | None = None,
+    left_zoom_delay_frames: int | None = None,
+    right_dynamic_zoom: bool = False,
+    right_zoom_quantile: float = 0.9975,
+    right_zoom_pad: float = 1.35,
+    right_zoom_smoothing_radius: int = 2,
+    right_zoom_delay_frames: int = 4,
+    animation_frames: int = 72,
+    fps: int = 12,
+) -> list[dict[str, object]]:
+    """Run fixed-PP versus adaptive-model comparisons and write synchronized MP4s.
+
+    ``right_model='finite_horizon'`` preserves the original predictive-model
+    batch. ``right_model='ordinary_pp_adaptive'`` compares the same PP kinetic
+    equation on both sides, changing only fixed versus adaptive RK2.
+    """
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    if right_model not in ("finite_horizon", "ordinary_pp_adaptive"):
+        raise ValueError("right_model must be one of 'finite_horizon' or 'ordinary_pp_adaptive'")
+    selected_cases = tuple(default_finite_horizon_animation_cases() if cases is None else cases)
+    summaries: list[dict[str, object]] = []
+    for case_idx, case in enumerate(selected_cases):
+        label = str(case.get("label", f"case_{case_idx:02d}"))
+        seed = int(case.get("seed", 2026 + case_idx))
+        alpha = float(case.get("alpha", 0.99))
+        K = _optional_float(case.get("K", 1.0))
+        tau = float(case.get("tau", 0.055))
+        fixed_steps = int(case.get("old_fixed_steps", old_fixed_steps))
+        case_adaptive_steps = int(case.get("adaptive_steps", adaptive_steps if adaptive_steps is not None else fixed_steps))
+        case_record_every = int(case.get("record_every", record_every if record_every is not None else max(1, fixed_steps // 40)))
+        case_research_every = int(
+            case.get(
+                "research_diagnostics_every",
+                research_diagnostics_every if research_diagnostics_every is not None else case_record_every,
+            )
+        )
+        case_right_dynamic_zoom = bool(case.get("right_dynamic_zoom", right_dynamic_zoom))
+        case_right_zoom_smoothing_radius = int(case.get("right_zoom_smoothing_radius", right_zoom_smoothing_radius))
+        case_right_zoom_delay_frames = int(case.get("right_zoom_delay_frames", right_zoom_delay_frames))
+        case_left_dynamic_zoom = bool(case.get("left_dynamic_zoom", left_dynamic_zoom))
+        case_left_zoom_quantile = float(case.get("left_zoom_quantile", left_zoom_quantile if left_zoom_quantile is not None else right_zoom_quantile))
+        case_left_zoom_pad = float(case.get("left_zoom_pad", left_zoom_pad if left_zoom_pad is not None else right_zoom_pad))
+        case_left_zoom_smoothing_radius = int(
+            case.get(
+                "left_zoom_smoothing_radius",
+                left_zoom_smoothing_radius if left_zoom_smoothing_radius is not None else case_right_zoom_smoothing_radius,
+            )
+        )
+        case_left_zoom_delay_frames = int(
+            case.get(
+                "left_zoom_delay_frames",
+                left_zoom_delay_frames if left_zoom_delay_frames is not None else case_right_zoom_delay_frames,
+            )
+        )
+        case_dir = out / label
+        case_dir.mkdir(parents=True, exist_ok=True)
+
+        old_config = TransientResearchConfig(
+            n_fibers=n_fibers,
+            n_per_fiber=n_per_fiber,
+            alpha=alpha,
+            K=K,
+            grid_size=grid_size,
+            domain_radius=domain_radius,
+            dt=tau,
+            dt_min=float(fixed_dt_min if fixed_dt_min is not None else min(tau / 20.0, 1.0e-4)),
+            dt_max=tau,
+            max_steps=fixed_steps,
+            min_steps=fixed_steps + 10,
+            tol_rms=0.0,
+            max_displacement_per_step=0.75,
+            backend="numpy",
+            force_backend="fft",
+            integrator="fixed_rk2",
+            color_scheme="phase_color",
+            seed=seed,
+            make_dashboard=False,
+            make_animation=True,
+            trajectory_frame_count=max(animation_frames, 2),
+            max_plot_points_per_group=1200,
+            record_research_diagnostics=True,
+            record_every=case_record_every,
+            research_diagnostics_every=case_research_every,
+            research_diagnostic_sample_size=research_diagnostic_sample_size,
+            research_energy_sample_size=research_energy_sample_size,
+            research_nn_chunk=research_nn_chunk,
+            out_dir=case_dir / "old_fixed_rk2_pp",
+        )
+        initial = make_initial_condition(old_config)
+        old_result = run_research_simulation(old_config, initial)
+        old_summary = save_research_run_outputs(old_result, old_config, old_config.out_dir, initial=initial)
+        _write_trajectory_npz(Path(old_config.out_dir) / "trajectory.npz", old_result)
+
+        if right_model == "finite_horizon":
+            dt_adaptive = tau / max(1, int(adaptive_steps_per_horizon))
+            new_steps = int(fixed_steps) * max(1, int(adaptive_steps_per_horizon))
+            new_config = SimulationConfig(
+                n_fibers=n_fibers,
+                n_per_fiber=n_per_fiber,
+                alpha=alpha,
+                K=K,
+                grid_size=grid_size,
+                domain_radius=domain_radius,
+                dt=dt_adaptive,
+                dt_min=float(adaptive_dt_min if adaptive_dt_min is not None else min(dt_adaptive / 10.0, 1.0e-4)),
+                dt_max=float(adaptive_dt_max if adaptive_dt_max is not None else dt_adaptive),
+                max_steps=new_steps,
+                min_steps=new_steps + 10,
+                tol_rms=0.0,
+                max_displacement_per_step=0.75,
+                backend="numpy",
+                integrator="adaptive_rk2",
+                color_scheme="phase_color",
+                prediction_horizon_tau=tau,
+                seed=seed,
+                make_dashboard=False,
+                make_animation=True,
+                trajectory_frame_count=max(animation_frames, 2),
+                max_plot_points_per_group=1200,
+                record_every=max(1, new_steps // 40),
+                out_dir=case_dir / "finite_horizon_adaptive",
+            )
+            new_result = run_finite_horizon_gauge_averaged_simulation(new_config, initial)
+            new_out = Path(new_config.out_dir)
+            _save_finite_horizon_run_outputs(new_result, new_config, new_out)
+            comparison = summarize_finite_horizon_comparison(old_result, old_config, new_result, new_config)
+            K_eff = resolve_pp_K(new_config.alpha, new_config.K)
+            right_title = "Finite-horizon PP, adaptive RK2"
+            right_hist_title = "Finite-horizon radius histogram"
+            title_text = (
+                "Finite-horizon predictive model test<br>"
+                f"<sup>tau={new_config.prediction_horizon_tau:g}, adaptive dt_max={new_config.dt_max:g}; "
+                f"old fixed h={old_config.dt:g}, alpha={new_config.alpha:g}, K={K_eff:g}, seed={new_config.seed}</sup>"
+            )
+            suptitle = (
+                f"Finite-horizon predictive model test: tau={new_config.prediction_horizon_tau:g}, "
+                f"adaptive dt_max={new_config.dt_max:g}, old fixed h={old_config.dt:g}"
+            )
+            mp4_name = "time_aligned_fixed_vs_finite_horizon.mp4"
+            morphology_stem = "finite_horizon_vs_fixed_rk2"
+            residual_stem = "finite_horizon_residual_split"
+            suptitle_prefix = "Time-aligned finite-horizon comparison"
+            suptitle_params = f"alpha={new_config.alpha:g}, tau={new_config.prediction_horizon_tau:g}, seed={new_config.seed}"
+        else:
+            new_steps = case_adaptive_steps
+            new_config = TransientResearchConfig(
+                n_fibers=n_fibers,
+                n_per_fiber=n_per_fiber,
+                alpha=alpha,
+                K=K,
+                grid_size=grid_size,
+                domain_radius=domain_radius,
+                dt=tau,
+                dt_min=float(adaptive_dt_min if adaptive_dt_min is not None else min(tau / 20.0, 1.0e-4)),
+                dt_max=float(adaptive_dt_max if adaptive_dt_max is not None else max(tau, float(adaptive_dt_min or tau))),
+                max_steps=new_steps,
+                min_steps=new_steps + 10,
+                tol_rms=0.0,
+                max_displacement_per_step=0.75,
+                backend="numpy",
+                force_backend="fft",
+                integrator="adaptive_rk2",
+                color_scheme="phase_color",
+                seed=seed,
+                make_dashboard=False,
+                make_animation=True,
+                trajectory_frame_count=max(animation_frames, 2),
+                max_plot_points_per_group=1200,
+                record_research_diagnostics=True,
+                record_every=max(1, int(case.get("adaptive_record_every", case_record_every))),
+                research_diagnostics_every=max(1, int(case.get("adaptive_research_diagnostics_every", case_research_every))),
+                research_diagnostic_sample_size=research_diagnostic_sample_size,
+                research_energy_sample_size=research_energy_sample_size,
+                research_nn_chunk=research_nn_chunk,
+                out_dir=case_dir / "adaptive_rk2_pp",
+            )
+            new_result = run_research_simulation(new_config, initial)
+            new_summary = save_research_run_outputs(new_result, new_config, new_config.out_dir, initial=initial)
+            _write_trajectory_npz(Path(new_config.out_dir) / "trajectory.npz", new_result)
+            comparison = _summarize_adaptive_pp_comparison(old_result, old_config, new_result, new_config)
+            comparison["new_summary"] = new_summary
+            K_eff = resolve_pp_K(new_config.alpha, new_config.K)
+            right_title = "Original PP, adaptive RK2"
+            right_hist_title = "Adaptive PP radius histogram"
+            title_text = (
+                "Original PP integrator comparison<br>"
+                f"<sup>adaptive right panel uses dynamic zoom={case_right_dynamic_zoom}; "
+                f"h={old_config.dt:g}, alpha={new_config.alpha:g}, K={K_eff:g}, seed={new_config.seed}</sup>"
+            )
+            suptitle = f"Original PP fixed-vs-adaptive RK2: h={old_config.dt:g}, alpha={new_config.alpha:g}, K={K_eff:g}"
+            mp4_name = "time_aligned_fixed_vs_adaptive_pp.mp4"
+            morphology_stem = "fixed_vs_adaptive_pp"
+            residual_stem = "adaptive_pp_residual_split"
+            suptitle_prefix = "Time-aligned original PP fixed-vs-adaptive comparison"
+            suptitle_params = f"alpha={new_config.alpha:g}, h={old_config.dt:g}, seed={new_config.seed}"
+        comparison["label"] = label
+        comparison["case_index"] = int(case_idx)
+        comparison["right_model"] = right_model
+        comparison["old_summary"] = old_summary
+        comparison["time_aligned_mp4"] = mp4_name
+        comparison["morphology_png"] = f"{morphology_stem}.png"
+        comparison["residual_png"] = f"{residual_stem}.png"
+        (case_dir / "comparison_metrics.json").write_text(json.dumps(_jsonable(comparison), indent=2))
+        make_finite_horizon_comparison_figure(
+            old_result,
+            old_config,
+            new_result,
+            new_config,
+            right_title=right_title,
+            right_hist_title=right_hist_title,
+            title_text=title_text,
+            right_dynamic_zoom=case_right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+        ).write_html(
+            str(case_dir / f"{morphology_stem}.html"),
+            include_plotlyjs="cdn",
+        )
+        _write_finite_horizon_comparison_png(
+            old_result,
+            old_config,
+            new_result,
+            new_config,
+            case_dir / f"{morphology_stem}.png",
+            right_title=right_title,
+            suptitle=suptitle,
+            right_dynamic_zoom=case_right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+        )
+        if right_model == "finite_horizon":
+            make_finite_horizon_residual_figure(new_result, new_config).write_html(
+                str(case_dir / f"{residual_stem}.html"),
+                include_plotlyjs="cdn",
+            )
+            _write_finite_horizon_residual_png(
+                new_result,
+                new_config,
+                case_dir / f"{residual_stem}.png",
+            )
+        else:
+            assert isinstance(new_result, ResearchSimulationResult)
+            assert isinstance(new_config, TransientResearchConfig)
+            make_pp_adaptive_residual_figure(
+                new_result,
+                new_config,
+                dynamic_zoom=case_right_dynamic_zoom,
+                zoom_quantile=right_zoom_quantile,
+                zoom_pad=right_zoom_pad,
+            ).write_html(
+                str(case_dir / f"{residual_stem}.html"),
+                include_plotlyjs="cdn",
+            )
+            _write_pp_adaptive_residual_png(
+                new_result,
+                new_config,
+                case_dir / f"{residual_stem}.png",
+                dynamic_zoom=case_right_dynamic_zoom,
+                zoom_quantile=right_zoom_quantile,
+                zoom_pad=right_zoom_pad,
+            )
+        write_time_aligned_finite_horizon_animation(
+            old_result,
+            old_config,
+            new_result,
+            new_config,
+            case_dir / mp4_name,
+            frame_count=int(animation_frames),
+            fps=int(fps),
+            right_title=right_title,
+            suptitle_prefix=suptitle_prefix,
+            suptitle_params=suptitle_params,
+            left_dynamic_zoom=case_left_dynamic_zoom,
+            left_zoom_quantile=case_left_zoom_quantile,
+            left_zoom_pad=case_left_zoom_pad,
+            left_zoom_smoothing_radius=case_left_zoom_smoothing_radius,
+            left_zoom_delay_frames=case_left_zoom_delay_frames,
+            right_dynamic_zoom=case_right_dynamic_zoom,
+            right_zoom_quantile=right_zoom_quantile,
+            right_zoom_pad=right_zoom_pad,
+            right_zoom_smoothing_radius=case_right_zoom_smoothing_radius,
+            right_zoom_delay_frames=case_right_zoom_delay_frames,
+        )
+        summaries.append(comparison)
+
+    (out / "batch_metrics.json").write_text(json.dumps(_jsonable(summaries), indent=2))
+    if right_model == "finite_horizon":
+        title = "Finite-Horizon Animation Batch"
+        description = "Each case compares original PP with fixed RK2 on the left against finite-horizon gauge-averaged PP with adaptive RK2 on the right."
+    else:
+        title = "Original PP Fixed-Vs-Adaptive Animation Batch"
+        description = "Each case compares the same original PP kinetic equation with fixed RK2 on the left and adaptive RK2 on the right. The right panel can use dynamic zoom to reveal the small cross-scale adaptive collapse."
+    report = [
+        f"# {title}",
+        "",
+        description,
+        "MP4 frames are sampled on a shared objective-time grid by linearly interpolating recorded trajectory frames.",
+        "",
+        "## Cases",
+        "",
+    ]
+    for summary in summaries:
+        label = str(summary["label"])
+        if summary.get("right_model") == "ordinary_pp_adaptive":
+            residual_line = (
+                f"- residual RMS adaptive PP / adaptive RK2-map: "
+                f"{float(summary['new_pp_residual_rms']):.6g} / {float(summary['new_rk2_map_residual_rms']):.6g}"
+            )
+        else:
+            residual_line = (
+                f"- residual RMS ordinary PP/new model: "
+                f"{float(summary['new_pp_residual_rms']):.6g} / {float(summary['new_model_residual_rms']):.6g}"
+            )
+        report.extend(
+            [
+                f"### {label}",
+                "",
+                f"- [time-aligned MP4]({label}/{summary['time_aligned_mp4']})",
+                f"- [morphology PNG]({label}/{summary['morphology_png']})",
+                f"- [residual PNG]({label}/{summary['residual_png']})",
+                f"- disk radius old/new: {float(summary['old_disk_radius']):.6g} / {float(summary['new_disk_radius']):.6g}",
+                residual_line,
+                "",
+            ]
+        )
+    (out / "REPORT_ANIMATION_BATCH.md").write_text("\n".join(report))
+    return summaries
+
+
+def _toy_vector_field(
+    x: Array,
+    *,
+    model: str,
+    c: float,
+    eps: float,
+    delta: float,
+    saddle_c: float,
+) -> Array:
+    pts = np.asarray(x, dtype=np.float64)
+    r = np.linalg.norm(pts, axis=1, keepdims=True)
+    safe_r = np.maximum(r, float(eps))
+    if model == "conical":
+        return -float(c) * pts / safe_r
+    if model == "log_conical":
+        coeff = (1.0 / max(float(delta), 1e-30)) + np.log(safe_r)
+        return -float(c) * coeff * pts / safe_r
+    if model == "saddle":
+        lam = float(saddle_c) / safe_r
+        return np.c_[-lam[:, 0] * pts[:, 0], lam[:, 0] * pts[:, 1]]
+    if model == "combined":
+        radial = -float(c) * pts / safe_r
+        lam = float(saddle_c) / safe_r
+        saddle = np.c_[-lam[:, 0] * pts[:, 0], lam[:, 0] * pts[:, 1]]
+        return radial + saddle
+    raise ValueError(f"unknown toy model {model!r}")
+
+
+def _toy_q(x: Array, *, h: float, c: float, eps: float, saddle_c: float) -> float:
+    r = np.linalg.norm(np.asarray(x, dtype=np.float64), axis=1)
+    scale = max(abs(float(c)), abs(float(saddle_c)))
+    return float(abs(h) * scale / max(float(np.min(r)) + float(eps), 1e-30))
+
+
+def simulate_toy_transient(
+    x0: Array,
+    *,
+    model: str = "conical",
+    integrator: IntegratorChoice = "fixed_rk2",
+    dt: float = 0.02,
+    max_steps: int = 200,
+    c: float = 1.0,
+    eps: float = 1e-4,
+    delta: float = 0.01,
+    saddle_c: float = 1.0,
+    adaptive_tol: float = 1e-4,
+    dt_min: float = 1e-5,
+    dt_max: float = 0.05,
+    record_every: int = 1,
+) -> dict[str, Array]:
+    """Integrate conical/saddle toy fields that isolate RK2 shell and hyperbola mechanisms."""
+
+    if integrator not in ("fixed_rk2", "adaptive_rk2"):
+        raise ValueError("toy integrator must be 'fixed_rk2' or 'adaptive_rk2'")
+    x = np.asarray(x0, dtype=np.float64).copy()
+    h_current = float(dt)
+    t = 0.0
+    frames: list[Array] = []
+    rows: list[tuple[float, float, float, float, float]] = []
+
+    def rhs(state: Array) -> Array:
+        return _toy_vector_field(state, model=model, c=c, eps=eps, delta=delta, saddle_c=saddle_c)
+
+    for step in range(int(max_steps) + 1):
+        if step % max(1, int(record_every)) == 0:
+            r = np.linalg.norm(x, axis=1)
+            frames.append(x.astype(np.float32, copy=True))
+            rows.append((float(step), float(t), float(h_current), float(np.min(r)), _toy_q(x, h=h_current, c=c, eps=eps, saddle_c=saddle_c)))
+        if step >= int(max_steps):
+            break
+        if integrator == "fixed_rk2":
+            h = float(dt)
+            k1 = rhs(x)
+            k2 = rhs(x + h * k1)
+            x = x + 0.5 * h * (k1 + k2)
+            t += h
+            continue
+
+        while True:
+            h = float(np.clip(h_current, dt_min, dt_max))
+            k1 = rhs(x)
+            x_euler = x + h * k1
+            k2 = rhs(x_euler)
+            x_heun = x + 0.5 * h * (k1 + k2)
+            err = float(np.sqrt(np.mean(np.sum((x_heun - x_euler) ** 2, axis=1))))
+            if err <= adaptive_tol or h <= dt_min * (1.0 + 1e-12):
+                x = x_heun
+                t += h
+                h_current = float(np.clip(h * _adaptive_step_factor(err, adaptive_tol, grow=True), dt_min, dt_max))
+                break
+            h_current = float(np.clip(h * _adaptive_step_factor(err, adaptive_tol, grow=False), dt_min, dt_max))
+
+    return {
+        "trajectory": np.stack(frames).astype(np.float32),
+        "diagnostics": np.array(rows, dtype=np.float64),
+    }
+
+
+def _toy_initial_cloud(n: int, seed: int) -> Array:
+    rng = np.random.default_rng(seed)
+    theta = rng.uniform(0.0, 2.0 * np.pi, int(n))
+    radius = np.sqrt(rng.uniform(0.15**2, 1.2**2, int(n)))
+    x = np.c_[radius * np.cos(theta), radius * np.sin(theta)]
+    x += 0.015 * rng.normal(size=x.shape)
+    return x.astype(np.float64)
+
+
+def make_toy_transient_figure(toy_runs: Sequence[tuple[str, dict[str, Array]]]) -> go.Figure:
+    if not toy_runs:
+        raise ValueError("toy_runs cannot be empty")
+    fig = make_subplots(
+        rows=2,
+        cols=len(toy_runs),
+        specs=[[{"type": "scatter"} for _ in toy_runs], [{"type": "scatter"} for _ in toy_runs]],
+        subplot_titles=[label for label, _ in toy_runs] + [f"{label}: r_min and q" for label, _ in toy_runs],
+        vertical_spacing=0.12,
+    )
+    for col, (label, run) in enumerate(toy_runs, start=1):
+        traj = np.asarray(run["trajectory"], dtype=np.float64)
+        final = traj[-1]
+        fig.add_trace(
+            go.Scattergl(x=final[:, 0], y=final[:, 1], mode="markers", marker=dict(size=3.5, opacity=0.72), name=label, showlegend=False),
+            row=1,
+            col=col,
+        )
+        diag = np.asarray(run["diagnostics"], dtype=np.float64)
+        fig.add_trace(go.Scatter(x=diag[:, 1], y=diag[:, 3], mode="lines+markers", name=f"{label} r_min", showlegend=False), row=2, col=col)
+        fig.add_trace(go.Scatter(x=diag[:, 1], y=diag[:, 4], mode="lines", name=f"{label} q", showlegend=False), row=2, col=col)
+        fig.update_xaxes(range=[-1.4, 1.4], scaleanchor="y" if col == 1 else f"y{col}", scaleratio=1, row=1, col=col)
+        fig.update_yaxes(range=[-1.4, 1.4], row=1, col=col)
+        fig.update_yaxes(type="log", row=2, col=col)
+        fig.update_xaxes(title_text="time", row=2, col=col)
+    fig.update_layout(title=dict(text="Toy RK2 shell and hyperbolic transient mechanisms", x=0.5), width=430 * len(toy_runs), height=780, template="plotly_white")
+    return fig
+
+
+def run_toy_transient_suite(
+    out_dir: Path | str,
+    *,
+    h_values: Sequence[float] = (0.09, 0.055, 0.03, 0.015, 0.0075),
+    n_points: int = 600,
+    seed: int = 2026,
+    max_steps: int = 180,
+    c: float = 1.0,
+    eps: float = 1e-4,
+    delta: float = 0.01,
+) -> dict[str, object]:
+    """Generate toy conical shell-scaling and saddle-invariant artifacts."""
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    if not h_values:
+        raise ValueError("h_values must contain at least one timestep")
+    x0 = _toy_initial_cloud(int(n_points), int(seed))
+    shell_rows: list[dict[str, float]] = []
+    toy_runs: list[tuple[str, dict[str, Array]]] = []
+    for h in h_values:
+        run = simulate_toy_transient(x0, model="conical", integrator="fixed_rk2", dt=float(h), max_steps=max_steps, c=c, eps=eps, delta=delta)
+        final_radius = np.linalg.norm(run["trajectory"][-1], axis=1)
+        shell_rows.append(
+            {
+                "h": float(h),
+                "observed_radius_median": float(np.median(final_radius)),
+                "observed_radius_peak": float(compute_morphology_metrics(run["trajectory"][-1])["disk_radius"]),
+                "predicted_hc_over_2": float(0.5 * h * c),
+            }
+        )
+    reference_h = float(h_values[min(1, len(h_values) - 1)])
+    toy_runs.append(("fixed conical", simulate_toy_transient(x0, model="conical", integrator="fixed_rk2", dt=reference_h, max_steps=max_steps, c=c, eps=eps, delta=delta)))
+    toy_runs.append(("adaptive conical", simulate_toy_transient(x0, model="conical", integrator="adaptive_rk2", dt=reference_h, max_steps=max_steps, c=c, eps=eps, delta=delta)))
+    toy_runs.append(("adaptive saddle", simulate_toy_transient(x0, model="saddle", integrator="adaptive_rk2", dt=reference_h, max_steps=max_steps, c=0.0, eps=eps, delta=delta, saddle_c=c)))
+    make_toy_transient_figure(toy_runs).write_html(str(out / "toy_transients.html"), include_plotlyjs="cdn")
+
+    fig = go.Figure()
+    h_arr = np.array([row["h"] for row in shell_rows])
+    fig.add_trace(go.Scatter(x=h_arr, y=[row["observed_radius_peak"] for row in shell_rows], mode="markers+lines", name="observed radial peak"))
+    fig.add_trace(go.Scatter(x=h_arr, y=[row["observed_radius_median"] for row in shell_rows], mode="markers+lines", name="median radius"))
+    fig.add_trace(go.Scatter(x=h_arr, y=[row["predicted_hc_over_2"] for row in shell_rows], mode="lines", name="h c / 2", line=dict(dash="dash")))
+    fig.update_layout(title=dict(text="Toy conical fixed-RK2 shell scaling", x=0.5), xaxis_title="h", yaxis_title="radius", width=780, height=520, template="plotly_white")
+    fig.write_html(str(out / "toy_shell_scaling.html"), include_plotlyjs="cdn")
+    metrics = {"seed": int(seed), "n_points": int(n_points), "c": float(c), "eps": float(eps), "delta": float(delta), "shell_scaling": shell_rows}
+    (out / "toy_metrics.json").write_text(json.dumps(_jsonable(metrics), indent=2))
+    return metrics
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--n-fibers", type=int, default=10)
+    parser.add_argument("--n-per-fiber", type=int, default=2000)
+    parser.add_argument("--shapes", default=",".join(DEFAULT_SHAPES))
+    parser.add_argument("--initialization-algorithm", choices=("raw", "alpha_ball"), default="raw")
+    parser.add_argument("--initialization-fast-steps", type=int, default=40)
+    parser.add_argument("--initialization-fast-min-steps", type=int, default=6)
+    parser.add_argument("--initialization-fast-window", type=int, default=3)
+    parser.add_argument("--initialization-fast-displacement-tol", type=float, default=1.5e-2)
+    parser.add_argument("--color-scheme", choices=("phase_color", "palette"), default="phase_color")
+    parser.add_argument("--initializer-alpha", type=float, default=0.99)
+    parser.add_argument("--initializer-K", type=float, default=1.0)
+    parser.add_argument("--initializer-grid-size", type=int, default=None)
+    parser.add_argument("--initializer-domain-radius", type=float, default=None)
+    parser.add_argument("--initializer-dt", type=float, default=0.055)
+    parser.add_argument("--alpha", type=float, default=0.50)
+    parser.add_argument("--K", type=float, default=1.0)
+    parser.add_argument("--grid-size", type=int, default=256)
+    parser.add_argument("--domain-radius", type=float, default=9.0)
+    parser.add_argument("--dt", type=float, default=0.055)
+    parser.add_argument("--max-steps", type=int, default=500)
+    parser.add_argument("--tol-rms", type=float, default=1.2e-2)
+    parser.add_argument("--backend", choices=("auto", "numpy", "torch"), default="auto")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--dtype", choices=("auto", "float32", "float64"), default="auto")
+    parser.add_argument("--force-backend", choices=("fft", "direct"), default="fft")
+    parser.add_argument("--integrator", choices=("fixed_rk2", "adaptive_rk2"), default="adaptive_rk2")
+    parser.add_argument("--time-direction", choices=("forward", "backward"), default="forward")
+    parser.add_argument("--adaptive-tol", type=float, default=5.0e-3)
+    parser.add_argument("--dt-min", type=float, default=1.0e-4)
+    parser.add_argument("--dt-max", type=float, default=0.09)
+    parser.add_argument("--max-displacement-per-step", type=float, default=0.75)
+    parser.add_argument("--no-center-each-step", action="store_true")
+    parser.add_argument("--no-clip-each-step", action="store_true")
+    parser.add_argument("--research-diagnostics", action="store_true")
+    parser.add_argument("--research-diagnostics-every", type=int, default=None)
+    parser.add_argument("--research-diagnostic-sample-size", type=int, default=2500)
+    parser.add_argument("--research-energy-sample-size", type=int, default=1200)
+    parser.add_argument("--research-sweep", choices=("none", "timestep", "alpha", "k_renormalization", "grid", "domain", "particles", "integrator_backend"), default="none")
+    parser.add_argument("--research-sweep-values", default=None)
+    parser.add_argument("--finite-horizon-comparison", action="store_true")
+    parser.add_argument("--finite-horizon-animation-batch", action="store_true")
+    parser.add_argument("--prediction-horizon-tau", type=float, default=0.055)
+    parser.add_argument("--comparison-old-steps", type=int, default=400)
+    parser.add_argument("--comparison-adaptive-steps-per-horizon", type=int, default=10)
+    parser.add_argument("--comparison-animation-frames", type=int, default=72)
+    parser.add_argument("--comparison-animation-fps", type=int, default=12)
+    parser.add_argument("--toy-suite", action="store_true")
+    parser.add_argument("--record-every", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--out-dir", type=Path, default=Path("pp_transient_research_output"))
+    parser.add_argument("--no-animation", action="store_true")
+    parser.add_argument("--trajectory-frame-count", type=int, default=0)
+    parser.add_argument("--max-animation-points-per-group", type=int, default=450)
+    parser.add_argument("--animation-density-grid-size", type=int, default=96)
+    parser.add_argument("--animation-frame-duration-ms", type=int, default=90)
+    return parser.parse_args(argv)
+
+
+def config_from_args(args: argparse.Namespace) -> TransientResearchConfig:
+    shapes = tuple(part.strip() for part in args.shapes.split(",") if part.strip())
+    if not shapes:
+        raise ValueError("--shapes must include at least one shape")
+    return TransientResearchConfig(
+        alpha=args.alpha,
+        K=args.K,
+        n_fibers=args.n_fibers,
+        n_per_fiber=args.n_per_fiber,
+        shape_names=shapes,
+        seed=_seed_from_args(args.seed),
+        color_scheme=args.color_scheme,
+        initialization_algorithm=args.initialization_algorithm,
+        initializer_config=InitializerConfig(
+            alpha=args.initializer_alpha,
+            K=args.initializer_K,
+            grid_size=args.initializer_grid_size,
+            domain_radius=args.initializer_domain_radius,
+            dt=args.initializer_dt,
+            max_steps=args.initialization_fast_steps,
+            min_steps=args.initialization_fast_min_steps,
+            window=args.initialization_fast_window,
+            displacement_tol=args.initialization_fast_displacement_tol,
+        ),
+        initialization_fast_steps=args.initialization_fast_steps,
+        initialization_fast_min_steps=args.initialization_fast_min_steps,
+        initialization_fast_window=args.initialization_fast_window,
+        initialization_fast_displacement_tol=args.initialization_fast_displacement_tol,
+        grid_size=args.grid_size,
+        domain_radius=args.domain_radius,
+        dt=args.dt,
+        max_steps=args.max_steps,
+        tol_rms=args.tol_rms,
+        backend=args.backend,
+        device=args.device,
+        dtype=args.dtype,
+        force_backend=args.force_backend,
+        integrator=args.integrator,
+        time_direction=args.time_direction,
+        prediction_horizon_tau=args.prediction_horizon_tau,
+        adaptive_tol=args.adaptive_tol,
+        dt_min=args.dt_min,
+        dt_max=args.dt_max,
+        max_displacement_per_step=args.max_displacement_per_step,
+        center_each_step=not args.no_center_each_step,
+        clip_each_step=not args.no_clip_each_step,
+        record_research_diagnostics=bool(args.research_diagnostics or args.research_sweep != "none"),
+        research_diagnostics_every=args.research_diagnostics_every,
+        research_diagnostic_sample_size=args.research_diagnostic_sample_size,
+        research_energy_sample_size=args.research_energy_sample_size,
+        record_every=args.record_every,
+        out_dir=args.out_dir,
+        make_dashboard=False,
+        make_animation=not args.no_animation,
+        trajectory_frame_count=args.trajectory_frame_count,
+        max_animation_points_per_group=args.max_animation_points_per_group,
+        animation_density_grid_size=args.animation_density_grid_size,
+        animation_frame_duration_ms=args.animation_frame_duration_ms,
+    )
+
+
+def _parse_research_sweep_values(raw: str | None, sweep: str) -> tuple[object, ...] | None:
+    if raw is None or not raw.strip():
+        return None
+    parts = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if not parts:
+        return None
+    if sweep in ("timestep", "alpha", "domain"):
+        return tuple(float(part) for part in parts)
+    if sweep in ("grid", "particles"):
+        return tuple(int(part) for part in parts)
+    if sweep == "k_renormalization":
+        return parts
+    raise ValueError(f"--research-sweep-values is not supported for sweep {sweep!r}")
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    config = config_from_args(args)
+    if args.finite_horizon_animation_batch:
+        summaries = run_finite_horizon_animation_batch(
+            config.out_dir,
+            n_fibers=config.n_fibers,
+            n_per_fiber=int(config.n_per_fiber) if isinstance(config.n_per_fiber, int) else int(config.n_per_fiber[0]),
+            grid_size=config.grid_size,
+            domain_radius=config.domain_radius,
+            old_fixed_steps=int(args.comparison_old_steps),
+            adaptive_steps_per_horizon=int(args.comparison_adaptive_steps_per_horizon),
+            animation_frames=int(args.comparison_animation_frames),
+            fps=int(args.comparison_animation_fps),
+        )
+        print("Done.")
+        print(json.dumps(_jsonable(summaries), indent=2))
+        print("Output directory:", config.out_dir)
+        return
+    if args.finite_horizon_comparison:
+        metrics = run_finite_horizon_comparison(
+            config.out_dir,
+            n_fibers=config.n_fibers,
+            n_per_fiber=int(config.n_per_fiber) if isinstance(config.n_per_fiber, int) else int(config.n_per_fiber[0]),
+            alpha=config.alpha,
+            K=config.K,
+            grid_size=config.grid_size,
+            domain_radius=config.domain_radius,
+            tau=float(config.prediction_horizon_tau),
+            old_fixed_steps=int(args.comparison_old_steps),
+            adaptive_steps_per_horizon=int(args.comparison_adaptive_steps_per_horizon),
+            seed=config.seed,
+        )
+        print("Done.")
+        print(json.dumps(_jsonable(metrics), indent=2))
+        print("Output directory:", config.out_dir)
+        return
+    if args.toy_suite:
+        metrics = run_toy_transient_suite(config.out_dir, seed=config.seed)
+        print("Done.")
+        print(json.dumps(_jsonable(metrics), indent=2))
+        print("Output directory:", config.out_dir)
+        return
+    if args.research_sweep != "none":
+        values = _parse_research_sweep_values(args.research_sweep_values, args.research_sweep)
+        summaries = run_pp_research_sweep(config, args.research_sweep, values, out_dir=config.out_dir)
+        print("Done.")
+        print(json.dumps(_jsonable(summaries), indent=2))
+        print("Output directory:", config.out_dir)
+        return
+
+    initial = make_initial_condition(config)
+    result = run_research_simulation(config, initial)
+    out_dir = Path(config.out_dir)
+    save_research_run_outputs(result, config, out_dir, initial=initial)
+    print("Done.")
+    print(json.dumps(_jsonable(summarize_research_run(result, config)), indent=2))
+    print("Output directory:", out_dir)
+
+
+if __name__ == "__main__":
+    main()

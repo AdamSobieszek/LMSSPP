@@ -16,6 +16,7 @@ import math
 import torch
 from torch import Tensor
 
+from .gauge import GaugeDiagnostics, GaugeState, normalize_weights, prepare_sphere_cloud
 from .lms import DEFAULT_EPS, alpha_operator, clamp_to_ball, dot, mobius_sphere, normalize
 
 
@@ -38,6 +39,164 @@ class CanonicalCloud:
     potential: float
     iterations: int
     converged: bool
+
+
+class CanonicalGaugeState(GaugeState):
+    """Gauge state enforcing x_i = M_w(xi_i)."""
+
+    def __init__(
+        self,
+        *,
+        w: Tensor,
+        reference_points: Tensor,
+        weights: Tensor | None = None,
+        mode: str = "busemann_exact",
+        diagnostics: GaugeDiagnostics | None = None,
+        canonical: CanonicalCloud | None = None,
+        canonical_initial_w: Tensor | None = None,
+        initialized_points: Tensor | None = None,
+    ) -> None:
+        super().__init__(
+            w=w,
+            reference_points=reference_points,
+            weights=weights,
+            observed_points=None,
+            mode=mode,
+            diagnostics=diagnostics,
+            canonical=canonical,
+        )
+        self.canonical_initial_w = (
+            canonical_initial_w.to(dtype=self.w.dtype, device=self.w.device).reshape(-1)
+            if canonical_initial_w is not None
+            else self.w.detach().clone()
+        )
+        self.initialized_points = (
+            normalize(initialized_points.to(dtype=self.reference_points.dtype, device=self.reference_points.device))
+            if initialized_points is not None
+            else None
+        )
+        self._refresh_observed_points()
+
+    def _refresh_observed_points(self) -> None:
+        self._observed_points = self.reconstructed_points()
+
+    @property
+    def observed_points(self) -> Tensor:
+        return self._observed_points
+
+    @observed_points.setter
+    def observed_points(self, value: Tensor) -> None:
+        _ = value
+        raise AttributeError("CanonicalGaugeState derives observed_points from w and reference_points.")
+
+    @property
+    def reference_points(self) -> Tensor:
+        return self._reference_points
+
+    @reference_points.setter
+    def reference_points(self, value: Tensor) -> None:
+        _ = value
+        raise AttributeError("Use set_reference_points(...) so CanonicalGaugeState can recompute observed_points.")
+
+    def set_w(self, value: Tensor) -> "CanonicalGaugeState":
+        self._w = self._coerce_w(value)
+        self._refresh_observed_points()
+        return self
+
+    def set_reference_points(
+        self,
+        reference_points: Tensor,
+        weights: Tensor | None = None,
+    ) -> "CanonicalGaugeState":
+        ref, a = prepare_sphere_cloud(reference_points, self.weights if weights is None else weights)
+        if int(ref.shape[1]) != int(self.w.shape[0]):
+            raise ValueError("reference_points dimension must match w.")
+        self._reference_points = ref
+        self._weights = a
+        self._refresh_observed_points()
+        return self
+
+    @classmethod
+    def from_observed_cloud(
+        cls,
+        points: Tensor,
+        weights: Tensor,
+        *,
+        fallback_dir: Tensor | None = None,
+        initial_center: Tensor | None = None,
+        max_iters: int = 160,
+        tol: float = 1e-10,
+    ) -> "CanonicalGaugeState":
+        return cls.from_initialized_cloud(
+            points,
+            weights,
+            fallback_dir=fallback_dir,
+            initial_center=initial_center,
+            max_iters=max_iters,
+            tol=tol,
+        )
+
+    @classmethod
+    def from_initialized_cloud(
+        cls,
+        points: Tensor,
+        weights: Tensor,
+        *,
+        target_w: Tensor | None = None,
+        fallback_dir: Tensor | None = None,
+        initial_center: Tensor | None = None,
+        max_iters: int = 160,
+        tol: float = 1e-10,
+    ) -> "CanonicalGaugeState":
+        observed, a = prepare_sphere_cloud(points, weights)
+        canonical = canonical_cloud(
+            observed,
+            a,
+            fallback_dir=fallback_dir,
+            initial_center=initial_center,
+            max_iters=int(max_iters),
+            tol=float(tol),
+        )
+        w = canonical.w if target_w is None else target_w.to(dtype=observed.dtype, device=observed.device).reshape(-1)
+        return cls(
+            w=w,
+            reference_points=canonical.P,
+            weights=a,
+            diagnostics=_diagnostics_from_canonical_cloud("busemann_exact", canonical),
+            canonical=canonical,
+            canonical_initial_w=canonical.w,
+            initialized_points=observed,
+        )
+
+    @classmethod
+    def from_reference_cloud(
+        cls,
+        reference_points: Tensor,
+        weights: Tensor,
+        w: Tensor,
+        *,
+        require_centered: bool = True,
+        tol: float = 1e-10,
+    ) -> "CanonicalGaugeState":
+        reference, a = prepare_sphere_cloud(reference_points, weights)
+        center_error = float(torch.linalg.norm((a[:, None] * reference).sum(dim=0)))
+        if bool(require_centered) and center_error > float(tol):
+            raise ValueError("reference_points are not centered enough for CanonicalGaugeState.")
+        w_t = w.to(dtype=reference.dtype, device=reference.device).reshape(-1)
+        diagnostics = GaugeDiagnostics(
+            mode="busemann_exact",
+            residual_norm=center_error,
+            center_error=center_error,
+            iterations=0,
+            converged=center_error <= float(tol),
+        )
+        return cls(
+            w=w_t,
+            reference_points=reference,
+            weights=a,
+            diagnostics=diagnostics,
+            canonical_initial_w=w_t,
+        )
 
 
 @dataclass(frozen=True)
@@ -75,19 +234,18 @@ class MovingFrameDiagnostics:
 
 
 def _prepare_weights(points: Tensor, weights: Tensor) -> Tensor:
-    if points.dim() != 2:
-        raise ValueError("points must have shape [N,d].")
-    if weights.dim() != 1 or int(weights.shape[0]) != int(points.shape[0]):
-        raise ValueError("weights must have shape [N], matching points.")
-    w = weights.to(dtype=points.dtype, device=points.device)
-    if not torch.isfinite(w).all():
-        raise ValueError("weights must be finite.")
-    if bool((w < 0).any()):
-        raise ValueError("weights must be nonnegative.")
-    total = w.sum()
-    if float(torch.abs(total)) <= DEFAULT_EPS:
-        raise ValueError("weights must have positive sum.")
-    return w / total
+    return normalize_weights(points, weights)
+
+
+def _diagnostics_from_canonical_cloud(mode: str, state: CanonicalCloud) -> GaugeDiagnostics:
+    return GaugeDiagnostics(
+        mode=mode,
+        residual_norm=float(state.residual_norm),
+        center_error=float(state.center_error),
+        potential=float(state.potential),
+        iterations=int(state.iterations),
+        converged=bool(state.converged),
+    )
 
 
 def ball_to_rapidity(v: Tensor, eps: float = 1e-12) -> Tensor:
@@ -540,6 +698,7 @@ def es_energy(u: Tensor, u_tau: Tensor, P: Tensor, weights: Tensor) -> Tensor:
 __all__ = [
     "CanonicalCenterSolve",
     "CanonicalCloud",
+    "CanonicalGaugeState",
     "CanonicalTrajectoryData",
     "ConnectionEstimate",
     "MovingFrameDiagnostics",

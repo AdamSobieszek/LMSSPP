@@ -1,0 +1,33 @@
+experiment: research_sweep
+output_dir: temp_research/pp_timestep_sweep_yaml
+sweep: timestep
+values: [0.09, 0.055, 0.03, 0.015, 0.0075]
+
+base_config:
+  n_fibers: 10
+  n_per_fiber: 50
+  alpha: 0.99
+  K: 1.0
+  grid_size: 128
+  domain_radius: 4.0
+  dt: 0.055
+  dt_min: 0.00025
+  dt_max: 0.09
+  max_steps: 200
+  min_steps: 210
+  tol_rms: 0.0
+  max_displacement_per_step: 0.75
+  backend: numpy
+  force_backend: fft
+  integrator: fixed_rk2
+  color_scheme: phase_color
+  seed: 2026
+  make_dashboard: false
+  make_animation: false
+  record_research_diagnostics: true
+  record_every: 20
+  research_diagnostics_every: 20
+  research_diagnostic_sample_size: 420
+  research_energy_sample_size: 420
+  research_nn_chunk: 256
+  max_plot_points_per_group: 600

@@ -28,7 +28,16 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .core.canonical_gauge import CanonicalCloud, canonical_cloud, canonical_residual
+from .core.canonical_gauge import CanonicalCloud, CanonicalGaugeState, canonical_residual
+from .core.gauge_transformations import canonical_reference_from_template
+from .core.initialize import (
+    euclidean_center_unit_sphere_np as _core_euclidean_center_unit_sphere_np,
+    householder_map_e0_to as _core_householder_map_e0_to,
+    normalize_np as _core_normalize_np,
+    random_sphere_points_np as _core_random_sphere_points_np,
+    reference_cloud_from_preset_np as _core_reference_cloud_from_preset_np,
+    unit_direction_np as _core_unit_direction_np,
+)
 from .core.lms import DEFAULT_EPS, dot, mobius_sphere, normalize
 
 try:  # Optional widget dependency.
@@ -465,76 +474,20 @@ def _random_sphere_points_np(
     *,
     preset: OpticalPreset = "random",
 ) -> np.ndarray:
-    n = max(2, int(n))
-    if d == 2:
-        if preset == "balanced":
-            theta = np.linspace(0.0, TAU, n, endpoint=False)
-        elif preset == "clustered":
-            theta = rng.normal(0.2, 0.35, size=n)
-        elif preset == "dipole":
-            half = n // 2
-            theta = np.concatenate(
-                [
-                    rng.normal(0.0, 0.16, size=half),
-                    rng.normal(math.pi, 0.16, size=n - half),
-                ]
-            )
-        else:
-            theta = rng.uniform(-math.pi, math.pi, size=n)
-        return np.column_stack([np.cos(theta), np.sin(theta)])
-    if preset == "balanced":
-        # Fibonacci sphere for a stable non-random reference cloud.
-        idx = np.arange(n, dtype=np.float64)
-        z = 1.0 - 2.0 * (idx + 0.5) / float(n)
-        phi = idx * math.pi * (3.0 - math.sqrt(5.0))
-        r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
-        return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
-    if preset == "clustered":
-        x = np.array([1.0, 0.0, 0.2]) + 0.35 * rng.normal(size=(n, d))
-    elif preset == "dipole":
-        half = n // 2
-        x = np.vstack(
-            [
-                np.array([1.0, 0.0, 0.0]) + 0.18 * rng.normal(size=(half, d)),
-                np.array([-1.0, 0.0, 0.0]) + 0.18 * rng.normal(size=(n - half, d)),
-            ]
-        )
-    else:
-        x = rng.normal(size=(n, d))
-    return x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
+    return _core_random_sphere_points_np(int(n), int(d), rng, preset=preset)
 
 
 def _normalize_np(x: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
-    arr = np.asarray(x, dtype=np.float64)
-    return arr / np.maximum(np.linalg.norm(arr, axis=-1, keepdims=True), float(eps))
+    return _core_normalize_np(x, eps=eps)
 
 
 def _unit_direction_np(direction: np.ndarray | None, d: int, *, eps: float = 1e-12) -> np.ndarray:
-    if direction is None:
-        u = np.zeros(int(d), dtype=np.float64)
-        u[0] = 1.0
-        return u
-    u = np.asarray(direction, dtype=np.float64).reshape(int(d))
-    n = float(np.linalg.norm(u))
-    if not np.isfinite(n) or n <= float(eps):
-        u = np.zeros(int(d), dtype=np.float64)
-        u[0] = 1.0
-        return u
-    return u / n
+    return _core_unit_direction_np(direction, int(d), eps=eps)
 
 
 def _householder_map_e0_to(target: np.ndarray) -> np.ndarray:
     """Return an orthogonal matrix H with H @ e0 == target (both unit vectors in R^d)."""
-    u = np.asarray(target, dtype=np.float64).reshape(-1)
-    d = int(u.size)
-    e0 = np.zeros(d, dtype=np.float64)
-    e0[0] = 1.0
-    v = e0 - u
-    nv = float(np.linalg.norm(v))
-    if nv <= 1e-15:
-        return np.eye(d, dtype=np.float64)
-    wv = v / nv
-    return np.eye(d, dtype=np.float64) - 2.0 * np.outer(wv, wv)
+    return _core_householder_map_e0_to(target)
 
 
 def _euclidean_center_unit_sphere_np(
@@ -545,15 +498,7 @@ def _euclidean_center_unit_sphere_np(
     tol: float = 1e-13,
 ) -> np.ndarray:
     """Subtract the weighted Euclidean mean and renormalize to S^{d-1} until ∑ᵢ aᵢ xᵢ≈0."""
-    x = np.asarray(pts, dtype=np.float64).reshape(-1, pts.shape[-1])
-    w = np.asarray(weights, dtype=np.float64).reshape(-1)
-    w = w / float(np.sum(w))
-    for _ in range(int(max_iters)):
-        mu = np.sum(w[:, None] * x, axis=0)
-        if float(np.linalg.norm(mu)) <= float(tol):
-            break
-        x = _normalize_np(x - mu[None, :])
-    return x
+    return _core_euclidean_center_unit_sphere_np(pts, weights, max_iters=max_iters, tol=tol)
 
 
 def _reference_cloud_from_preset_np(
@@ -565,9 +510,7 @@ def _reference_cloud_from_preset_np(
     direction: np.ndarray,
 ) -> np.ndarray:
     """Sample a canonical reference-cloud template on S^{d-1}, then align its e1-axis with direction."""
-    xi = _random_sphere_points_np(int(n), int(d), rng, preset=preset)
-    h = _householder_map_e0_to(_unit_direction_np(direction, int(d)))
-    return (h @ xi.T).T
+    return _core_reference_cloud_from_preset_np(int(n), int(d), rng, preset=preset, direction=direction)
 
 
 def _template_to_canonical_reference_np(
@@ -580,15 +523,13 @@ def _template_to_canonical_reference_np(
     """Return exact Busemann-balanced ξ on S^{d-1} from a preset template.
 
     If ∑ᵢ aᵢ ξᵢ=0 already (equivalently residual at z=0 is tiny), ``P`` is the
-    template.  Otherwise apply ``canonical_cloud`` once (Stage B) before orbit
-    placement.
+    template.  Otherwise apply the core exact canonical reference solve (Stage B)
+    before orbit placement.
     """
     P, a = _prepare_points_weights(xi, weights)
-    z0 = torch.zeros(int(P.shape[1]), dtype=P.dtype, device=P.device)
-    if float(torch.linalg.norm(canonical_residual(z0, P, a))) <= float(tol):
-        return P, a, None
-    lifted = canonical_cloud(P, a, max_iters=int(max_iters), tol=float(tol))
-    return lifted.P, a, lifted
+    state = canonical_reference_from_template(P, a, max_iters=int(max_iters), tol=float(tol))
+    pre_lift = state.canonical if isinstance(state.canonical, CanonicalCloud) else None
+    return state.reference_points, state.weights, pre_lift
 
 
 def _canonical_initialization_np(
@@ -607,8 +548,7 @@ def _canonical_initialization_np(
     opposite ``w_target`` for this LMS Möbius convention.  A short Euclidean
     centering pass improves templates whose ambient mean is not exactly zero; if
     needed, a single Busemann solve then lifts the template to exact canonical
-    gauge before forming xⁱ=M_{w_target}(ξⁱ).  The final inverse solve on x
-    recovers w_*=w_target up to numerical error.
+    gauge before a CanonicalGaugeState forms xⁱ=M_{w_target}(ξⁱ).
     """
     d = max(2, int(dimension))
     r = float(np.clip(float(target_radius), 0.0, 0.9995))
@@ -621,19 +561,19 @@ def _canonical_initialization_np(
     xi = _euclidean_center_unit_sphere_np(xi, weights)
     P_ref, a_t, pre_lift = _template_to_canonical_reference_np(xi, weights)
     target_w = torch.as_tensor(target_w_np, dtype=P_ref.dtype, device=P_ref.device)
-    observed_t = normalize(mobius_sphere(P_ref, target_w))
-    final_state = canonical_cloud(
-        observed_t,
+    target_state = CanonicalGaugeState.from_reference_cloud(
+        P_ref,
         a_t,
-        initial_center=-target_w,
-        max_iters=160,
+        target_w,
+        require_centered=False,
         tol=1e-10,
     )
+    observed_t = target_state.observed_points
 
     def as_np(value: Tensor) -> np.ndarray:
         return value.detach().cpu().numpy().astype(np.float64)
 
-    w_star = as_np(final_state.w)
+    w_star = as_np(target_state.w)
     achieved_radius = float(np.linalg.norm(w_star))
     z_dim = int(P_ref.shape[1])
     z_zero = torch.zeros(z_dim, dtype=P_ref.dtype, device=P_ref.device)
@@ -654,21 +594,21 @@ def _canonical_initialization_np(
     return CanonicalInitialization(
         candidate_points=np.asarray(xi, dtype=np.float64),
         observed_points=as_np(observed_t),
-        reference_points=as_np(final_state.P),
+        reference_points=as_np(target_state.reference_points),
         weights=a_t.detach().cpu().numpy().astype(np.float64),
         target_w=target_w_np.astype(np.float64),
         candidate_z_star=cand_z,
         candidate_w_star=cand_w,
-        z_star=as_np(final_state.z),
+        z_star=as_np(-target_state.w),
         w_star=w_star,
         candidate_residual_norm=cand_res,
         candidate_center_error=cand_ce,
-        residual_norm=float(final_state.residual_norm),
-        center_error=float(final_state.center_error),
+        residual_norm=float(target_state.diagnostics.residual_norm),
+        center_error=float(target_state.diagnostics.center_error),
         candidate_converged=cand_conv,
-        converged=bool(final_state.converged),
+        converged=bool(target_state.diagnostics.converged),
         candidate_iterations=cand_iter,
-        iterations=int(final_state.iterations),
+        iterations=int(target_state.diagnostics.iterations),
         candidate_radius=float(np.linalg.norm(cand_w)),
         achieved_radius=achieved_radius,
         radius_error=abs(achieved_radius - r),
@@ -710,6 +650,16 @@ def _segments_from_origin2(points: np.ndarray) -> tuple[list[float | None], list
     for p in pts:
         xs.extend([0.0, float(p[0]), None])
         ys.extend([0.0, float(p[1]), None])
+    return xs, ys
+
+
+def _segments_diameters2(points: np.ndarray) -> tuple[list[float | None], list[float | None]]:
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    xs: list[float | None] = []
+    ys: list[float | None] = []
+    for p in pts:
+        xs.extend([float(p[0]), float(-p[0]), None])
+        ys.extend([float(p[1]), float(-p[1]), None])
     return xs, ys
 
 
@@ -1393,14 +1343,14 @@ class LMSOpticalDiskBaseWidget:
 
     def _canonicalized_points(self, points: np.ndarray) -> np.ndarray:
         P, a = _prepare_points_weights(points, self.weights)
-        state = canonical_cloud(P, a, max_iters=160, tol=1e-10)
-        self.z_star = state.z.detach().cpu().numpy().astype(np.float64)
-        self.w_star = state.w.detach().cpu().numpy().astype(np.float64)
-        self._center_error = float(state.center_error)
-        self._inverse_residual_norm = float(state.residual_norm)
-        self._gauge_converged = bool(state.converged)
-        self._gauge_iterations = int(state.iterations)
-        reference = state.P.detach().cpu().numpy().astype(np.float64)
+        state = CanonicalGaugeState.from_initialized_cloud(P, a, max_iters=160, tol=1e-10)
+        self.z_star = (-state.canonical_initial_w).detach().cpu().numpy().astype(np.float64)
+        self.w_star = state.canonical_initial_w.detach().cpu().numpy().astype(np.float64)
+        self._center_error = float(state.diagnostics.center_error)
+        self._inverse_residual_norm = float(state.diagnostics.residual_norm)
+        self._gauge_converged = bool(state.diagnostics.converged)
+        self._gauge_iterations = int(state.diagnostics.iterations)
+        reference = state.reference_points.detach().cpu().numpy().astype(np.float64)
         self.reference_points = reference
         return reference
 
@@ -1656,13 +1606,15 @@ class LMSOpticalDiskBaseWidget:
 
         add(go.Scatter(x=cx.tolist(), y=cy.tolist(), mode="lines", line=dict(color="rgba(20,20,20,0.3)", width=1), name="S¹", hoverinfo="skip", showlegend=False), "geom_circle", 2, 2)
         add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=7, color="#244C9A", opacity=0.72), name="ξᵢ"), "geom_all_incoming", 2, 2)
-        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(91,140,90,0.45)", width=1.7), name="xᵢ(w)=-Hξᵢ-w(ξᵢ)", hoverinfo="skip"), "geom_all_reflected", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(91,140,90,0.45)", width=1.7), name="xᵢ(w)↔−xᵢ(w)", hoverinfo="skip"), "geom_all_reflected", 2, 2)
         add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(215,38,56,0.28)", width=1.2), name="ξᵢ−w", hoverinfo="skip"), "geom_all_normal", 2, 2)
+        add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(215,38,56,0.55)", width=1.2, dash="dash"), name="w→−xᵢ(w)", hoverinfo="skip"), "geom_all_normal_ext", 2, 2)
         add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.24)", width=1.0, dash="dash"), name="(ξᵢ−w)⊥", hoverinfo="skip"), "geom_all_mirror", 2, 2)
         if self.select_pi:
             add(go.Scatter(x=[], y=[], mode="markers", marker=dict(size=13, color="#F2A900", line=dict(color="black", width=1.2)), name="selected ξᵢ"), "geom_incoming", 2, 2)
-            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=3), name="selected xᵢ(w)"), "geom_reflected", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#5B8C5A", width=3), name="selected xᵢ(w)↔−xᵢ(w)"), "geom_reflected", 2, 2)
             add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#D72638", width=3), name="selected ξᵢ−w"), "geom_normal", 2, 2)
+            add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="#D72638", width=2, dash="dash"), name="selected w→−xᵢ(w)"), "geom_normal_ext", 2, 2)
             add(go.Scatter(x=[], y=[], mode="lines", line=dict(color="rgba(0,0,0,0.45)", width=2, dash="dash"), name="selected (ξᵢ−w)⊥"), "geom_mirror", 2, 2)
 
         fig.update_layout(
@@ -2494,13 +2446,19 @@ class LMSOpticalDiskBaseWidget:
                 self.fig.data[self.tr["geom_all_incoming"]].x = _plotly_values(P[:, 0])
                 self.fig.data[self.tr["geom_all_incoming"]].y = _plotly_values(P[:, 1])
             if "geom_all_reflected" in self.tr:
-                gx, gy = _segments_from_origin2(np.asarray(payload["X"], dtype=np.float64))
+                X = np.asarray(payload["X"], dtype=np.float64)
+                gx, gy = _segments_diameters2(X)
                 self.fig.data[self.tr["geom_all_reflected"]].x = gx
                 self.fig.data[self.tr["geom_all_reflected"]].y = gy
             if "geom_all_normal" in self.tr:
                 gx, gy = _segments_between2(np.asarray(payload["w"], dtype=np.float64), np.asarray(payload["P"], dtype=np.float64))
                 self.fig.data[self.tr["geom_all_normal"]].x = gx
                 self.fig.data[self.tr["geom_all_normal"]].y = gy
+            if "geom_all_normal_ext" in self.tr:
+                X = np.asarray(payload["X"], dtype=np.float64)
+                gx, gy = _segments_between2(np.asarray(payload["w"], dtype=np.float64), -X)
+                self.fig.data[self.tr["geom_all_normal_ext"]].x = gx
+                self.fig.data[self.tr["geom_all_normal_ext"]].y = gy
             if "geom_all_mirror" in self.tr:
                 gx, gy = _householder_mirror_lines2(np.asarray(payload["w"], dtype=np.float64), np.asarray(payload["P"], dtype=np.float64))
                 self.fig.data[self.tr["geom_all_mirror"]].x = gx
@@ -2527,11 +2485,14 @@ class LMSOpticalDiskBaseWidget:
                 self.fig.data[self.tr["geom_incoming"]].x = [float(p[0])]
                 self.fig.data[self.tr["geom_incoming"]].y = [float(p[1])]
             if "geom_reflected" in self.tr:
-                self.fig.data[self.tr["geom_reflected"]].x = [0.0, float(q[0])]
-                self.fig.data[self.tr["geom_reflected"]].y = [0.0, float(q[1])]
+                self.fig.data[self.tr["geom_reflected"]].x = [float(q[0]), float(-q[0])]
+                self.fig.data[self.tr["geom_reflected"]].y = [float(q[1]), float(-q[1])]
             if "geom_normal" in self.tr:
                 self.fig.data[self.tr["geom_normal"]].x = [float(w_np[0]), float(p[0])]
                 self.fig.data[self.tr["geom_normal"]].y = [float(w_np[1]), float(p[1])]
+            if "geom_normal_ext" in self.tr:
+                self.fig.data[self.tr["geom_normal_ext"]].x = [float(w_np[0]), float(-q[0])]
+                self.fig.data[self.tr["geom_normal_ext"]].y = [float(w_np[1]), float(-q[1])]
             if "geom_mirror" in self.tr:
                 self.fig.data[self.tr["geom_mirror"]].x = [float(-1.08 * tangent[0]), float(1.08 * tangent[0])]
                 self.fig.data[self.tr["geom_mirror"]].y = [float(-1.08 * tangent[1]), float(1.08 * tangent[1])]

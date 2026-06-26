@@ -293,11 +293,57 @@ Hence
 \]
 The target slot $b$ appears only at quadratic order through the special-conformal vector field
 \[
-    K_b(a)=2\ip a b a-\norm a^2b.
+    2\ip a b a-\norm a^2b.
 \]
 \end{corollary}
 
 This expansion explains why the bracket is a useful coordinate: the target entry acts as a curvature/gauge deformation rather than as an ordinary first-order translation.
+
+
+\subsection{Möbius transforms in bracket form}
+
+The boost transformations induced by the Möbius transform $\Mob_w(x)$, where $w$ and $x$ are vectors, have a notoriously complicated expression
+\begin{equation}
+M_w(x)
+=
+\frac{(1-|w|^2)x-(1-2\ip{w}{x}+|x|^2)w}
+{1-2\ip{w}{x}+|w|^2|x|^2}.
+\label{eq:mobius}
+\end{equation}
+Which simplifies when restricting the input domain to unit norm vectors $\xi\in \Sph^{d-1}, |\xi|=1$
+\[
+    \Mob_w(\xi)=\frac{(1-|w|^2)(\xi-w)}{|\xi-w|^2} -w.
+\]
+Since we define $\Om(w)=1-|w|^2$, the remaining term can be expressed as a $(\xi-w)^+$ inversion
+\[
+    \Mob_w(\xi)=\Om(w)(\xi-w)^+-w.
+\]
+Given how unit norm vectors $|\xi|=1$ satisfy $\xi^+= \xi$, this can equivalently be written as
+\[
+    \Mob_w(\xi)=\Om(w)(\xi^+-w)^+-w.
+\]
+With this we not only find the expression can be written with an $\mathfrak{S}$-bracket, this form turns out to be equivalent to the full expression in \eqref{eq:mobius} and so hold for all $x$:
+\[
+    \boxed{
+    \begin{aligned}
+    \Mob_w(x)&=\Om(w)\Sbr{x}{w}-w,\\[6pt]
+    w+\Mob_w(x)&=\Om(w)\Sbr{x}{w}.
+    \end{aligned}
+    }
+\]
+
+\begin{equation}
+1-2\ip{w}{x}+|w|^2|x|^2
+=|x|^2|x^+-w|^2.
+\end{equation}
+Since  $\Om(w)\UU(w)=w$ and $\Mob_w(\xi)=-\Hh_{\xi-w}(\xi)$ we obtain the following "reflected-ray" identity 
+\[
+    \boxed{
+    \Hh_{\xi-w}(\xi)=-\Mob_w(\xi)=\Om(w)\bigl(\UU(w)-\Sbr{\xi}{w}\bigr)
+    =\frac12\Om(w)\grad\calB_\xi(w).
+    }
+\]
+Thus the reflected ray is a gauged Busemann score.  The gauge is the diagonal projective section $\Om(w)$.
 
 \subsection{The diagonal coordinate}
 
@@ -512,45 +558,6 @@ then
 \]
 The atom $a=w$ is not an artificial insertion.  It is the diagonal source whose bracket ray is the curvature-gauge drift $\UU(w)$.
 
-\subsection{Möbius transforms in bracket form}
-
-The boost transformations induced by the Möbius transform $\Mob_w(x)$, where $w$ and $x$ are vectors, have a notoriously complicated expression
-\begin{equation}
-M_w(x)
-=
-\frac{(1-|w|^2)x-(1-2\ip{w}{x}+|x|^2)w}
-{1-2\ip{w}{x}+|w|^2|x|^2}.
-\label{eq:mobius}
-\end{equation}
-Which simplifies when restricting the input domain to unit norm vectors $\xi\in \Sph^{d-1}, |\xi|=1$
-\[
-    \Mob_w(\xi)=\frac{(1-|w|^2)(\xi-w)}{|\xi-w|^2} -w.
-\]
-Since we define $\Om(w)=1-|w|^2$, the remaining term can be expressed as a $(\xi-w)^+$ inversion
-\[
-    \Mob_w(\xi)=\Om(w)(\xi-w)^+-w.
-\]
-Given how unit norm vectors $|\xi|=1$ satisfy $\xi^+= \xi$, this can equivalently be written as
-\[
-    \Mob_w(\xi)=\Om(w)(\xi^+-w)^+-w.
-\]
-With this we not only find the expression can be written with an $\mathfrak{S}$-bracket, this form turns out to be equivalent to the full expression in \eqref{eq:mobius} and so hold for all $x$:
-\[
-    \boxed{
-    \begin{aligned}
-    \Mob_w(x)&=\Om(w)\Sbr{x}{w}-w,\\[6pt]
-    w+\Mob_w(x)&=\Om(w)\Sbr{x}{w}.
-    \end{aligned}
-    }
-\]
-Since  $\Om(w)\UU(w)=w$ and $\Mob_w(\xi)=-\Hh_{\xi-w}(\xi)$ we obtain the following "reflected-ray" identity 
-\[
-    \boxed{
-    \Hh_{\xi-w}(\xi)=-\Mob_w(\xi)=\Om(w)\bigl(\UU(w)-\Sbr{\xi}{w}\bigr)
-    =\frac12\Om(w)\grad\calB_\xi(w).
-    }
-\]
-Thus the reflected ray is a gauged Busemann score.  The gauge is the diagonal projective section $\Om(w)$.
 
 \section{The spherical Kuramoto reduction as a projective score flow}
 

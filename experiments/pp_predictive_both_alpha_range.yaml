@@ -1,0 +1,54 @@
+experiment: finite_horizon_animation_alpha_range
+output_dir: temp_research/pp_predictive_both_alpha_range_high
+
+params:
+  left_dynamic_zoom: true
+  right_dynamic_zoom: true
+  n_fibers: 20
+  n_per_fiber: 200
+  grid_size: 128
+  domain_radius: 10.0
+  adaptive_steps: 800
+  adaptive_steps_per_horizon: 4
+  animation_frames: 200
+  fps: 15
+  left_zoom_quantile: 0.9975
+  left_zoom_pad: 1.35
+  left_zoom_smoothing_radius: 3
+  left_zoom_delay_frames: 0
+  right_zoom_quantile: 0.9975
+  right_zoom_pad: 1.35
+  right_zoom_smoothing_radius: 3
+  right_zoom_delay_frames: 0
+
+cases:
+  - label: seed2026_alpha0p999
+    seed: 2026
+    alpha: 0.999
+    K: None
+    tau: 0.055
+  - label: seed2026_alpha0p998
+    seed: 2026
+    alpha: 0.998
+    K: None
+    tau: 0.055
+  - label: seed2026_alpha0p997
+    seed: 2026
+    alpha: 0.997
+    K: None
+    tau: 0.055
+  - label: seed2026_alpha0p996
+    seed: 2026
+    alpha: 0.996
+    K: None
+    tau: 0.055
+  - label: seed2026_alpha0p995
+    seed: 2026
+    alpha: 0.995
+    K: None
+    tau: 0.055
+  - label: seed2026_alpha0p994
+    seed: 2026
+    alpha: 0.994
+    K: None
+    tau: 0.055
