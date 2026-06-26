@@ -105,7 +105,7 @@ from .pp_initializers import (
 Array = np.ndarray
 BackendChoice = Literal["auto", "numpy", "torch"]
 DTypeChoice = Literal["auto", "float32", "float64"]
-IntegratorChoice = Literal["fixed_rk2", "adaptive_rk2"]
+IntegratorChoice = Literal["fixed_rk2", "adaptive_rk2", "adaptive_rk4"]
 TimeDirectionChoice = Literal["forward", "backward"]
 ExternalFieldChoice = Literal["affine", "projective"]
 PredictiveModeChoice = Literal["averaged_predictive", "pure_predictive"]
@@ -140,7 +140,59 @@ def _format_pp_K_value(K_value: float) -> str:
         return "-inf"
     if np.isnan(K_value):
         return "nan"
-    return f"{K_value:.2f}"
+    return f"{K_value:.3e}"
+
+
+def _rk4_step_state(
+    solver: Any,
+    velocity_fn: Callable[[Any], tuple[Any, ...]],
+    x: Any,
+    dt: float,
+    time_sign: float,
+    k1: Any | None = None,
+) -> tuple[Any, int, int]:
+    """Advance one RK4 step, returning state plus extra field evaluations/clips."""
+
+    field_evaluations = 0
+    clip_events = 0
+    if k1 is None:
+        k1 = velocity_fn(x)[0]
+        field_evaluations += 1
+
+    x2, clipped = solver.clip_inside_with_count(x + 0.5 * time_sign * dt * k1)
+    clip_events += clipped
+    k2 = velocity_fn(x2)[0]
+    field_evaluations += 1
+
+    x3, clipped = solver.clip_inside_with_count(x + 0.5 * time_sign * dt * k2)
+    clip_events += clipped
+    k3 = velocity_fn(x3)[0]
+    field_evaluations += 1
+
+    x4, clipped = solver.clip_inside_with_count(x + time_sign * dt * k3)
+    clip_events += clipped
+    k4 = velocity_fn(x4)[0]
+    field_evaluations += 1
+
+    x_next = x + (time_sign * dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return x_next, field_evaluations, clip_events
+
+
+def _adaptive_rk4_trial(
+    solver: Any,
+    velocity_fn: Callable[[Any], tuple[Any, ...]],
+    x: Any,
+    dt: float,
+    time_sign: float,
+    k1: Any,
+) -> tuple[Any, float, int, int]:
+    """Estimate RK4 local error with one full step versus two half steps."""
+
+    x_full, full_evals, full_clips = _rk4_step_state(solver, velocity_fn, x, dt, time_sign, k1)
+    x_half, half_evals, half_clips = _rk4_step_state(solver, velocity_fn, x, 0.5 * dt, time_sign, k1)
+    x_two_half, second_evals, second_clips = _rk4_step_state(solver, velocity_fn, x_half, 0.5 * dt, time_sign)
+    local_err = solver.rms_delta(x_two_half, x_full) / 15.0
+    return x_two_half, float(local_err), full_evals + half_evals + second_evals, full_clips + half_clips + second_clips
 
 
 @dataclass(frozen=True)
@@ -164,7 +216,7 @@ class SimulationConfig:
     initialization_fast_displacement_tol: float = 1.5e-2
 
     grid_size: int = 256
-    domain_radius: float = 4.0
+    domain_radius: float = 6.0
     dt: float = 0.055
     max_steps: int = 500
     tol_rms: float = 1.2e-2
@@ -471,6 +523,53 @@ def run_simulation(
             t += dt_fixed
             accepted_steps += 1
             dt_history.append(dt_fixed)
+    elif config.integrator == "adaptive_rk4":
+        while True:
+            _raise_if_cancelled()
+            record_trajectory(accepted_steps, x, t)
+            vf, _ = velocity_fn(x)
+            field_evaluations += 1
+            rms, maxv = solver.speed_stats(vf)
+            if accepted_steps % config.record_every == 0:
+                append_diagnostic(accepted_steps, t, rms, maxv, dt_current)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+
+            trial_dt = _cfl_limited_dt(dt_current, maxv, solver.h, config)
+            while True:
+                x_trial, local_err, trial_evals, trial_clips = _adaptive_rk4_trial(
+                    solver, velocity_fn, x, trial_dt, time_sign, vf
+                )
+                field_evaluations += trial_evals
+                clip_events += trial_clips
+                if not np.isfinite(local_err):
+                    if trial_dt <= config.dt_min * (1 + 1e-12):
+                        raise FloatingPointError("adaptive RK4 local error is non-finite at dt_min")
+                    rejected_steps += 1
+                    trial_dt = max(
+                        float(config.dt_min),
+                        trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False, order=5),
+                    )
+                    continue
+                if local_err <= config.adaptive_tol or trial_dt <= config.dt_min * (1 + 1e-12):
+                    break
+                rejected_steps += 1
+                trial_dt = max(
+                    float(config.dt_min),
+                    trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False, order=5),
+                )
+
+            x = solver.center(x_trial)
+            x, clipped = solver.clip_inside_with_count(x)
+            clip_events += clipped
+            t += trial_dt
+            accepted_steps += 1
+            dt_history.append(trial_dt)
+            dt_current = _clamp_dt(
+                trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=True, order=5), config
+            )
     else:
         while True:
             _raise_if_cancelled()
@@ -843,6 +942,54 @@ def run_hamiltonian_exponent_simulation(
             t += dt_fixed
             accepted_steps += 1
             dt_history.append(dt_fixed)
+    elif config.integrator == "adaptive_rk4":
+        while True:
+            _raise_if_cancelled()
+            record_trajectory(accepted_steps, x, t)
+            vf, _, residual_now, _ = velocity_fn(x)
+            field_evaluations += 1
+            rms, max_residual = solver.speed_stats(residual_now)
+            _, max_speed = solver.speed_stats(vf)
+            if accepted_steps % config.record_every == 0:
+                append_diagnostic(accepted_steps, t, rms, max_residual, dt_current)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+
+            trial_dt = _cfl_limited_dt(dt_current, max_speed, solver.h, config)
+            while True:
+                x_trial, local_err, trial_evals, trial_clips = _adaptive_rk4_trial(
+                    solver, velocity_fn, x, trial_dt, time_sign, vf
+                )
+                field_evaluations += trial_evals
+                clip_events += trial_clips
+                if not np.isfinite(local_err):
+                    if trial_dt <= config.dt_min * (1 + 1e-12):
+                        raise FloatingPointError("adaptive RK4 local error is non-finite at dt_min")
+                    rejected_steps += 1
+                    trial_dt = max(
+                        float(config.dt_min),
+                        trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False, order=5),
+                    )
+                    continue
+                if local_err <= config.adaptive_tol or trial_dt <= config.dt_min * (1 + 1e-12):
+                    break
+                rejected_steps += 1
+                trial_dt = max(
+                    float(config.dt_min),
+                    trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False, order=5),
+                )
+
+            x = solver.center(x_trial)
+            x, clipped = solver.clip_inside_with_count(x)
+            clip_events += clipped
+            t += trial_dt
+            accepted_steps += 1
+            dt_history.append(trial_dt)
+            dt_current = _clamp_dt(
+                trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=True, order=5), config
+            )
     else:
         while True:
             _raise_if_cancelled()
@@ -1049,6 +1196,56 @@ def run_finite_horizon_gauge_averaged_simulation(
             t += dt_fixed
             accepted_steps += 1
             dt_history.append(dt_fixed)
+    elif config.integrator == "adaptive_rk4":
+        while True:
+            _raise_if_cancelled()
+            record_trajectory(accepted_steps, x, t)
+            vf, _, _ = velocity_fn(x)
+            field_evaluations += field_evaluations_per_velocity
+            rms, maxv = solver.speed_stats(vf)
+            if accepted_steps % config.record_every == 0:
+                append_diagnostic(accepted_steps, t, rms, maxv, dt_current)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+
+            trial_dt = _cfl_limited_dt(dt_current, maxv, solver.h, config)
+            while True:
+                x_trial, local_err, trial_evals, trial_clips = _adaptive_rk4_trial(
+                    solver, velocity_fn, x, trial_dt, time_sign, vf
+                )
+                field_evaluations += trial_evals * field_evaluations_per_velocity
+                clip_events += trial_clips
+                if not np.isfinite(local_err):
+                    if trial_dt <= config.dt_min * (1 + 1e-12):
+                        raise FloatingPointError("adaptive RK4 local error is non-finite at dt_min")
+                    rejected_steps += 1
+                    trial_dt = max(
+                        float(config.dt_min),
+                        trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False, order=5),
+                    )
+                    continue
+                if local_err <= config.adaptive_tol or trial_dt <= config.dt_min * (1 + 1e-12):
+                    break
+                rejected_steps += 1
+                trial_dt = max(
+                    float(config.dt_min),
+                    trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False, order=5),
+                )
+
+            x = solver.center(x_trial)
+            x, clipped = solver.clip_inside_with_count(x)
+            clip_events += clipped
+            last_velocity_backend = None
+            last_A_bar_backend = None
+            last_rho_grid_backend = None
+            t += trial_dt
+            accepted_steps += 1
+            dt_history.append(trial_dt)
+            dt_current = _clamp_dt(
+                trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=True, order=5), config
+            )
     else:
         while True:
             _raise_if_cancelled()
@@ -1921,8 +2118,8 @@ def _validate_runtime_config(config: SimulationConfig) -> None:
         raise ValueError("initializer_config.displacement_tol must be positive")
     if config.dtype not in ("auto", "float32", "float64"):
         raise ValueError("dtype must be one of 'auto', 'float32', or 'float64'")
-    if config.integrator not in ("fixed_rk2", "adaptive_rk2"):
-        raise ValueError("integrator must be 'fixed_rk2' or 'adaptive_rk2'")
+    if config.integrator not in ("fixed_rk2", "adaptive_rk2", "adaptive_rk4"):
+        raise ValueError("integrator must be 'fixed_rk2', 'adaptive_rk2', or 'adaptive_rk4'")
     if config.time_direction not in ("forward", "backward"):
         raise ValueError("time_direction must be 'forward' or 'backward'")
     if config.external_field not in ("affine", "projective"):
@@ -2354,6 +2551,54 @@ def _plotly_values(values: Any) -> Any:
     return values
 
 
+def _cloud_halfwidth(x: Array, q: float = 0.995, pad: float = 1.25, floor: float = 1e-8) -> float:
+    points = np.asarray(x, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 2 or points.shape[0] == 0:
+        return float(floor)
+    finite = np.all(np.isfinite(points), axis=1)
+    if not np.any(finite):
+        return float(floor)
+    points = points[finite]
+    rel = points - np.mean(points, axis=0, keepdims=True)
+    r = np.linalg.norm(rel, axis=1)
+    return max(float(floor), float(pad * np.quantile(r, q)))
+
+
+def _smooth_delayed_zoom_scales(
+    raw_scales: Sequence[float],
+    *,
+    smoothing_radius: int = 2,
+    delay_frames: int = 4,
+) -> Array:
+    """Smooth dynamic zoom half-widths and delay zoom-in to avoid visual jitter."""
+
+    raw = np.asarray(raw_scales, dtype=np.float64)
+    if raw.ndim != 1:
+        raise ValueError("raw_scales must be one-dimensional")
+    if len(raw) == 0:
+        return raw
+    if not np.all(np.isfinite(raw)):
+        raise ValueError("raw_scales must be finite")
+    raw = np.maximum(raw, 1e-12)
+
+    radius = max(0, int(smoothing_radius))
+    if radius > 0 and len(raw) > 1:
+        offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+        weights = radius + 1.0 - np.abs(offsets)
+        weights = weights / np.sum(weights)
+        padded = np.pad(raw, (radius, radius), mode="edge")
+        smoothed = np.convolve(padded, weights, mode="valid")
+    else:
+        smoothed = raw.copy()
+
+    delay = max(0, int(delay_frames))
+    delayed = np.empty_like(smoothed)
+    for i in range(len(smoothed)):
+        delayed[i] = smoothed[max(0, i - delay)]
+
+    return np.maximum(delayed, raw)
+
+
 def _initialization_preset_from_config(config: SimulationConfig) -> str:
     if config.fibers is not None:
         return "mixed"
@@ -2680,6 +2925,10 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
     """
 
     _slider_alert_color = "#d62728"
+    _dynamic_zoom_quantile = 0.9975
+    _dynamic_zoom_pad = 1.35
+    _dynamic_zoom_smoothing_radius = 3
+    _dynamic_zoom_delay_frames = 0
 
     def __init__(
         self,
@@ -2715,6 +2964,8 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
         self._zmax = 1.0
         self._vmax = 1.0
         self._fiber_trace_count = 0
+        self._left_full_range = [-float(config.domain_radius), float(config.domain_radius)]
+        self._right_full_range = [-float(config.domain_radius), float(config.domain_radius)]
 
         fibers = _normalize_fibers(config)
         self._group_names: tuple[str, ...] = tuple(
@@ -2750,8 +3001,8 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
             )
         elif self._second_panel == "barycenters":
             right = (
-                "Right: per-fiber barycenters (circles) and critical points of "
-                "W*rho-omega*x (x markers)."
+                "Right: per-fiber barycenters (circles), critical points of "
+                "W*rho-omega*x (x markers), and lag arrows from barycenter to critical point."
             )
         else:
             right = "Right: precomputed joint spatial density."
@@ -2820,6 +3071,12 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
             description="Use optimal K",
             tooltip="Use K=None so the backend chooses the alpha-normalized PP coupling.",
             layout=widgets.Layout(width="160px"),
+        )
+        self.dynamic_zoom_toggle = widgets.ToggleButton(
+            value=bool(self.config.density_dynamic_zoom),
+            description="Zoom: on",
+            tooltip="Dynamically crop both subplots around each cached frame's active scale.",
+            layout=widgets.Layout(width="120px"),
         )
         self.n_fibers_slider = widgets.IntSlider(
             value=n_fibers,
@@ -2912,6 +3169,7 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
                 ),
                 widgets.HBox([self.alpha_slider]),
                 widgets.HBox([self.K_slider, self.use_optimal_K_toggle]),
+                widgets.HBox([self.dynamic_zoom_toggle]),
                 widgets.HBox(
                     [
                         self.config_status_html,
@@ -2925,6 +3183,7 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
             ]
         )
         self._sync_K_control_state()
+        self._sync_zoom_toggle_labels()
 
     def _set_slider_alert_style(self, slider: Any, active: bool) -> None:
         if hasattr(slider, "style") and hasattr(slider.style, "handle_color"):
@@ -2937,6 +3196,13 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
         use_auto = bool(self.use_optimal_K_toggle.value)
         self.K_slider.disabled = use_auto
         self.use_optimal_K_toggle.button_style = "info" if use_auto else ""
+
+    def _dynamic_zoom_enabled(self) -> bool:
+        return bool(self.dynamic_zoom_toggle.value)
+
+    def _sync_zoom_toggle_labels(self) -> None:
+        self.dynamic_zoom_toggle.description = "Zoom: on" if self._dynamic_zoom_enabled() else "Zoom: off"
+        self.dynamic_zoom_toggle.button_style = "info" if self._dynamic_zoom_enabled() else ""
 
     def _K_from_controls(self) -> float | None:
         return None if bool(self.use_optimal_K_toggle.value) else float(self.K_slider.value)
@@ -3083,12 +3349,35 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
                     col=2,
                 )
                 self.tr[f"cfiber{k}"] = len(self.fig.data) - 1
+                self.fig.add_trace(
+                    go.Scatter(
+                        x=[],
+                        y=[],
+                        mode="lines+markers",
+                        line=dict(color=color, width=1.4),
+                        marker=dict(
+                            size=[0, 10],
+                            color=color,
+                            symbol=["circle", "triangle-up-open"],
+                            angleref="previous",
+                            line=dict(width=1.4, color=color),
+                        ),
+                        name=f"fiber {k + 1} barycenter-to-critical lag",
+                        legendgroup=f"fiber{k}",
+                        showlegend=False,
+                        hoverinfo="skip",
+                        visible=True,
+                    ),
+                    row=1,
+                    col=2,
+                )
+                self.tr[f"lagfiber{k}"] = len(self.fig.data) - 1
             self._fiber_trace_count += 1
 
         with self.fig.batch_update():
             for k in range(self._fiber_trace_count):
                 visible = k < len(group_names)
-                for prefix in ("fiber", "vfiber", "bfiber", "cfiber"):
+                for prefix in ("fiber", "vfiber", "bfiber", "cfiber", "lagfiber"):
                     key = f"{prefix}{k}"
                     if key not in self.tr:
                         continue
@@ -3106,6 +3395,10 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
                                 f"fiber {k + 1}: {group_names[k]}"
                                 "<br>A_rho(x)=omega critical point<br>x1=%{x:.4g}<br>x2=%{y:.4g}<extra></extra>"
                             )
+                        elif prefix == "lagfiber":
+                            trace.name = f"fiber {k + 1} barycenter-to-critical lag"
+                            trace.line.color = colors[k]
+                            trace.marker.line.color = colors[k]
                         else:
                             trace.name = f"fiber {k + 1}: {group_names[k]}"
                         trace.legendgroup = f"fiber{k}"
@@ -3129,6 +3422,7 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
             self.frame_cap_text,
         ):
             ctl.observe(self._on_control_change, names="value")
+        self.dynamic_zoom_toggle.observe(self._on_dynamic_zoom_change, names="value")
         self.time_direction_toggle.observe(self._on_time_direction_toggle, names="value")
         self.btn_resample.on_click(self._on_resample)
         self.btn_precompute.on_click(self._on_precompute_clicked)
@@ -3181,11 +3475,13 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
             residual_text = f"; residual RMS={result.rms_residual:.3g}; runtime={result.runtime_seconds:.2f}s"
         frame_text = "all steps" if int(cfg.trajectory_frame_count) <= 0 else f"cap {int(cfg.trajectory_frame_count):,}"
         self._sync_K_control_state()
+        self._sync_zoom_toggle_labels()
         K_eff = resolve_pp_K(cfg.alpha, cfg.K)
         traction_scale = resolve_pp_traction_scale(cfg.alpha, cfg.K)
+        zoom_text = "on" if self._dynamic_zoom_enabled() else "off"
         self.config_status_html.value = (
             "<b>PP config:</b> "
-            f"alpha={float(cfg.alpha):.2f}; "
+            f"alpha={float(cfg.alpha):.4f}; "
             f"K={_format_pp_K_value(K_eff)}; "
             f"traction={traction_scale:.3g}; "
             f"omega atoms={int(cfg.n_fibers)}; "
@@ -3194,6 +3490,7 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
             f"init={self.initialization_dropdown.label}; "
             f"warmup={self.initializer_dropdown.label}; "
             f"time={cfg.time_direction}; "
+            f"zoom={zoom_text}; "
             f"steps={int(cfg.max_steps):,}; "
             f"frames={frame_text}; "
             f"backend={backend_text}; "
@@ -3261,6 +3558,45 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
                 trajectory_x
             )
         vmax = 1e-6
+        left_zoom_scales = _smooth_delayed_zoom_scales(
+            [
+                _cloud_halfwidth(
+                    trajectory_x[f],
+                    q=self._dynamic_zoom_quantile,
+                    pad=self._dynamic_zoom_pad,
+                    floor=1e-6,
+                )
+                for f in range(frame_count)
+            ],
+            smoothing_radius=self._dynamic_zoom_smoothing_radius,
+            delay_frames=self._dynamic_zoom_delay_frames,
+        )
+        right_raw_zoom_scales: list[float] = []
+        for f in range(frame_count):
+            if velocity_panel:
+                assert velocity_frames is not None
+                right_points = velocity_frames[f]
+            elif barycenter_panel:
+                assert barycenter_frames is not None
+                assert critical_frames is not None
+                right_points = np.vstack([barycenter_frames[f], critical_frames[f]])
+            else:
+                right_points = trajectory_x[f]
+            right_raw_zoom_scales.append(
+                _cloud_halfwidth(
+                    right_points,
+                    q=self._dynamic_zoom_quantile,
+                    pad=self._dynamic_zoom_pad,
+                    floor=1e-6,
+                )
+            )
+        right_zoom_scales = _smooth_delayed_zoom_scales(
+            right_raw_zoom_scales,
+            smoothing_radius=self._dynamic_zoom_smoothing_radius,
+            delay_frames=self._dynamic_zoom_delay_frames,
+        )
+        r = float(self.config.domain_radius)
+        self._left_full_range = [-r, r]
 
         payloads: list[dict[str, Any]] = []
         for f in range(frame_count):
@@ -3273,6 +3609,8 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
             payload: dict[str, Any] = {
                 "fiber_x": fiber_x,
                 "fiber_y": fiber_y,
+                "left_range": [-float(left_zoom_scales[f]), float(left_zoom_scales[f])],
+                "right_range": [-float(right_zoom_scales[f]), float(right_zoom_scales[f])],
                 "title": _animation_title(self.config, result, int(steps[f]), float(times[f]), f, frame_count),
                 "stats": (
                     f"frame {f + 1}/{frame_count}; step={int(steps[f])}; "
@@ -3308,7 +3646,11 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
                 payload["density_z"] = trajectory_rho[f].T
             payloads.append(payload)
 
-        self._vmax = vmax * 1.08 if velocity_panel else self._vmax
+        if velocity_panel:
+            self._vmax = vmax * 1.08
+            self._right_full_range = [-float(self._vmax), float(self._vmax)]
+        else:
+            self._right_full_range = [-r, r]
         return payloads
 
     def _compute_trajectory_velocities(self, trajectory_x: Array) -> Array:
@@ -3342,8 +3684,8 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
         ``A_rho = grad(W * rho)``, the per-fiber target is a critical point of
         ``Phi_omega(x) = W * rho(x) - omega . x`` and solves
         ``grad Phi_omega = A_rho(x) - omega = 0``.  We reuse the same grid field,
-        interpolate ``A_rho`` and its Hessian, and run a small damped Newton solve
-        for each omega atom.
+        differentiate that grid for the Newton Jacobian, and run a small damped
+        Newton solve for each omega atom.
         """
 
         result = self._result
@@ -3371,8 +3713,8 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
                 if idx.size:
                     barycenters[f, k] = np.mean(xf[idx], axis=0)
 
-            rho_grid, ax_grid, ay_grid = solver.A_grid_from_particles(xf)
-            hxx_grid, hxy_grid, hyy_grid = solver.hessian_grid_from_rho(rho_grid)
+            _rho_grid, ax_grid, ay_grid = solver.A_grid_from_particles(xf)
+            hxx_grid, hxy_grid, hyy_grid = self._hessian_grid_from_A_grid(ax_grid, ay_grid, solver.h)
             seeds = previous_critical if previous_critical is not None else barycenters[f]
             for k in range(group_count):
                 omega = omega_atoms[k]
@@ -3483,6 +3825,14 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
         return field, hessian
 
     @staticmethod
+    def _hessian_grid_from_A_grid(ax_grid: Array, ay_grid: Array, h: float) -> tuple[Array, Array, Array]:
+        hxx = np.gradient(ax_grid, float(h), axis=0)
+        hxy_from_x = np.gradient(ax_grid, float(h), axis=1)
+        hxy_from_y = np.gradient(ay_grid, float(h), axis=0)
+        hyy = np.gradient(ay_grid, float(h), axis=1)
+        return hxx, 0.5 * (hxy_from_x + hxy_from_y), hyy
+
+    @staticmethod
     def _grid_residual_minimizer(
         solver: FFTPeszekPoyato2D,
         ax_grid: Array,
@@ -3497,16 +3847,14 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
 
     def _apply_static_payload_to_figure(self) -> None:
         if self._second_panel == "velocity":
-            v = float(self._vmax)
             with self.fig.batch_update():
-                self.fig.update_xaxes(range=[-v, v], row=1, col=2)
-                self.fig.update_yaxes(range=[-v, v], row=1, col=2)
+                self.fig.update_xaxes(range=list(self._right_full_range), row=1, col=2)
+                self.fig.update_yaxes(range=list(self._right_full_range), row=1, col=2)
             return
         if self._second_panel == "barycenters":
-            r = self.config.domain_radius
             with self.fig.batch_update():
-                self.fig.update_xaxes(range=[-r, r], row=1, col=2)
-                self.fig.update_yaxes(range=[-r, r], row=1, col=2)
+                self.fig.update_xaxes(range=list(self._right_full_range), row=1, col=2)
+                self.fig.update_yaxes(range=list(self._right_full_range), row=1, col=2)
             return
         if self._density_axis is None:
             return
@@ -3517,6 +3865,18 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
             density.y = axis
             density.zmin = 0.0
             density.zmax = float(self._zmax)
+
+    def _apply_payload_axis_ranges(self, payload: dict[str, Any]) -> None:
+        if self._dynamic_zoom_enabled():
+            left_range = payload.get("left_range", self._left_full_range)
+            right_range = payload.get("right_range", self._right_full_range)
+        else:
+            left_range = self._left_full_range
+            right_range = self._right_full_range
+        self.fig.update_xaxes(range=list(left_range), row=1, col=1)
+        self.fig.update_yaxes(range=list(left_range), row=1, col=1)
+        self.fig.update_xaxes(range=list(right_range), row=1, col=2)
+        self.fig.update_yaxes(range=list(right_range), row=1, col=2)
 
     def _apply_cached_frame(self, frame_idx: int) -> None:
         if not self._frame_payloads:
@@ -3535,14 +3895,22 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
                     vtrace.x = _plotly_values(payload["vfiber_x"][k])
                     vtrace.y = _plotly_values(payload["vfiber_y"][k])
                 if barycenter_panel:
+                    lagtrace = self.fig.data[self.tr[f"lagfiber{k}"]]
                     btrace = self.fig.data[self.tr[f"bfiber{k}"]]
                     ctrace = self.fig.data[self.tr[f"cfiber{k}"]]
-                    btrace.x = _plotly_values(np.array([payload["barycenter_x"][k]], dtype=np.float64))
-                    btrace.y = _plotly_values(np.array([payload["barycenter_y"][k]], dtype=np.float64))
-                    ctrace.x = _plotly_values(np.array([payload["critical_x"][k]], dtype=np.float64))
-                    ctrace.y = _plotly_values(np.array([payload["critical_y"][k]], dtype=np.float64))
+                    bx = float(payload["barycenter_x"][k])
+                    by = float(payload["barycenter_y"][k])
+                    cx = float(payload["critical_x"][k])
+                    cy = float(payload["critical_y"][k])
+                    lagtrace.x = _plotly_values(np.array([bx, cx], dtype=np.float64))
+                    lagtrace.y = _plotly_values(np.array([by, cy], dtype=np.float64))
+                    btrace.x = _plotly_values(np.array([bx], dtype=np.float64))
+                    btrace.y = _plotly_values(np.array([by], dtype=np.float64))
+                    ctrace.x = _plotly_values(np.array([cx], dtype=np.float64))
+                    ctrace.y = _plotly_values(np.array([cy], dtype=np.float64))
             if not velocity_panel and not barycenter_panel:
                 self.fig.data[self.tr["density"]].z = _plotly_values(payload["density_z"])
+            self._apply_payload_axis_ranges(payload)
             self.fig.layout.title.text = payload["title"]
         self.stats_html.value = payload["stats"]
 
@@ -3607,6 +3975,14 @@ class PeszekPoyatoDynamicsBaseWidget(_AsyncPrecomputeControlsMixin):
             return
         self._sync_time_direction_label()
         self._mark_cache_stale("Time direction changed. Click Interrupt, then Precompute flow.")
+
+    def _on_dynamic_zoom_change(self, change: dict[str, Any]) -> None:
+        if self._updating or change.get("name") != "value":
+            return
+        self._sync_zoom_toggle_labels()
+        self._sync_config_status(self._result)
+        if self._frame_payloads:
+            self._apply_cached_frame(self._frame_index)
 
     def _on_resample(self, _btn: Any) -> None:
         self._seed += 1
@@ -4468,7 +4844,7 @@ class PeszekPoyatoContinuousDensityWidget(_AsyncPrecomputeControlsMixin):
             layout=widgets.Layout(width="600px"),
         )
         self.use_optimal_K_toggle = widgets.ToggleButton(
-            value=self.config.K is None,
+            value=True,
             description="Use optimal K",
             tooltip="Use K=None so the backend chooses the alpha-normalized PP coupling.",
             layout=widgets.Layout(width="160px"),
@@ -5229,7 +5605,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--backend", choices=("auto", "numpy", "torch"), default="auto")
     parser.add_argument("--device", default=None, help="torch device override, e.g. cuda, cuda:0, mps, or cpu")
     parser.add_argument("--dtype", choices=("auto", "float32", "float64"), default="auto")
-    parser.add_argument("--integrator", choices=("fixed_rk2", "adaptive_rk2"), default="adaptive_rk2")
+    parser.add_argument("--integrator", choices=("fixed_rk2", "adaptive_rk2", "adaptive_rk4"), default="adaptive_rk2")
     parser.add_argument("--time-direction", choices=("forward", "backward"), default="forward")
     parser.add_argument("--adaptive-tol", type=float, default=5.0e-3)
     parser.add_argument("--dt-min", type=float, default=1.0e-4)

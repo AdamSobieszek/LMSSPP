@@ -23,27 +23,48 @@ DTypeChoice = Literal["auto", "float32", "float64"]
 
 AUTO_K_REFERENCE_ALPHA = 0.99
 AUTO_K_REFERENCE_DELTA = 1.0 - AUTO_K_REFERENCE_ALPHA
+AUTO_K_OPT_SAFETY_FACTOR = 1.003
+AUTO_K_OPT_TRACTION_LIMIT = 1.5417376823742555
+AUTO_K_OPT_EXP_AMPLITUDE = 1.7729528862175705
+AUTO_K_OPT_EXP_AMPLITUDE = 1.7029528862175705
+AUTO_K_OPT_EXP_RATE = 2.2877960408582667
+AUTO_K_OPT_EXP_RATE = 2.301960408582667
+
+
+def _resolve_auto_pp_K(alpha: float) -> float:
+    """Resolve the fitted automatic PP coupling for ``alpha < 1``."""
+
+    delta = 1.0 - float(alpha)
+    if delta > 0.0:
+        x = -float(np.log10(delta))
+        correction = AUTO_K_OPT_TRACTION_LIMIT - AUTO_K_OPT_EXP_AMPLITUDE * np.exp(-AUTO_K_OPT_EXP_RATE * x)
+        correction = max(0.0, float(correction))
+        return float(delta * AUTO_K_OPT_SAFETY_FACTOR * correction)
+    if abs(delta) < 1e-15:
+        return float("inf")
+    return 1.0
 
 
 def resolve_pp_K(alpha: float, K: float | None) -> float:
     """Resolve the PP coupling strength.
 
-    Passing ``K=None`` uses the alpha-scaled convention normalized so that
-    ``alpha=0.99`` gives exactly ``K=1``:
+    Passing ``K=None`` uses the empirical fixed-scale fit
 
-        K_auto = (1 - 0.99) / (1 - alpha).
+        x = -log10(1 - alpha)
+        K_auto = 1.003 * (1 - alpha) * (1.5417376823742555 - 1.7729528862175705 * exp(-2.2877960408582667 * x))
 
+    for ``alpha < 1``. The fit is calibrated for high-alpha experiments; values
+    outside that range are clipped to keep the automatic coupling non-negative.
     At the singular metadata point ``alpha=1`` this returns ``inf`` for
-    ``K=None``. Kernel computations use :func:`resolve_pp_traction_scale`
-    instead of this display/logging value.
+    ``K=None``. Kernel computations use
+    :func:`resolve_pp_traction_scale` instead of this display/logging value.
     """
 
     alpha_f = float(alpha)
     if K is None:
-        denom = 1.0 - alpha_f
-        if abs(denom) < 1e-15:
-            return float("inf")
-        K_f = AUTO_K_REFERENCE_DELTA / denom
+        K_f = _resolve_auto_pp_K(alpha_f)
+        if abs(1.0 - alpha_f) < 1e-15:
+            return K_f
     else:
         K_f = float(K)
     if not np.isfinite(K_f):
@@ -64,7 +85,7 @@ def resolve_pp_traction_scale(alpha: float, K: float | None) -> float:
     denom = 1.0 - alpha_f
     if abs(denom) < 1e-15:
         if K is None:
-            return float(1.0 / AUTO_K_REFERENCE_DELTA)
+            return float(AUTO_K_OPT_SAFETY_FACTOR * AUTO_K_OPT_TRACTION_LIMIT)
         return float(K)
     K_f = resolve_pp_K(alpha_f, K)
     traction = K_f / denom
@@ -706,10 +727,10 @@ def _cfl_limited_dt(dt: float, max_speed: float, h: float, config: Any) -> float
     return _clamp_dt(limited, config)
 
 
-def _adaptive_step_factor(local_err: float, tol: float, *, grow: bool) -> float:
+def _adaptive_step_factor(local_err: float, tol: float, *, grow: bool, order: int = 2) -> float:
     if not np.isfinite(local_err) or local_err <= 0:
         return 2.0 if grow else 0.25
-    factor = 0.92 * float(tol / local_err) ** 0.5
+    factor = 0.92 * float(tol / local_err) ** (1.0 / max(1, int(order)))
     if grow:
         return float(np.clip(factor, 0.5, 2.0))
     return float(np.clip(factor, 0.2, 0.8))

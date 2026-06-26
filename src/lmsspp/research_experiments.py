@@ -30,6 +30,7 @@ from .dynamics.pp_transient_research import (
     TransientResearchConfig,
     run_finite_horizon_animation_batch,
     run_finite_horizon_comparison,
+    run_k_scale_calibration,
     run_long_cross_reference,
     run_pp_research_sweep,
     run_predictive_mode_comparison_batch,
@@ -52,6 +53,7 @@ SUPPORTED_EXPERIMENTS = (
     "finite_horizon_animation_batch",
     "finite_horizon_animation_alpha_range",
     "finite_horizon_comparison",
+    "k_scale_calibration",
     "long_cross_reference",
     "predictive_mode_comparison_batch",
     "predictive_velocity_animation_batch",
@@ -218,6 +220,13 @@ def run_experiment_config(
 
     if kind == "finite_horizon_comparison":
         metrics = run_finite_horizon_comparison(out_dir, **params)
+        return metrics
+
+    if kind == "k_scale_calibration":
+        base_data = dict(config.get("base_config", {}))
+        base_data.setdefault("out_dir", out_dir)
+        base_config = transient_config_from_mapping(base_data)
+        metrics = run_k_scale_calibration(out_dir, base_config=base_config, **params)
         return metrics
 
     if kind == "predictive_mode_comparison_batch":

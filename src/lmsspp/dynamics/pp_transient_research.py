@@ -21,6 +21,11 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - tqdm is optional for research runs
+    tqdm = None  # type: ignore[assignment]
+
 from .PP import (
     Array,
     FFTPeszekPoyato2D,
@@ -50,6 +55,7 @@ from .pp_cs_equilibria import (
     PredictiveModeChoice,
     SimulationConfig,
     SimulationResult,
+    _adaptive_rk4_trial,
     _config_to_json,
     _jsonable,
     _predictive_theta_from_config,
@@ -412,6 +418,55 @@ def run_research_simulation(
             t += dt_fixed
             accepted_steps += 1
             dt_history.append(dt_fixed)
+    elif config.integrator == "adaptive_rk4":
+        while True:
+            _raise_if_cancelled()
+            record_trajectory(accepted_steps, x, t)
+            vf, _ = velocity_fn(x)
+            field_evaluations += 1
+            rms, maxv = solver.speed_stats(vf)
+            if accepted_steps % config.record_every == 0:
+                append_diagnostic(accepted_steps, t, rms, maxv, dt_current)
+            if accepted_steps % research_every == 0:
+                append_research_diagnostic(accepted_steps, t, dt_current, x)
+            if rms < config.tol_rms and accepted_steps > config.min_steps:
+                break
+            if accepted_steps >= config.max_steps:
+                break
+
+            trial_dt = _cfl_limited_dt(dt_current, maxv, solver.h, config)
+            while True:
+                x_trial, local_err, trial_evals, trial_clips = _adaptive_rk4_trial(
+                    solver, velocity_fn, x, trial_dt, time_sign, vf
+                )
+                field_evaluations += trial_evals
+                clip_events += trial_clips
+                if not np.isfinite(local_err):
+                    if trial_dt <= config.dt_min * (1 + 1e-12):
+                        raise FloatingPointError("adaptive RK4 local error is non-finite at dt_min")
+                    rejected_steps += 1
+                    trial_dt = max(
+                        float(config.dt_min),
+                        trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False, order=5),
+                    )
+                    continue
+                if local_err <= config.adaptive_tol or trial_dt <= config.dt_min * (1 + 1e-12):
+                    break
+                rejected_steps += 1
+                trial_dt = max(
+                    float(config.dt_min),
+                    trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=False, order=5),
+                )
+
+            x = maybe_center_state(x_trial)
+            x, clipped = maybe_clip_state(x)
+            clip_events += clipped
+            t += trial_dt
+            accepted_steps += 1
+            dt_history.append(trial_dt)
+            dt_current = _clamp_dt(
+                trial_dt * _adaptive_step_factor(local_err, config.adaptive_tol, grow=True, order=5), config
+            )
     else:
         while True:
             _raise_if_cancelled()
@@ -1428,6 +1483,464 @@ def run_pp_research_sweep(
     make_sweep_summary_figure(summaries, sweep=sweep).write_html(str(root / "sweep_summary.html"), include_plotlyjs="cdn")
     make_sweep_morphology_grid(cases, sweep=sweep).write_html(str(root / "morphology_grid.html"), include_plotlyjs="cdn")
     return summaries
+
+
+def _k_scale_csv(path: Path, rows: Sequence[dict[str, object]]) -> None:
+    if not rows:
+        path.write_text("")
+        return
+    keys: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in keys:
+                keys.append(key)
+    with path.open("w") as f:
+        f.write(",".join(keys) + "\n")
+        for row in rows:
+            f.write(",".join(str(row.get(key, "")) for key in keys) + "\n")
+
+
+def _k_scale_boundary_summary(result: ResearchSimulationResult, config: TransientResearchConfig) -> dict[str, float | bool]:
+    trajectory = result.trajectory_x
+    if trajectory is None:
+        trajectory = result.x_final[None, :, :]
+    traj = np.asarray(trajectory, dtype=np.float64)
+    max_abs = float(np.max(np.abs(traj))) if traj.size else 0.0
+    boundary_fraction = max_abs / max(float(config.domain_radius), 1e-30)
+    scale_values = np.array([_cloud_halfwidth(frame, q=0.9975, pad=1.0, floor=1e-12) for frame in traj], dtype=np.float64)
+    return {
+        "max_abs_coordinate": max_abs,
+        "max_boundary_fraction": float(boundary_fraction),
+        "transient_scale_max": float(np.max(scale_values)) if scale_values.size else float("nan"),
+        "boundary_clip_hit": bool(result.clip_events > 0),
+    }
+
+
+def _plot_k_scale_calibration(root: Path, selected_rows: Sequence[dict[str, object]], aggregate_rows: Sequence[dict[str, object]]) -> None:
+    if not selected_rows:
+        return
+    _setup_matplotlib_caches()
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    alphas = np.array([float(row["alpha"]) for row in aggregate_rows], dtype=np.float64)
+    median_k = np.array([float(row["median_selected_K"]) for row in aggregate_rows], dtype=np.float64)
+    median_deviation = np.array([float(row["median_selected_deviation"]) for row in aggregate_rows], dtype=np.float64)
+    ok_counts = np.array([int(row["selected_seed_count"]) for row in aggregate_rows], dtype=np.int64)
+
+    order = np.argsort(alphas)
+    fig, ax = plt.subplots(figsize=(8.5, 5.0), dpi=160)
+    ax.plot(alphas[order], median_k[order], marker="o", linewidth=1.6)
+    ax.set_xlabel("alpha")
+    ax.set_ylabel("selected K")
+    ax.set_title("Adaptive K-deviation calibration")
+    ax.grid(True, alpha=0.25)
+    for x, y, n in zip(alphas[order], median_k[order], ok_counts[order], strict=True):
+        ax.annotate(f"n={n}", (x, y), textcoords="offset points", xytext=(0, 7), ha="center", fontsize=7)
+    fig.tight_layout()
+    _save_experiment_png(fig, root / "k_opt_vs_alpha.png", dpi=180)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.0), dpi=160)
+    ax.plot(alphas[order], median_deviation[order], marker="o", linewidth=1.6, color="#b35c00")
+    ax.set_xlabel("alpha")
+    ax.set_ylabel("selected deviation from K_baseline")
+    ax.set_title("Deviation from selected baseline K(alpha)")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    _save_experiment_png(fig, root / "k_deviation_vs_alpha.png", dpi=180)
+    plt.close(fig)
+
+
+def _fixed_traction_K(alpha: float, *, reference_alpha: float, reference_K: float) -> float:
+    denom = 1.0 - float(reference_alpha)
+    if denom <= 0.0:
+        raise ValueError("reference_alpha must be < 1 for fixed-traction K calibration")
+    delta = 1.0 - float(alpha)
+    if delta <= 0.0:
+        raise ValueError("K-scale calibration currently expects alpha < 1")
+    return float(reference_K) * delta / denom
+
+
+def _estimate_scale_crossing(rows: Sequence[dict[str, object]]) -> tuple[float | None, float | None]:
+    safe = sorted(
+        (row for row in rows if bool(row["evolved_enough"]) and np.isfinite(float(row["scale_error_log"]))),
+        key=lambda row: float(row["K_deviation"]),
+    )
+    if not safe:
+        return None, None
+    for left, right in zip(safe[:-1], safe[1:], strict=False):
+        y0 = float(left["scale_error_log"])
+        y1 = float(right["scale_error_log"])
+        if y0 == 0.0:
+            return float(left["K_deviation"]), float(left["K"])
+        if y0 * y1 > 0.0:
+            continue
+        log_d0 = np.log(float(left["K_deviation"]))
+        log_d1 = np.log(float(right["K_deviation"]))
+        if y1 == y0:
+            log_d = 0.5 * (log_d0 + log_d1)
+        else:
+            log_d = log_d0 - y0 * (log_d1 - log_d0) / (y1 - y0)
+        deviation = float(np.exp(log_d))
+        baseline = float(left["K_baseline"])
+        return deviation, float(baseline * deviation)
+    best = min(safe, key=lambda row: float(row["abs_scale_error_log"]))
+    return float(best["K_deviation"]), float(best["K"])
+
+
+def _k_scale_row_usable(row: dict[str, object]) -> bool:
+    return (
+        not bool(row["boundary_hit"])
+        and bool(row["evolved_enough"])
+        and np.isfinite(float(row["scale_error_log"]))
+    )
+
+
+def _k_scale_row_contracting(row: dict[str, object]) -> bool:
+    return _k_scale_row_usable(row) and float(row["scale_error_log"]) <= 0.0
+
+
+def _k_scale_row_search_status(row: dict[str, object]) -> Literal["safe_contracting", "safe_expanding", "unsafe"]:
+    if _k_scale_row_contracting(row):
+        return "safe_contracting"
+    if _k_scale_row_usable(row):
+        return "safe_expanding"
+    return "unsafe"
+
+
+class _TextProgress:
+    def __init__(self, total: int, *, label: str = "simulations") -> None:
+        self.total = max(0, int(total))
+        self.label = label
+        self.count = 0
+
+    def __enter__(self) -> "_TextProgress":
+        if self.total:
+            print(f"{self.label}: 0/{self.total}", flush=True)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.total:
+            print(f"{self.label}: {self.count}/{self.total}", flush=True)
+
+    def update(self, n: int = 1) -> None:
+        self.count += int(n)
+        if self.total and (self.count == self.total or self.count % max(1, self.total // 20) == 0):
+            print(f"{self.label}: {self.count}/{self.total}", flush=True)
+
+
+def run_k_scale_calibration(
+    out_dir: Path | str,
+    *,
+    base_config: TransientResearchConfig | dict[str, Any] | None = None,
+    alphas: Sequence[float] | None = None,
+    alpha_delta_min: float = 0.005,
+    alpha_delta_max: float = 0.5,
+    alpha_count: int = 9,
+    seeds: Sequence[int] = (2026, 2027, 2028),
+    reference_alpha: float = 0.99,
+    reference_K: float = 1.0,
+    baseline: Literal["current_auto", "fixed_traction"] = "current_auto",
+    deviation_min: float = 0.03125,
+    deviation_max: float = 1.0,
+    search_points_per_iteration: int = 5,
+    search_iterations: int = 3,
+    bracket_multiplier: float = 2.0,
+    max_bracket_iterations: int = 10,
+    boundary_hit_fraction: float = 0.985,
+    min_final_time: float = 2.0,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[str, object]:
+    """Calibrate the multiplicative deviation around a baseline K relationship."""
+    _ = search_points_per_iteration  # Accepted for older YAML files; no grid is used.
+
+    root = Path(out_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    if base_config is None:
+        base = TransientResearchConfig()
+    elif isinstance(base_config, TransientResearchConfig):
+        base = base_config
+    else:
+        base = TransientResearchConfig(**dict(base_config))
+
+    if alphas is None:
+        deltas = np.geomspace(float(alpha_delta_max), float(alpha_delta_min), int(alpha_count))
+        alpha_values = tuple(float(1.0 - delta) for delta in deltas)
+    else:
+        alpha_values = tuple(float(alpha) for alpha in alphas)
+    seed_values = tuple(int(seed) for seed in seeds)
+
+    run_rows: list[dict[str, object]] = []
+    selected_rows: list[dict[str, object]] = []
+    aggregate_rows: list[dict[str, object]] = []
+    estimated_total = len(alpha_values) * len(seed_values) * (
+        1 + max(0, int(max_bracket_iterations)) + max(0, int(search_iterations))
+    )
+    progress_context: Any
+    if tqdm is not None:
+        progress_context = tqdm(total=estimated_total, desc="K-scale sims", unit="sim")
+    else:
+        progress_context = _TextProgress(estimated_total, label="K-scale sims")
+
+    with progress_context as progress:
+        for alpha_index, alpha in enumerate(alpha_values):
+            for seed in seed_values:
+                seed_base = replace(
+                    base,
+                    alpha=float(alpha),
+                    K=None,
+                    seed=int(seed),
+                    integrator=base.integrator,
+                    make_dashboard=False,
+                    make_animation=True,
+                    backend="numpy" if base.force_backend == "direct" else base.backend,
+                    out_dir=root / f"alpha_{alpha_index:02d}_seed_{seed}",
+                )
+                initial = make_initial_condition(seed_base)
+                K_current_auto = resolve_pp_K(alpha, None)
+                K_fixed_traction = _fixed_traction_K(
+                    alpha, reference_alpha=float(reference_alpha), reference_K=float(reference_K)
+                )
+                if baseline == "current_auto":
+                    K_baseline = K_current_auto
+                elif baseline == "fixed_traction":
+                    K_baseline = K_fixed_traction
+                else:
+                    raise ValueError("baseline must be 'current_auto' or 'fixed_traction'")
+
+                candidates: list[dict[str, object]] = []
+                evaluated: dict[float, dict[str, object]] = {}
+
+                def evaluate_deviation(deviation: float, *, phase: str, iteration: int) -> dict[str, object]:
+                    if cancel_check is not None and cancel_check():
+                        raise InterruptedError("K-scale calibration cancelled.")
+                    bounded_deviation = float(np.clip(float(deviation), float(deviation_min), float(deviation_max)))
+                    deviation_key = round(bounded_deviation, 14)
+                    if deviation_key in evaluated:
+                        return evaluated[deviation_key]
+
+                    K_value = float(K_baseline * bounded_deviation)
+                    cfg = replace(seed_base, K=K_value)
+                    result = run_research_simulation(cfg, initial, cancel_check=cancel_check)
+                    initial_scale = _cloud_halfwidth(result.x_initial, q=0.9975, pad=1.0, floor=1e-12)
+                    final_scale = _cloud_halfwidth(result.x_final, q=0.9975, pad=1.0, floor=1e-12)
+                    boundary = _k_scale_boundary_summary(result, cfg)
+                    boundary_hit = bool(boundary["boundary_clip_hit"]) or float(boundary["max_boundary_fraction"]) >= float(boundary_hit_fraction)
+                    evolved_enough = float(result.final_time) >= float(min_final_time)
+                    scale_ratio = float(final_scale / max(initial_scale, 1e-30))
+                    scale_error_log = float(np.log(max(scale_ratio, 1e-30)))
+                    row: dict[str, object] = {
+                        "phase": str(phase),
+                        "iteration": int(iteration),
+                        "alpha": float(alpha),
+                        "delta": float(1.0 - alpha),
+                        "seed": int(seed),
+                        "K_current_auto": float(K_current_auto),
+                        "K_fixed_traction": float(K_fixed_traction),
+                        "K_baseline": float(K_baseline),
+                        "K_deviation": bounded_deviation,
+                        "K": float(K_value),
+                        "boundary_hit": bool(boundary_hit),
+                        "evolved_enough": bool(evolved_enough),
+                        "contracting": bool(scale_error_log <= 0.0),
+                        "usable_contracting": False,
+                        "clip_events": int(result.clip_events),
+                        "steps": int(result.steps),
+                        "final_time": float(result.final_time),
+                        "rms_residual": float(result.rms_residual),
+                        "initial_scale": float(initial_scale),
+                        "final_scale": float(final_scale),
+                        "final_to_initial_scale": scale_ratio,
+                        "scale_error_log": scale_error_log,
+                        "abs_scale_error_log": abs(scale_error_log),
+                        "dt_mean": float(result.dt_mean),
+                        "dt_min_observed": float(result.dt_min_observed),
+                        "dt_max_observed": float(result.dt_max_observed),
+                        **boundary,
+                    }
+                    row["usable_contracting"] = _k_scale_row_contracting(row)
+                    row["search_status"] = _k_scale_row_search_status(row)
+                    run_rows.append(row)
+                    candidates.append(row)
+                    evaluated[deviation_key] = row
+                    progress.update(1)
+                    return row
+
+                multiplier = max(1.01, float(bracket_multiplier))
+                start_deviation = float(np.clip(1.0, float(deviation_min), float(deviation_max)))
+                start_row = evaluate_deviation(start_deviation, phase="start", iteration=0)
+                expanding_low: dict[str, object] | None = None
+                contracting_high: dict[str, object] | None = None
+                unsafe_high: dict[str, object] | None = None
+
+                start_status = _k_scale_row_search_status(start_row)
+                if start_status == "safe_contracting":
+                    contracting_high = start_row
+                    direction = "down"
+                elif start_status == "safe_expanding":
+                    expanding_low = start_row
+                    direction = "up"
+                else:
+                    unsafe_high = start_row
+                    direction = "down"
+
+                current = start_deviation
+                for iteration in range(max(0, int(max_bracket_iterations))):
+                    if direction == "down":
+                        if current <= float(deviation_min) * (1.0 + 1e-12):
+                            break
+                        current = max(float(deviation_min), current / multiplier)
+                        row = evaluate_deviation(current, phase="bracket_down", iteration=iteration + 1)
+                    else:
+                        if current >= float(deviation_max) * (1.0 - 1e-12):
+                            break
+                        current = min(float(deviation_max), current * multiplier)
+                        row = evaluate_deviation(current, phase="bracket_up", iteration=iteration + 1)
+
+                    status = _k_scale_row_search_status(row)
+                    if direction == "down":
+                        if status == "safe_contracting":
+                            contracting_high = row
+                            continue
+                        if status == "safe_expanding":
+                            expanding_low = row
+                            break
+                        unsafe_high = row
+                        if contracting_high is not None:
+                            break
+                    else:
+                        if status == "safe_expanding":
+                            expanding_low = row
+                            continue
+                        if status == "safe_contracting":
+                            contracting_high = row
+                            break
+                        unsafe_high = row
+                        break
+
+                for iteration in range(max(0, int(search_iterations))):
+                    if expanding_low is not None and contracting_high is not None:
+                        low_dev = float(expanding_low["K_deviation"])
+                        high_dev = float(contracting_high["K_deviation"])
+                        phase = "refine_contracting_edge"
+                    elif expanding_low is not None and unsafe_high is not None:
+                        low_dev = float(expanding_low["K_deviation"])
+                        high_dev = float(unsafe_high["K_deviation"])
+                        phase = "discover_safe_contraction"
+                    else:
+                        break
+                    if low_dev <= 0.0 or high_dev <= 0.0 or low_dev >= high_dev:
+                        break
+                    mid_dev = float(np.exp(0.5 * (np.log(low_dev) + np.log(high_dev))))
+                    row = evaluate_deviation(mid_dev, phase=phase, iteration=iteration + 1)
+                    status = _k_scale_row_search_status(row)
+                    if status == "safe_contracting":
+                        contracting_high = row
+                    elif status == "safe_expanding":
+                        expanding_low = row
+                    else:
+                        unsafe_high = row
+
+                contracting_rows = [row for row in candidates if _k_scale_row_contracting(row)]
+                selected = min(contracting_rows, key=lambda row: float(row["K_deviation"])) if contracting_rows else None
+                if selected is not None:
+                    critical_deviation, critical_K = _estimate_scale_crossing(candidates)
+                    selected_row = dict(selected)
+                    selected_row["selected"] = True
+                    selected_row["critical_deviation"] = critical_deviation
+                    selected_row["critical_K"] = critical_K
+                    selected_rows.append(selected_row)
+
+            alpha_selected = [row for row in selected_rows if float(row["alpha"]) == float(alpha)]
+            if alpha_selected:
+                aggregate_rows.append(
+                    {
+                        "alpha": float(alpha),
+                        "delta": float(1.0 - alpha),
+                        "selected_seed_count": int(len(alpha_selected)),
+                        "median_selected_K": float(np.median([float(row["K"]) for row in alpha_selected])),
+                        "mean_selected_K": float(np.mean([float(row["K"]) for row in alpha_selected])),
+                        "median_K_baseline": float(np.median([float(row["K_baseline"]) for row in alpha_selected])),
+                        "median_K_fixed_traction": float(np.median([float(row["K_fixed_traction"]) for row in alpha_selected])),
+                        "median_K_current_auto": float(np.median([float(row["K_current_auto"]) for row in alpha_selected])),
+                        "median_selected_deviation": float(np.median([float(row["K_deviation"]) for row in alpha_selected])),
+                        "mean_selected_deviation": float(np.mean([float(row["K_deviation"]) for row in alpha_selected])),
+                        "median_critical_K": float(
+                            np.median([float(row["critical_K"]) for row in alpha_selected if row["critical_K"] is not None])
+                        ),
+                        "median_critical_deviation": float(
+                            np.median(
+                                [
+                                    float(row["critical_deviation"])
+                                    for row in alpha_selected
+                                    if row["critical_deviation"] is not None
+                                ]
+                            )
+                        ),
+                        "median_final_scale": float(np.median([float(row["final_scale"]) for row in alpha_selected])),
+                        "median_final_to_initial_scale": float(
+                            np.median([float(row["final_to_initial_scale"]) for row in alpha_selected])
+                        ),
+                        "median_abs_scale_error_log": float(
+                            np.median([float(row["abs_scale_error_log"]) for row in alpha_selected])
+                        ),
+                    }
+                )
+            else:
+                aggregate_rows.append(
+                    {
+                        "alpha": float(alpha),
+                        "delta": float(1.0 - alpha),
+                        "selected_seed_count": 0,
+                        "median_selected_K": float("nan"),
+                        "mean_selected_K": float("nan"),
+                        "median_K_baseline": float("nan"),
+                        "median_K_fixed_traction": float(
+                            _fixed_traction_K(alpha, reference_alpha=float(reference_alpha), reference_K=float(reference_K))
+                        ),
+                        "median_K_current_auto": float(resolve_pp_K(alpha, None)),
+                        "median_selected_deviation": float("nan"),
+                        "mean_selected_deviation": float("nan"),
+                        "median_critical_K": float("nan"),
+                        "median_critical_deviation": float("nan"),
+                        "median_final_scale": float("nan"),
+                        "median_final_to_initial_scale": float("nan"),
+                        "median_abs_scale_error_log": float("nan"),
+                    }
+                )
+
+    result_summary: dict[str, object] = {
+        "experiment": "k_scale_calibration",
+        "out_dir": str(root),
+        "alpha_count": int(len(alpha_values)),
+        "seed_count": int(len(seed_values)),
+        "reference_alpha": float(reference_alpha),
+        "reference_K": float(reference_K),
+        "baseline": str(baseline),
+        "deviation_min": float(deviation_min),
+        "deviation_max": float(deviation_max),
+        "search_policy": "multiplicative_bracket_refine",
+        "bracket_multiplier": float(bracket_multiplier),
+        "max_bracket_iterations": int(max_bracket_iterations),
+        "search_iterations": int(search_iterations),
+        "alphas": list(alpha_values),
+        "seeds": list(seed_values),
+        "boundary_hit_fraction": float(boundary_hit_fraction),
+        "min_final_time": float(min_final_time),
+        "aggregate": aggregate_rows,
+    }
+    (root / "k_scale_runs.json").write_text(json.dumps(_jsonable(run_rows), indent=2))
+    (root / "k_scale_selected.json").write_text(json.dumps(_jsonable(selected_rows), indent=2))
+    (root / "k_scale_aggregate.json").write_text(json.dumps(_jsonable(aggregate_rows), indent=2))
+    (root / "summary.json").write_text(json.dumps(_jsonable(result_summary), indent=2))
+    _k_scale_csv(root / "k_scale_runs.csv", run_rows)
+    _k_scale_csv(root / "k_scale_selected.csv", selected_rows)
+    _k_scale_csv(root / "k_scale_aggregate.csv", aggregate_rows)
+    _plot_k_scale_calibration(root, selected_rows, aggregate_rows)
+    return result_summary
 
 
 def _long_cross_point_colors(config: TransientResearchConfig, result: ResearchSimulationResult) -> Array:

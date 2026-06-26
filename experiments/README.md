@@ -43,6 +43,10 @@ The current dispatcher in `src/lmsspp/research_experiments.py` supports:
   PP fixed RK2 against original PP adaptive RK2 with dynamic zoom.
 - `finite_horizon_comparison`: compare the old fixed RK2 PP run against the
   finite-horizon adaptive run for one parameter set.
+- `k_scale_calibration`: multiplicatively bracket and refine alpha-dependent
+  deviations around a baseline `K(alpha)`, then pick the smallest safe
+  contracting value: final cloud scale no larger than the initial scale, with no
+  intermediate FFT-boundary hit.
 - `long_cross_reference`: reproduce the long fixed-RK2 disk versus adaptive-RK2
   cross comparison with separate full-domain and adaptive dynamic-zoom figures.
 - `research_sweep`: build a `TransientResearchConfig`, sweep one parameter, and
